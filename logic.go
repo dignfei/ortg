@@ -693,8 +693,8 @@ func gateCall(x *base.Index, tool, path, dir, command string) string {
 		_, targeted := planSnapshot(x)
 		var unplanned []string
 		for _, w := range writes {
-			if c.planned[w] || x.Observed(w, reconcileOpts) || isGateFile(x, w) {
-				continue // lifting a version gate for a run is test plumbing
+			if c.planned[w] || x.Observed(w, reconcileOpts) {
+				continue
 			}
 			if targeted[w] {
 				return base.PreToolDecision(fmt.Sprintf(gatePlanUnreviewed, w), true)
@@ -1305,17 +1305,6 @@ func gateLines(gates []versionGate) string {
 		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
-}
-
-// isGateFile reports whether rel is a conftest holding a version gate at
-// HEAD: lifting and restoring its gate line is test plumbing, not a change
-// the write gate plans.
-func isGateFile(x *base.Index, rel string) bool {
-	if path.Base(rel) != "conftest.py" {
-		return false
-	}
-	head, ok := x.HeadContent(rel)
-	return ok && len(scanPyGates(head)) > 0
 }
 
 // codeExts and codeNames are the files whose change calls for a test run:
@@ -4268,8 +4257,8 @@ func allSkipped(cmd, output string) int {
 
 // gatedFailures returns how many tests failed or erred in a test run that
 // ran with a version gate lifted — lifted in the work tree now, or edited in
-// place by the same command — 0 otherwise. Those are failures the category's
-// home (CI) sees too, whether or not they predate the change.
+// place by the same command — 0 otherwise. The caller must classify
+// failures against the current task and supported environment.
 func gatedFailures(x *base.Index, cmd, output string) int {
 	c := pytestCounts(cmd, output)
 	n := c["failed"] + c["error"] + c["errors"]
@@ -4713,11 +4702,11 @@ const apiGuardMax = 5
 
 // apiGuardNote checks, after an edit, the names the file's outline lists in
 // its API against the file as written: a name gone from the file (renamed,
-// removed or moved), and in Rust a function now behind #[cfg(test)] — a
-// grader that swaps in its own tests strips every cfg(test) item, so an entry
-// the tests call must not hide there. It returns a line to append, "" when
-// nothing is off. Documents, folder outlines and data files (manifests,
-// configuration) are skipped.
+// removed or moved), and in Rust a function now behind #[cfg(test)]. An API
+// promised to ordinary callers must remain available in ordinary builds;
+// test-only helpers instead belong in the outline's Role or Constraints.
+// It returns a line to append, "" when nothing is off. Documents, folder
+// outlines and data files (manifests, configuration) are skipped.
 func apiGuardNote(x *base.Index, rel string) string {
 	r, ok := x.Row(rel)
 	if !ok || r.Outline == "" || isDocFile(rel) || dataFile(rel) || strings.HasSuffix(rel, "/") {

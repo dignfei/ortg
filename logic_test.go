@@ -2373,36 +2373,42 @@ func TestGuardTestsNamed(t *testing.T) {
 	}
 }
 
-// Entries the tests call stay contracts: "单测入口" draws a warning, a Rust
-// function the outline's API lists is flagged once it sits under
-// #[cfg(test)] or is gone, and "=" on a file in a contract reminds that a
-// moved execution point needs a full target and an updated contract.
+// API-listed public entries are checked for missing names and #[cfg(test)].
+// Test-only helpers belong in Role/Constraints and do not become public APIs
+// merely because tests call them. "=" still reminds a contract participant
+// to describe changes to its execution responsibilities.
 func TestTestEntriesGuarded(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	root := t.TempDir()
-	os.WriteFile(filepath.Join(root, "dir.rs"), []byte("impl ConfigBuilder {\n    pub(crate) fn build(&self) {}\n    pub fn add(&self) {}\n}\n"), 0o644)
+	const helper = "#[cfg(test)]\nfn fixture_setup() {}\n"
+	os.WriteFile(filepath.Join(root, "dir.rs"), []byte("impl ConfigBuilder {\n    pub(crate) fn build(&self) {}\n    pub fn add(&self) {}\n}\n"+helper), 0o644)
 	t.Chdir(root)
 	if _, err := scanWithHeader(); err != nil {
 		t.Fatal(err)
 	}
 	Header(testHeader+"\n#【契约】limit：达限仍出上下文", nil, nil, nil, nil, nil, nil)
-	out, _ := Update("dir.rs", "dir.rs[7 L ST T]: Role:d | Uses:- | API:单测入口 ConfigBuilder{build,add,remove_all} | Constraints:- | Keys:limit(执行)")
-	if !strings.Contains(out, "测试也调用") {
-		t.Fatalf("\"单测入口\" is warned against: %q", out)
+	out, _ := Update("dir.rs", "dir.rs[7 L ST T]: Role:构建配置，fixture_setup提供测试辅助 | Uses:- | API:单测入口 ConfigBuilder{build,add,remove_all} | Constraints:fixture_setup仅供测试 | Keys:limit(执行)")
+	if !strings.Contains(out, "测试也调用") || !strings.Contains(out, "不能仅凭测试调用认定为公开 API") {
+		t.Fatalf("an ambiguous test entry must be classified by its public contract: %q", out)
 	}
 	x, _ := base.Open(root)
-	if got := apiGuardNote(x, "dir.rs"); !strings.Contains(got, "remove_all") || strings.Contains(got, "cfg(test) 下") {
-		t.Fatalf("a missing API name is reported, nothing hidden yet: %q", got)
+	if got := apiGuardNote(x, "dir.rs"); !strings.Contains(got, "remove_all") || strings.Contains(got, "cfg(test) 下") || strings.Contains(got, "fixture_setup") {
+		t.Fatalf("only the missing public API is reported, not a test helper: %q", got)
 	}
-	os.WriteFile(filepath.Join(root, "dir.rs"), []byte("impl ConfigBuilder {\n    #[cfg(test)]\n    pub(crate) fn build(&self) {}\n    pub fn add(&self) {}\n    fn remove_all() {}\n}\n"), 0o644)
-	if got := apiGuardNote(x, "dir.rs"); !strings.Contains(got, "build 现在在 #[cfg(test)] 下") || strings.Contains(got, "已找不到") {
-		t.Fatalf("an API function under cfg(test) is flagged: %q", got)
+	os.WriteFile(filepath.Join(root, "dir.rs"), []byte("impl ConfigBuilder {\n    #[cfg(test)]\n    pub(crate) fn build(&self) {}\n    pub fn add(&self) {}\n    fn remove_all() {}\n}\n"+helper), 0o644)
+	if got := apiGuardNote(x, "dir.rs"); !strings.Contains(got, "build 现在在 #[cfg(test)] 下") || !strings.Contains(got, "真实公开入口应在普通构建中可用") || !strings.Contains(got, "若确实只是测试辅助代码") || strings.Contains(got, "已找不到") || strings.Contains(got, "fixture_setup") {
+		t.Fatalf("a hidden public API is flagged with a separate test-helper boundary: %q", got)
 	}
-	Update("dir.rs", "dir.rs[7 L ST T]: Role:d | Uses:- | API:测试也调用 ConfigBuilder{build,add} | Constraints:- | Keys:limit(执行)")
+	Update("dir.rs", "dir.rs[7 L ST T]: Role:构建配置，fixture_setup提供测试辅助 | Uses:- | API:测试也调用 ConfigBuilder{build,add} | Constraints:fixture_setup仅供测试 | Keys:limit(执行)")
+	os.WriteFile(filepath.Join(root, "dir.rs"), []byte("impl ConfigBuilder {\n    pub(crate) fn build(&self) {}\n    pub fn add(&self) {}\n}\n"+helper), 0o644)
+	x = mustOpen(t, root)
+	if got := apiGuardNote(x, "dir.rs"); got != "" {
+		t.Fatalf("a legitimate cfg(test) helper outside API must not raise a public-API notice: %q", got)
+	}
 	if out, _ := Target("dir.rs", "=", false, ""); !strings.Contains(out, "参与契约 limit") {
 		t.Fatalf("= on a contract party reminds of the execution point: %q", out)
 	}
-	if !strings.Contains(reviewChecklist, "9. 执行点") || !strings.Contains(updateDiscipline, "不写\"单测入口\"") {
+	if !strings.Contains(reviewChecklist, "9. 执行点") || !strings.Contains(updateDiscipline, "仅供测试的辅助代码可按项目约定条件编译") {
 		t.Fatal("the checklist and the discipline carry the rules")
 	}
 }
@@ -2810,7 +2816,7 @@ func TestRemovedTestedNames(t *testing.T) {
 	x := mustOpen(t, root)
 	write("pkg/mod.py", "def keep():\n    pass\n")
 	note, _ := removedTestedNote(x, "pkg/mod.py")
-	for _, want := range []string{"old_helper（pkg/tests/test_mod.py）", "CONST（pkg/tests/test_other.py）", "默认保留"} {
+	for _, want := range []string{"old_helper（pkg/tests/test_mod.py）", "CONST（pkg/tests/test_other.py）", "先核实真实公共契约与测试用途", "测试辅助代码和内部实现可按任务调整"} {
 		if !strings.Contains(note, want) {
 			t.Fatalf("note lacks %q:\n%s", want, note)
 		}
@@ -3190,8 +3196,8 @@ func TestTestpathsScope(t *testing.T) {
 
 // A gate whose condition does not hold here is acknowledged by committing
 // again after the refusal; a lift and its run in one command count; a
-// broad run the write gate refuses never ran; lifting a gate line is no
-// planned change; a stale-run refusal still names the gates in force.
+// broad run the write gate refuses never ran; version-gate configuration
+// follows ordinary write planning; a stale refusal still names live gates.
 func TestVersionGateFlow(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	gate := "def pytest_collection_modifyitems(config, items):\n    if dep_version >= parse_version(\"2\"):\n        marker = pytest.mark.skip(reason=\"doctest output changed\")\n        for item in items:\n            if isinstance(item, DoctestItem):\n                item.add_marker(marker)\n"
@@ -3248,14 +3254,13 @@ func TestVersionGateFlow(t *testing.T) {
 		t.Fatalf("a refused command never ran: %v -> %v", before, after)
 	}
 	if got, _ := Gate("Edit", filepath.Join(root, "conftest.py"), "", "", ""); strings.Contains(got, `"permissionDecision":"deny"`) {
-		t.Fatalf("lifting a gate line is allowed: %q", got)
+		t.Fatalf("the existing single-file configuration change remains allowed: %q", got)
 	}
-	if got, _ := Gate("Edit", filepath.Join(root, "a.py"), "", "", ""); strings.Contains(got, `"permissionDecision":"deny"`) {
-		t.Fatalf("the gate file does not count as an unplanned change: %q", got)
+	if got, _ := Gate("Edit", filepath.Join(root, "a.py"), "", "", ""); !strings.Contains(got, `"permissionDecision":"deny"`) {
+		t.Fatalf("configuration with a version gate counts toward the multi-file plan: %q", got)
 	}
 }
 
-// A colored pytest summary (--color=yes) is read once colors are removed.
 func TestAllSkippedColored(t *testing.T) {
 	in := base.ReadHookInput(strings.NewReader(`{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"python -m pytest x.py -q"},"tool_response":{"stdout":"\u001b[33m\u001b[1m17 skipped\u001b[0m\u001b[33m in 0.05s\u001b[0m"}}`), time.Second)
 	if got := allSkipped(in.Command, in.ToolOutput); got != 17 {
@@ -3264,9 +3269,9 @@ func TestAllSkippedColored(t *testing.T) {
 }
 
 // A test run with a version gate lifted — in the same command or in the work
-// tree — whose summary has failures gets a notice that failures predating
-// the change count too; a run with the gate in force, or without failures,
-// gets none.
+// tree — whose summary has failures gets a notice to distinguish regressions
+// and task blockers from failures to report. A run with the gate in force,
+// or without failures, gets none.
 func TestGatedFailuresNotice(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	gate := "def pytest_collection_modifyitems(config, items):\n    if dep_version >= parse_version(\"2\"):\n        skip_doctests = True\n"
@@ -3279,8 +3284,8 @@ func TestGatedFailuresNotice(t *testing.T) {
 		return HookReply("post", base.HookInput{Cwd: root, SessionID: session, ToolName: "Bash", Command: cmd, ToolOutput: out})
 	}
 	const lift = `sed -i 's/if dep_version/if False and dep_version/' conftest.py && python -m pytest -q; git checkout -- conftest.py`
-	if got := post("gf1", lift, "3 failed, 10 passed in 2.00s"); !strings.Contains(got, "汇总里有 3 个失败或错误") {
-		t.Fatalf("a lift and its failing run in one command: %q", got)
+	if got := post("gf1", lift, "3 failed, 10 passed in 2.00s"); !strings.Contains(got, "汇总里有 3 个失败或错误") || !strings.Contains(got, "本机实际输出本身不是修改期望或测试选择的依据") || !strings.Contains(got, "本次回归或任务阻断纳入修复，其余按证据报告并保留失败记录") || strings.Contains(got, "直到只剩环境问题") || strings.Contains(got, "按这里的实际输出更新期望") {
+		t.Fatalf("a lifted-gate failure must retain evidence without authorizing test changes or unrelated repairs: %q", got)
 	}
 	if got := post("gf1", lift, "3 failed, 10 passed in 2.00s"); strings.Contains(got, "失败或错误") {
 		t.Fatalf("once per command and session: %q", got)
@@ -3375,8 +3380,8 @@ func TestDepBumpNotice(t *testing.T) {
 		t.Fatalf("a new dependency is no version change: %q", got)
 	}
 	write("Cargo.toml", strings.Replace(cargo, `"0.41.0"`, `"0.42.0"`, 1))
-	if got := edit("d1", "Cargo.toml"); !strings.Contains(got, "Cargo.toml：linelib 0.41.0 → 0.42.0") {
-		t.Fatalf("an edit moving a version: %q", got)
+	if got := edit("d1", "Cargo.toml"); !strings.Contains(got, "Cargo.toml：linelib 0.41.0 → 0.42.0") || !strings.Contains(got, "版本变化是否为任务或项目支持契约所必需") || !strings.Contains(got, "任务确需升级时") || strings.Contains(got, "先把版本改回去") {
+		t.Fatalf("a version change must be assessed against task necessity and project support: %q", got)
 	}
 	if got := edit("d1", "Cargo.toml"); strings.Contains(got, "已有依赖的版本") {
 		t.Fatalf("once per set of changes: %q", got)
