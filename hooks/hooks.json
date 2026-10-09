@@ -1,0 +1,122 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ortg hook --event session",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ortg hook --event subagent",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|apply_patch|ApplyPatch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ortg hook --event pre",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob|Bash|Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:ortg:ortg",
+            "tool": "ortg_gate",
+            "input": {
+              "tool": "${tool_name}",
+              "path": "${tool_input.file_path}",
+              "dir": "${tool_input.path}",
+              "command": "${tool_input.command}",
+              "agent": "${agent_id}"
+            },
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ortg hook --event post",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|apply_patch|ApplyPatch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ortg hook --event post",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ortg hook --event post",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ortg hook --event prompt",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ortg hook --event compact",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ortg hook --event stop",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

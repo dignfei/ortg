@@ -1,0 +1,6 @@
+{
+  "name": "ortg",
+  "version": "0.5.30",
+  "description": "单文件纲要引擎：SessionStart 注入规则与对账报告；MCP 服务器需在 ~/.codex/config.toml 声明 [mcp_servers.ortg]。",
+  "hooks": "./hooks/codex.json"
+}

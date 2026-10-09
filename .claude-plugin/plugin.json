@@ -1,0 +1,8 @@
+{
+  "name": "ortg",
+  "version": "0.5.30",
+  "description": "单文件纲要引擎：为每个源码文件维护一行模型写的纲要，SessionStart 注入规则与对账报告，MCP 五工具读写。",
+  "author": {
+    "name": "ortg"
+  }
+}
