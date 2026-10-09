@@ -4,17 +4,23 @@ import "strconv"
 
 // All model-facing texts live here and only here.
 
+const semanticInitRule = "语义初始化：阅读源码正文（长文件分段读完）及可见的相关测试，AST、导入和符号清单只辅助定位，不能代替正文阅读与语义概括。Role 写实际职责；Uses 按职责与契约的重要性选择强依赖，不按导入顺序截取前五项；API/Constraints 只写有依据的契约与约束，无内容不伪填，不把未提供的固定文案猜写成已知约束。条目齐全不等于语义质量已核验。"
+const outlineConflictRule = "纲要与需求、源码、测试或实际运行结果冲突时，读取对应源码与测试核实，并修正不准确的纲要；状态对齐不证明代码正确或语义完整。"
+const dependencyBlockerRule = "任务依赖闭环：发现仓库缺失符号、导入失败或其他依赖缺口，按实际调用路径与可见测试判断是否阻断目标功能或验收。阻断的纳入修复计划，不能仅因文件未点名或改动前已缺失而排除；确与任务无关的按证据说明。"
+const finalSourceRule = "最终验证：为绕过仓库缺失实现而临时注入或替换的函数、对象只作诊断。提交或结束任务前，移除这类替代，在新进程中按最终持久源码运行验收；仅替代后的自测通过不算最终源码通过。"
+const entryContractRule = "多入口契约：同一行为由 setter、预检、包装或快捷分支处理时，按入口与触发条件核对可见契约；提前校验或迁移后，异常类型、已明确给出的词句与输出格式仍须满足各入口约定，并分别覆盖各入口，不只验证底层函数。"
+
 const rulesBlock = `## ORTG 纲要规则
 本仓库由 ORTG 维护一份纲要：每个源码文件一行 "文件名[标签]: Role:职责 | Uses:依赖 | API:对外契约 | Constraints:约束"，模型通过纲要头规则加全部条目理解整个系统。
 三条硬规则：
-1. 开工先调用 ortg_overview（不带参数）取纲要：整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回；超过时只返回纲要头与模块清单，再按问题用 module 参数取相关模块的纲要（可多次；module="*" 取全部），再决定下一步。发过的条目一直在上下文里，不再重发（再取只补还没有或已变动的，全都有就只回对账报告；上下文压缩或清空后会自动重发）——不要和 Grep/Read/Glob 并行发出。纲要就是本仓库的认知：能从纲要回答的问题直接回答，不去源码里"确认"（那等于宣布纲要不可信，也白花 token）；只有纲要没写的具体事实（某个值、某段实现、某个行号）才读对应文件。
+1. 开工先调用 ortg_overview（不带参数）取纲要：整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回；超过时只返回纲要头与模块清单，再按问题用 module 参数取相关模块的纲要（可多次；module="*" 取全部），再决定下一步。发过的条目一直在上下文里，不再重发（再取只补还没有或已变动的，全都有就只回对账报告；上下文压缩或清空后会自动重发）——不要和 Grep/Read/Glob 并行发出。纲要就是本仓库的认知：能从纲要回答的问题直接回答，不重复读源码；只有纲要没写的具体事实（某个值、某段实现、某个行号），或遇到需求、测试及运行结果冲突时，才读对应文件核查并修正纲要。
 2. 读到没有纲要或纲要过期的文件，读完顺便按纪律生成一行纲要，调用 ortg_update 提交。
 3. 改代码：只改一个文件时直接改。要改多个文件（含新建、删除）时先定计划、核对、再动手：用 ortg_target 的 items 一次列出这次要改、要新建、要删的每个文件的目标纲要，调用 ortg_review 按全局纲要逐项核对，补改后再核对，直到连续两次核对计划不变——在此之前改第二个文件会被拦；这是自查，不用给用户看、不用等同意，核对完直接动手。改完一个文件，立即为它提交新纲要（ortg_update）——这是改动本身的一部分：不征求同意、不留到最后、不当成待办报告给用户；纲要没提交，这个文件就不算改完。所有字段重写完整，不只写增量。再判断这次改动影响到哪些文件（Uses 依赖它的、调用图里调用它的、全局纲要里语义相关的）：要跟着改代码的就改，纲要描述随之不准的就重写它们的纲要提交；纲要头里的全局描述（依赖层次、模块划分、系统约定）随之不准的，用 ortg_header 改。
 状态规则：纲要是否对齐以 ortg_status 的实时对账为准；被问到"对齐了吗 / 有哪些文件要处理"时重新扫描再答，不引用开工时的报告——那只是快照，之后文件可能已经变了。
 骨架规则：纲要中只有裸文件名没有纲要的行，是尚未建立认知的文件清单；下次读取该文件时必须顺便生成一行纲要并调用 ortg_update 提交。
 目录纲要规则：第三方库等不逐文件写纲要的目录，给目录本身写一行纲要（文件名以 / 结尾，如 vendored/[标签]: ...），目录放进 observe_dirs。它的内容往往自成一体，但不要为它单开一个模块：B 标签填用到它的那个模块，它就并入那个模块、随那个模块一起发送。
 目标规则：条目下一行 "#目标:" 是该文件的目标纲要——这个文件改完之后应有的纲要，表示要改代码去达到它；"#目标:删除" 表示计划删除；"#计划新建" 表示文件尚不存在。改完后用 ortg_update 提交，目标纲要自动清空。只改实现、改完纲要不变的文件（重构、格式化、修 lint），ortg_target 的 outline 传 "=" 即可，不必把整行纲要再抄一遍，纲要里显示为 "#目标:同现在"。目标纲要只写要改代码去达成的状态：待核查、待实测的结论和疑问不是目标，也不写进当前纲要——先核查，再把事实写进当前纲要。
-高屋建瓴模式：只迭代目标纲要、纲要头、忽略规则与目录描述，不改代码，用 ortg_target 与 ortg_header 提交。`
+高屋建瓴模式：只迭代目标纲要、纲要头、忽略规则与目录描述，不改代码，用 ortg_target 与 ortg_header 提交。` + "\n" + semanticInitRule + "\n" + outlineConflictRule + "\n" + dependencyBlockerRule + "\n" + finalSourceRule
 
 // codexBudgetRule is injected only under the Codex host: it wraps MCP calls in
 // functions.exec and cuts the middle out of a tool result that overruns the
@@ -65,14 +71,14 @@ const overviewTooLarge = "ortg: %s的纲要约 %d %s，超过单次返回上限 
 const overviewIncrementNote = "ortg: 本次只发了 %d 条还没发过或已变动的纲要，另有 %d 条本会话已发过、仍在你的上下文里。"
 
 // overviewPartFooter closes a module fetch; %s is the scope.
-const overviewPartFooter = "以上是%s的纲要。能据此回答的问题直接回答，不要再去源码核实；只有纲要没写的具体事实才读对应文件；别的模块的问题再按模块取。"
+const overviewPartFooter = "以上是%s的纲要。能据此回答的问题直接回答，不重复读源码；具体事实没写或出现冲突时读对应文件核实；别的模块的问题再按模块取。" + outlineConflictRule
 
 const skeletonRule = `ortg: 该文件尚无纲要。读完后按纪律生成一行纲要并调用 ortg_update 提交——直接做，不询问。`
 
 // The S budgets are the one text here not written by hand: quotaLine renders
 // logic.go's sQuota, the same table checkOrError enforces, so the discipline and
 // the header template cannot drift from the checker.
-var updateDiscipline = `纲要行纪律：单行；格式 文件名[标签]: Role:职责 | Uses:依赖 | API:对外契约 | Constraints:约束；标签 [C A B D… E] 是重要度数字在前、其后层级、模块、特征(0到多个)、规模，以空格分隔，每个都是纲要头字典里的大写字母(模块可两个)；Role 一句话写这个文件的职责，测试文件只写一句测什么，不逐项罗列，文档文件一句话说它讲什么；跨模块、不靠调用关系的约定不写进 Uses：在纲要头登记 #【契约】键：正文，本文件参与就在行末加 | Keys:键(角色),…，键须已登记(未登记会被拒)；Uses 只列本文件依赖的跨文件强依赖(≤5)，一律写仓库相对路径：文件写全路径(如 lib/storage/cache.c)，整个目录或包写目录路径并以 / 结尾(如 lib/storage/)，可加括注写用到什么，包名、模块名、裸文件名都不行，第三方库与标准库不写；API 只列跨包或对外的契约(命令、工具名、给别的包用的导出名，以及测试代码要调用的入口——写"测试也调用"，不写"单测入口"：它们照样是对外契约，不得加 cfg(test)/条件编译或收窄可见性，判分或别的测试可能整段替换测试代码)，包内标识符不列，无则写 -；同一个参数或限额能由多层执行时，在接线文件的纲要或【契约】正文里写明由哪一层执行、其他层不再执行；给文件新增的对外接口(Rust pub 项、Go 导出名、JS/TS export)必须写进 API；Constraints 只写不读代码就会做错的约束、不变量与陷阱，不复述 Role 与 API，代码里一眼可见的实现细节不写，按 C 配额 ` + quotaLine() + `(「必须保持」子句另计，不超过该档配额的一半、至少 100 字，不占其余约束的字数)；测试契约：本文件的单元测试或别处的集成测试锁定了的对外行为（输出格式、参数组合的结果、边界值、错误语义），写成"必须保持 X（测试名）"，写清期望结果，不写成"可能/现状是 X"——这是改动时不许改变的东西；这种约束另有模块依赖时，在依赖方的纲要里也写上；测试配置按依赖版本或平台整类跳过、本地跑不到的测试（CI 或别的环境可能不跳过），在被测文件的 Constraints 里写成「本地验证盲区：X（跳过条件）」——它们锁定的行为本地无法验证，改动碰到时要逐行核对实现，不能当作已通过；文档文件的 Constraints 写它规定的约定、约束与设计决定，按 ` + strconv.Itoa(docQuota) + ` 字配额；禁时间维度；所有字段重写完整。`
+var updateDiscipline = `纲要行纪律：单行；格式 文件名[标签]: Role:职责 | Uses:依赖 | API:对外契约 | Constraints:约束；标签 [C A B D… E] 是重要度数字在前、其后层级、模块、特征(0到多个)、规模，以空格分隔，每个都是纲要头字典里的大写字母(模块可两个)；Role 一句话写这个文件的职责，测试文件只写一句测什么，不逐项罗列，文档文件一句话说它讲什么；跨模块、不靠调用关系的约定不写进 Uses：在纲要头登记 #【契约】键：正文，本文件参与就在行末加 | Keys:键(角色),…，键须已登记(未登记会被拒)；Uses 只列本文件依赖的跨文件强依赖(≤5)，一律写仓库相对路径：文件写全路径(如 lib/storage/cache.c)，整个目录或包写目录路径并以 / 结尾(如 lib/storage/)，可加括注写用到什么，包名、模块名、裸文件名都不行，第三方库与标准库不写；API 只列跨包或对外的契约(命令、工具名、给别的包用的导出名，以及测试代码要调用的入口——写"测试也调用"，不写"单测入口"：它们照样是对外契约，不得加 cfg(test)/条件编译或收窄可见性，判分或别的测试可能整段替换测试代码)，包内标识符不列，无则写 -；同一个参数或限额能由多层执行时，在接线文件的纲要或【契约】正文里写明由哪一层执行、其他层不再执行；给文件新增的对外接口(Rust pub 项、Go 导出名、JS/TS export)必须写进 API；Constraints 只写不读代码就会做错的约束、不变量与陷阱，不复述 Role 与 API，代码里一眼可见的实现细节不写，按 C 配额 ` + quotaLine() + `(「必须保持」子句另计，不超过该档配额的一半、至少 100 字，不占其余约束的字数)；测试契约：本文件的单元测试或别处的集成测试锁定了的对外行为（输出格式、参数组合的结果、边界值、错误语义），写成"必须保持 X（测试名）"，写清期望结果，不写成"可能/现状是 X"——这是改动时不许改变的东西；这种约束另有模块依赖时，在依赖方的纲要里也写上；测试配置按依赖版本或平台整类跳过、本地跑不到的测试（CI 或别的环境可能不跳过），在被测文件的 Constraints 里写成「本地验证盲区：X（跳过条件）」——它们锁定的行为本地无法验证，改动碰到时要逐行核对实现，不能当作已通过；文档文件的 Constraints 写它规定的约定、约束与设计决定，按 ` + strconv.Itoa(docQuota) + ` 字配额；禁时间维度；所有字段重写完整。` + " " + semanticInitRule + " " + entryContractRule
 
 const decisionText = `未对齐清单怎么处置由用户决定，三个选项由程序在用户发出第一句话时直接显示给他，你不要再主动提问，也不要把清单复述一遍。用户回「1」= 逐个读文件、按纪律生成纲要行并用 ortg_update 提交；「2」= 人工已核对，调用 ortg_align mode=all 前移指纹；「3」或没提 = 现在什么都不做，读到或改到哪一个再顺手提交。本条只管这份存量清单：改完某个文件后立即为它提交新纲要仍按硬规则 3 执行，不询问。`
 
@@ -139,7 +145,7 @@ const tableBrokenNote = "ortg: ortg.tsv 无法加载，本会话 ORTG 已停用�
 // but a document's outline; headerFromDocsNote takes over once every document
 // has one, headerNoDocsNote when the repository has none; headerDocsMissingNote
 // (%s the documents) refuses a written header while documents still lack one.
-const headerFirstNote = "ortg: 纲要头还没写（【部署】【系统】仍是模板占位）。建纲要的第一步是给文档写纲要，源码纲要与目标纲要要等纲要头写好才收。还没纲要的文档：%s。逐份读全文（不要用 head、sed 截断），用 ortg_update 提交：Role 一句话说它讲什么，Constraints 写它规定的约定、约束与设计决定（文档按 %d 字配额，不按重要度）。教程、翻译、大批参考页这类可以放进观察档（ortg_header 的 observe_dirs、observe_files），或给所在目录写一行目录纲要。文档纲要齐了，再据此与目录结构写纲要头（ortg_header）：系统是什么、部署与运行方式、架构与模块划分、依赖层次、数据流、不可破坏的约定（含被测试锁定、跨模块的对外行为），并登记 #B模块 字典；然后逐个读源码写纲要，同时读它的单元测试和相关的集成测试，按测试契约把它们锁定的行为写进 Constraints。文档只作背景，纲要写代码实际怎么做；文档与代码不一致时按代码写，并在那份文档的纲要里记下不一致之处。"
+const headerFirstNote = "ortg: 纲要头还没写（【部署】【系统】仍是模板占位）。建纲要的第一步是给文档写纲要，源码纲要与目标纲要要等纲要头写好才收。还没纲要的文档：%s。逐份读全文（不要用 head、sed 截断），用 ortg_update 提交：Role 一句话说它讲什么，Constraints 写它规定的约定、约束与设计决定（文档按 %d 字配额，不按重要度）。教程、翻译、大批参考页这类可以放进观察档（ortg_header 的 observe_dirs、observe_files），或给所在目录写一行目录纲要。文档纲要齐了，再据此与目录结构写纲要头（ortg_header）：系统是什么、部署与运行方式、架构与模块划分、依赖层次、数据流、不可破坏的约定（含被测试锁定、跨模块的对外行为），并登记 #B模块 字典；然后逐个读源码写纲要，同时读它的单元测试和相关的集成测试，按测试契约把它们锁定的行为写进 Constraints。文档只作背景，纲要写代码实际怎么做；文档与代码不一致时按代码写，并在那份文档的纲要里记下不一致之处。" + " " + semanticInitRule
 const headerFromDocsNote = "ortg: 文档纲要已经齐了，纲要头还没写（【部署】【系统】仍是模板占位）。根据文档纲要与目录结构写纲要头（ortg_header）：系统是什么、部署与运行方式、架构与模块划分、依赖层次、数据流、不可破坏的约定（含被测试锁定、跨模块的对外行为），并登记 #B模块 字典；写好之后才收源码纲要与目标纲要。文档只作背景，与代码不一致时按代码写。"
 const headerNoDocsNote = "ortg: 纲要头还没写（【部署】【系统】仍是模板占位），仓库里也没有文档。先读入口文件与目录结构，写纲要头（ortg_header）：系统是什么、部署与运行方式、架构与模块划分、依赖层次、数据流、不可破坏的约定（含被测试锁定、跨模块的对外行为），并登记 #B模块 字典；写好之后才收文件纲要与目标纲要。"
 const headerDocsMissingNote = "ortg: 还有文档没写纲要，先不写纲要头：%s。逐份读全写文档纲要（用不上的放进观察档），再写纲要头；只改忽略、观察等配置不受此限。"
@@ -202,7 +208,7 @@ const gateMultiFile = "ortg: 这一步会让改动涉及多个计划外的文件
 
 // gateSoloEdit (%s the file) rides along the first write to a file outside
 // any plan: a single-file change needs no plan, but its outline is due.
-const gateSoloEdit = "ortg: %s 不在改动计划里，按单文件改动放行。改完立即用 ortg_update 提交它的新纲要；若还要改别的文件，先用 ortg_target 的 items 一次列全计划再核对。"
+const gateSoloEdit = "ortg: %s 不在改动计划里，按单文件改动放行。改完立即用 ortg_update 提交它的新纲要；若还要改别的文件，先用 ortg_target 的 items 一次列全计划再核对。" + " " + dependencyBlockerRule + " " + entryContractRule
 const gatePlanUnreviewed = "ortg: %s 的目标纲要已写，但计划还没核对到收敛（连续两次 ortg_review 看到的计划一样才解锁）。调用 ortg_review。"
 const reviewSame = "- %s：只改实现，改完纲要不变（纲要见全局纲要）\n"
 
@@ -308,7 +314,7 @@ const reviewChecklist = `
 8. 测试调用的入口：纲要 API 里测试也调用的函数，改动后签名与可见性还在吗？不得为消除未使用警告给它加 cfg(test)/条件编译或收窄可见性。
 9. 执行点：同一个参数或限额会不会被多层同时执行（一层改了，另一层还在兜底，本地测试因此测不出差别）？计划里写明唯一执行点了吗？改了参数流向的文件不要用 = 。
 10. 收尾验证：全部改完、提交之前，按仓库自己的测试配置跑一次不收窄的整包测试（不加 -k、不只跑单个文件或子目录、不用 -o addopts 等改掉收集范围），新出现的失败修掉；删掉或改名的名字，确认没有测试还在导入它；按依赖库版本整类跳过的测试临时去掉门控跑一遍，跑不了的记成「本地验证盲区」，不算通过；测试另起进程调用的构建产物，确认是按测试所用的配置从当前源码新构建的。
-`
+` + "\n" + dependencyBlockerRule + "\n" + entryContractRule + "\n" + finalSourceRule
 
 // The commit gate (verifyCommit). gateVerifyCore refuses a commit of code
 // no broad test run has seen since it last changed; gateVerifyVersionHint
@@ -317,7 +323,7 @@ const reviewChecklist = `
 // gateVerifyGatesOnly refuses a commit for those alone, both then followed
 // by gateLiftHowTo; gateVerifyGatesNudge (%s the gates in force) follows a
 // refusal for a stale run when every gate was run lifted once.
-const gateVerifyCore = "ortg: 自最近一次改代码以来还没跑过整包测试，这次提交先拦下（每个提交点只拦一次，再提交即放行）。提交前按仓库自己的测试配置跑一次不收窄的整包测试——不加 -k/-m，不只跑单个文件或子目录，不用 -o addopts、-c、-p no:doctest 之类改掉收集范围；太慢就加并行，输出写进日志文件，在本回合里等它跑完再看（给足超时，或用阻塞循环等日志里的结束标记）——非交互运行时回合一结束会话就退出，放到后台的测试等不到通知，还可能被一并终止。测试若另起进程调用构建产物（可执行文件、服务、插件），先查测试支持代码按什么变量、配置或目录找它，按那套配置从当前源码重新构建——产物比最近一次改动旧，测出的通过不算数。看新出现的失败：拿不准是不是这次改出来的，就在改动前的提交上对照着跑那几个测试（用 git worktree add 到临时目录，不要 stash 或切走当前改动）；是这次改出来的先修好。"
+const gateVerifyCore = "ortg: 自最近一次改代码以来还没跑过整包测试，这次提交先拦下（每个提交点只拦一次，再提交即放行）。提交前按仓库自己的测试配置跑一次不收窄的整包测试——不加 -k/-m，不只跑单个文件或子目录，不用 -o addopts、-c、-p no:doctest 之类改掉收集范围；太慢就加并行，输出写进日志文件，在本回合里等它跑完再看（给足超时，或用阻塞循环等日志里的结束标记）——非交互运行时回合一结束会话就退出，放到后台的测试等不到通知，还可能被一并终止。测试若另起进程调用构建产物（可执行文件、服务、插件），先查测试支持代码按什么变量、配置或目录找它，按那套配置从当前源码重新构建——产物比最近一次改动旧，测出的通过不算数。看新出现的失败：拿不准是不是这次改出来的，就在改动前的提交上对照着跑那几个测试（用 git worktree add 到临时目录，不要 stash 或切走当前改动）；是这次改出来的先修好。" + " " + finalSourceRule
 const gateVerifyVersionHint = "测试配置按依赖库版本整类跳过的测试（CI 或别的环境可能不跳过），临时去掉这道版本门控把那一类跑一遍、跑完恢复；改动前就失败、只差第三方库的输出表示（浮点位数、repr、警告文本）的，按实际输出更新期望——这不算改变行为；按平台、网络或可选依赖跳过的不要硬跑，在纲要里记成「本地验证盲区」，改动碰到它们锁定的行为时逐行核对实现。"
 const gateVerifyGates = "另外，测试配置里有按依赖版本整类跳过测试的分支，本地还从没在去掉它之后跑过整包：\n%s\n"
 const gateVerifyGatesOnly = "ortg: 整包已经跑过，但测试配置里有按依赖版本整类跳过测试的分支，本地还从没在去掉它之后跑过整包，这次提交先拦下（每个提交点只拦一次，再提交即放行）：\n%s\n"
@@ -370,7 +376,7 @@ const reviewConverged = "\n计划与上次核对一致，已收敛：以上 %d �
 // semantic ties — a shared concept, config key or data format — so the model
 // is also sent to the global outline. It asks for a judgement per file, not a
 // blanket rewrite.
-const impactNote = "ortg: 判断这次改动的影响面。候选依赖方（Uses=全局纲要里 Uses 写到 %s，调用=CBM 调用图里调用它）：%s。再通读全局纲要做语义判断：Role/API/Constraints 里涉及同一概念、配置项、数据格式、协议或约定的文件，即使不在候选里也可能受影响（相关模块不在上下文就先用 ortg_overview 取）。逐个判断——接口或约定变了、代码要跟着改的，改代码并提交它的新纲要；代码不用改但纲要描述已不准的（如 Uses、API、Constraints 里提到的名字或行为变了），只重写那行纲要用 ortg_update 提交；不受影响的不动。改动涉及的文件纲要里点名的守护测试（「必须保持 X（测试名）」）要运行；它们失败时先回到需求确认，需求没有明确要求改变那个行为，就改实现，不改测试期望值。直接做，不询问。"
+const impactNote = "ortg: 判断这次改动的影响面。候选依赖方（Uses=全局纲要里 Uses 写到 %s，调用=CBM 调用图里调用它）：%s。再通读全局纲要做语义判断：Role/API/Constraints 里涉及同一概念、配置项、数据格式、协议或约定的文件，即使不在候选里也可能受影响（相关模块不在上下文就先用 ortg_overview 取）。逐个判断——接口或约定变了、代码要跟着改的，改代码并提交它的新纲要；代码不用改但纲要描述已不准的（如 Uses、API、Constraints 里提到的名字或行为变了），只重写那行纲要用 ortg_update 提交；不受影响的不动。改动涉及的文件纲要里点名的守护测试（「必须保持 X（测试名）」）要运行；它们失败时先回到需求确认，需求没有明确要求改变那个行为，就改实现，不改测试期望值。直接做，不询问。" + " " + dependencyBlockerRule + " " + entryContractRule
 
 // dirRowMismatch refuses an outline whose trailing "/" disagrees with the
 // path: a folder outline names a directory ("vendored/[标签]: ..."), a file's
