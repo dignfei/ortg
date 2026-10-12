@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1715,8 +1717,17 @@ func TestHeaderFirst(t *testing.T) {
 	if _, err := Target("", "", false, testHeader+section); err != nil {
 		t.Fatalf("a document with a real header writes the header: %v", err)
 	}
+	if _, err := Update("a.go", line); err == nil {
+		t.Fatal("a header imported with a plan must not bypass unfinished documents")
+	}
+	_, missing := docs(mustOpen(t, root))
+	for _, p := range missing {
+		if _, err := Update(p, path.Base(p)+"[3 L ST T]: Role:文档 | Uses:- | API:- | Constraints:-"); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := Update("a.go", line); err != nil {
-		t.Fatalf("with the header written outlines are accepted: %v", err)
+		t.Fatalf("with the header and documents written outlines are accepted: %v", err)
 	}
 	if doc, _ := Overview("", true); strings.Contains(doc, "纲要头还没写") {
 		t.Fatalf("a written header needs no guidance:\n%.200s", doc)
@@ -1792,12 +1803,9 @@ func TestHeaderDepNote(t *testing.T) {
 	}
 }
 
-// The first build runs documents first: a fresh table takes only documents'
-// outlines, refuses a written header while a document lacks one (unless the
-// same call moves it to observe), and only then takes source outlines; the
-// guidance follows that progress, and documents get docQuota whatever their
-// importance.
-func TestDocsFirst(t *testing.T) {
+// A grounded initial header can precede remaining documents, but the first
+// source outline waits for them. No role or source change is needed to advance.
+func TestInitialHeaderBeforeRemainingDocs(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	root := t.TempDir()
 	os.WriteFile(filepath.Join(root, "main.go"), []byte("package main"), 0o644)
@@ -1820,19 +1828,48 @@ func TestDocsFirst(t *testing.T) {
 	if err != nil || strings.Contains(got, "配额") {
 		t.Fatalf("a document's outline is taken first, under the document quota: %q %v", got, err)
 	}
-	if _, err := Header(testHeader, nil, nil, nil, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "docs/a.md") {
-		t.Fatalf("a written header waits for every document's outline: %v", err)
+	x := mustOpen(t, root)
+	rows, cfg := x.Rows(), x.Config()
+	got, err = Header(testHeader, nil, nil, nil, nil, nil, nil)
+	if err != nil || !strings.Contains(got, fmt.Sprintf(headerDocsPendingNote, "docs/a.md")) {
+		t.Fatalf("a grounded initial header must retain the document reminder: %q %v", got, err)
 	}
-	if x := mustOpen(t, root); !headerUnwritten(x.Header()) {
-		t.Fatal("the refused header must not be written")
+	x = mustOpen(t, root)
+	if headerUnwritten(x.Header()) || !reflect.DeepEqual(x.Rows(), rows) {
+		t.Fatal("writing the initial header must preserve all rows")
 	}
-	// moving a document to observe in the same call clears the way
-	if _, err := Header(testHeader, nil, nil, nil, []string{"docs"}, nil, nil); err != nil {
-		t.Fatalf("observed documents need no outline: %v", err)
+	after := x.Config()
+	if !slices.Equal(cfg.IgnoreDirs, after.IgnoreDirs) || !slices.Equal(cfg.IgnoreFiles, after.IgnoreFiles) ||
+		!slices.Equal(cfg.KeepFiles, after.KeepFiles) || !slices.Equal(cfg.ObserveDirs, after.ObserveDirs) ||
+		!slices.Equal(cfg.ObserveFiles, after.ObserveFiles) || !reflect.DeepEqual(cfg.Dirs, after.Dirs) {
+		t.Fatal("writing the initial header must preserve the cognitive role configuration")
 	}
-	// the gate belongs to the first build: once the header is written, a new
-	// document without an outline does not hold back header edits
+	if r, _ := x.Row("docs/a.md"); r.Outline != "" || x.Observed(r.Path, reconcileOpts) || x.Excluded(r.Path, reconcileOpts) {
+		t.Fatalf("the unfinished document must remain a cognitive skeleton: %+v", r)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "main.go")); string(b) != "package main" {
+		t.Fatal("header initialization must not change source bytes")
+	}
+	before, err := os.ReadFile(filepath.Join(root, base.TableName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Update("main.go", src); err == nil || !strings.Contains(err.Error(), "docs/a.md") {
+		t.Fatalf("the first source outline must wait for the remaining document: %v", err)
+	}
+	if after, err := os.ReadFile(filepath.Join(root, base.TableName)); err != nil || string(after) != string(before) {
+		t.Fatal("refusing an early source outline must preserve the complete table")
+	}
+	if _, err := Update("docs/a.md", "a.md[3 D CL T]: Role:文档约定 | Uses:- | API:- | Constraints:-"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Update("main.go", src); err != nil {
+		t.Fatalf("the first source outline must be accepted after documents are complete: %v", err)
+	}
+	// Existing source knowledge prevents a new document from restarting the
+	// first-build gate, for both source updates and first outlines of new files.
 	os.WriteFile(filepath.Join(root, "NEW.md"), []byte("n"), 0o644)
+	os.WriteFile(filepath.Join(root, "another.go"), []byte("package main"), 0o644)
 	if _, err := Scan(); err != nil {
 		t.Fatal(err)
 	}
@@ -1840,9 +1877,68 @@ func TestDocsFirst(t *testing.T) {
 		t.Fatalf("a written header is edited freely: %v", err)
 	}
 	if got, err := Update("main.go", src); err != nil {
-		t.Fatalf("with the header written source outlines are taken: %v", err)
+		t.Fatalf("an unfinished new document must not block existing source updates: %v", err)
 	} else if got2, _ := Update("main.go", "main.go[7 E CL T]: Role:入口 | Uses:- | API:- | Constraints:"+long); !strings.Contains(got2, "C7 配额") {
 		t.Fatalf("a source file keeps its importance quota: %q (first reply %q)", got2, got)
+	}
+	if _, err := Update("another.go", "another.go[7 E CL T]: Role:新增入口 | Uses:- | API:- | Constraints:-"); err != nil {
+		t.Fatalf("an unfinished new document must not block new source outlines in a mature repository: %v", err)
+	}
+}
+
+func TestFirstSourceDocsGateIgnoresOtherRoles(t *testing.T) {
+	for _, role := range []string{"observe", "excluded", "ignored", "deleted", "missing", "directory"} {
+		t.Run(role, func(t *testing.T) {
+			t.Setenv("TMPDIR", t.TempDir())
+			root := t.TempDir()
+			for _, file := range []string{"README.md", "main.go", "seed.go"} {
+				os.WriteFile(filepath.Join(root, file), []byte("content"), 0o644)
+			}
+			t.Chdir(root)
+			if _, err := Scan(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Header(testHeader, nil, nil, nil, nil, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			x := mustOpen(t, root)
+			seed := "seed.go"
+			if role == "directory" {
+				seed = "vendor"
+				if err := os.Mkdir(filepath.Join(root, seed), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			name := seed
+			if role == "directory" {
+				name += "/"
+			}
+			if err := x.SetOutline(seed, name+"[7 L ST T]: Role:既有认知 | Uses:- | API:- | Constraints:-"); err != nil {
+				t.Fatal(err)
+			}
+			cfg := x.Config()
+			var err error
+			switch role {
+			case "observe":
+				cfg.ObserveFiles = []string{seed}
+				err = x.SetConfig(cfg)
+			case "excluded":
+				cfg.IgnoreFiles = []string{seed}
+				err = x.SetConfig(cfg)
+			case "ignored":
+				err = x.SetIgnored(seed, true)
+			case "deleted":
+				err = x.SetDeleted(seed, true)
+			case "missing":
+				err = os.Remove(filepath.Join(root, seed))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Update("main.go", "main.go[7 E CL T]: Role:入口 | Uses:- | API:- | Constraints:-"); err == nil || !strings.Contains(err.Error(), "README.md") {
+				t.Fatalf("%s outline must not count as existing cognitive source knowledge: %v", role, err)
+			}
+		})
 	}
 }
 
@@ -1870,6 +1966,37 @@ func TestHeaderGuidanceStages(t *testing.T) {
 		if isDocFile(p) != want {
 			t.Errorf("isDocFile(%q) = %v", p, !want)
 		}
+	}
+}
+
+func TestInitializationPhaseRevisions(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root := t.TempDir()
+	for _, file := range []string{"README.md", "core.go", "ordinary.go"} {
+		os.WriteFile(filepath.Join(root, file), []byte("content"), 0o644)
+	}
+	t.Chdir(root)
+	if _, err := Scan(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Header(testHeader, nil, nil, nil, nil, nil, nil); err != nil || !strings.Contains(got, stagedInitRule) {
+		t.Fatalf("the initial header must carry the staged workflow: %q %v", got, err)
+	}
+	line := func(file string) string { return file + "[7 L ST T]: Role:职责 | Uses:- | API:- | Constraints:-" }
+	if got, err := Update("README.md", line("README.md")); err != nil || !strings.Contains(got, initDocsCompleteNote) || strings.Contains(got, initCompleteNote) {
+		t.Fatalf("completing documents must request revisions before core code: %q %v", got, err)
+	}
+	if got, err := Update("README.md", line("README.md")); err != nil || strings.Contains(got, initDocsCompleteNote) {
+		t.Fatalf("rewriting a completed document is not a new phase completion: %q %v", got, err)
+	}
+	if _, err := Update("core.go", line("core.go")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Update("ordinary.go", line("ordinary.go")); err != nil || !strings.Contains(got, initCompleteNote) {
+		t.Fatalf("completing all outlines must request the final header and affected-outline revision: %q %v", got, err)
+	}
+	if got, err := Update("ordinary.go", line("ordinary.go")); err != nil || strings.Contains(got, initCompleteNote) {
+		t.Fatalf("rewriting a completed outline must not restart initialization: %q %v", got, err)
 	}
 }
 

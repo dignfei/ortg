@@ -5,10 +5,11 @@ import "strconv"
 // All model-facing texts live here and only here.
 
 const semanticInitRule = "语义初始化：阅读源码正文（长文件分段读完）及可见的相关测试，AST、导入和符号清单只辅助定位，不能代替正文阅读与语义概括。Role 写实际职责；Uses 按职责与契约的重要性选择强依赖，不按导入顺序截取前五项；API/Constraints 只写有依据的契约与约束，无内容不伪填，不把未提供的固定文案猜写成已知约束。条目齐全不等于语义质量已核验。"
+const stagedInitRule = "首次初始化顺序：核心文档与源码入口 → 初始纲要头 → 补齐全部文档纲要 → 根据完整文档理解修订纲要头和受影响的已有纲要 → 优先建立核心代码纲要（入口、基础模块与关键执行链） → 根据核心代码理解再次修订头与受影响纲要 → 建立普通文件纲要 → 通读全库纲要，最后修订头及仍需更新的文件纲要。每轮检查职责、接口、约束和关系描述是否随新增理解变化；头用 ortg_header、文件纲要用 ortg_update 更新，不只更新头。所有未覆盖文件继续保留待建纲要状态。"
 const outlineConflictRule = "纲要与需求、源码、测试或实际运行结果冲突时，读取对应源码与测试核实，并修正不准确的纲要；状态对齐不证明代码正确或语义完整。"
-const dependencyBlockerRule = "任务依赖闭环：发现仓库缺失符号、导入失败或其他依赖缺口，按实际调用路径与可见测试判断是否阻断目标功能或验收。阻断的纳入修复计划，不能仅因文件未点名或改动前已缺失而排除；确与任务无关的按证据说明。"
+const dependencyBlockerRule = "任务依赖闭环：发现仓库缺失符号、导入失败或其他依赖缺口，按实际调用路径与可见测试判断是否阻断目标功能或验收。阻断的纳入修复计划，不能仅因文件未点名或改动前已缺失而排除；确与任务无关的按证据说明。恢复或迁移缺失符号后，全库搜索实际使用点，逐个消费者核对导入、名称绑定与调用契约；不能只补定义或修一个分支，遗漏的消费者也要纳入计划并验证。"
 const finalSourceRule = "最终验证：为绕过仓库缺失实现而临时注入或替换的函数、对象只作诊断。提交或结束任务前，移除这类替代，在新进程中按最终持久源码运行验收；仅替代后的自测通过不算最终源码通过。"
-const entryContractRule = "多入口契约：同一行为由 setter、预检、包装或快捷分支处理时，按入口与触发条件核对可见契约；提前校验或迁移后，异常类型、已明确给出的词句与输出格式仍须满足各入口约定，并分别覆盖各入口，不只验证底层函数。"
+const entryContractRule = "多入口契约：同一行为由 setter、预检、包装或快捷分支处理时，按入口与触发条件核对可见契约；提前校验或迁移后，异常类型、已明确给出的词句与输出格式仍须满足各入口约定，并分别覆盖各入口，不只验证底层函数。按任务实际使用的后端与通信入口运行验收；涉及 HTTP、SQLite 等不同实现时分别检查，另一后端或分支通过不能替代任务实际入口的验证。"
 
 const rulesBlock = `## ORTG 纲要规则
 本仓库由 ORTG 维护一份纲要：每个源码文件一行 "文件名[标签]: Role:职责 | Uses:依赖 | API:对外契约 | Constraints:约束"，模型通过纲要头规则加全部条目理解整个系统。
@@ -139,16 +140,14 @@ const tableFormatNote = "ortg: ortg.tsv 的格式本版 ortg 不认识（多半�
 const tableBrokenNote = "ortg: ortg.tsv 无法加载，本会话 ORTG 已停用，请先修复或从 ortg.tsv.bak 恢复: "
 
 // emptyTableNote and migrateHint cover bootstrapping from legacy outline documents.
-// The first build of a fresh table runs docs first, then the header, then
-// the source: headerFirstNote (%s the documents still without an outline, %d
-// the document quota) leads an overview of a fresh table and refuses anything
-// but a document's outline; headerFromDocsNote takes over once every document
-// has one, headerNoDocsNote when the repository has none; headerDocsMissingNote
-// (%s the documents) refuses a written header while documents still lack one.
-const headerFirstNote = "ortg: 纲要头还没写（【部署】【系统】仍是模板占位）。建纲要的第一步是给文档写纲要，源码纲要与目标纲要要等纲要头写好才收。还没纲要的文档：%s。逐份读全文（不要用 head、sed 截断），用 ortg_update 提交：Role 一句话说它讲什么，Constraints 写它规定的约定、约束与设计决定（文档按 %d 字配额，不按重要度）。教程、翻译、大批参考页这类可以放进观察档（ortg_header 的 observe_dirs、observe_files），或给所在目录写一行目录纲要。文档纲要齐了，再据此与目录结构写纲要头（ortg_header）：系统是什么、部署与运行方式、架构与模块划分、依赖层次、数据流、不可破坏的约定（含被测试锁定、跨模块的对外行为），并登记 #B模块 字典；然后逐个读源码写纲要，同时读它的单元测试和相关的集成测试，按测试契约把它们锁定的行为写进 Constraints。文档只作背景，纲要写代码实际怎么做；文档与代码不一致时按代码写，并在那份文档的纲要里记下不一致之处。" + " " + semanticInitRule
-const headerFromDocsNote = "ortg: 文档纲要已经齐了，纲要头还没写（【部署】【系统】仍是模板占位）。根据文档纲要与目录结构写纲要头（ortg_header）：系统是什么、部署与运行方式、架构与模块划分、依赖层次、数据流、不可破坏的约定（含被测试锁定、跨模块的对外行为），并登记 #B模块 字典；写好之后才收源码纲要与目标纲要。文档只作背景，与代码不一致时按代码写。"
-const headerNoDocsNote = "ortg: 纲要头还没写（【部署】【系统】仍是模板占位），仓库里也没有文档。先读入口文件与目录结构，写纲要头（ortg_header）：系统是什么、部署与运行方式、架构与模块划分、依赖层次、数据流、不可破坏的约定（含被测试锁定、跨模块的对外行为），并登记 #B模块 字典；写好之后才收文件纲要与目标纲要。"
-const headerDocsMissingNote = "ortg: 还有文档没写纲要，先不写纲要头：%s。逐份读全写文档纲要（用不上的放进观察档），再写纲要头；只改忽略、观察等配置不受此限。"
+// A fresh table first needs a grounded project header, not every document's
+// outline. Unfinished documents retain their cognitive role and remain pending.
+const headerFirstNote = "ortg: 纲要头还没写（【部署】【系统】仍是模板占位）。先读 README、架构等核心文档全文和源码入口，尽快用 ortg_header 写有依据的初始纲要头：系统是什么、部署与运行方式、模块划分、依赖层次、数据流与不可破坏的约定，并登记 #B模块 字典。不必等全部文档有纲要；不知道的事实先核查，不猜填。还没纲要的文档：%s。读过的文档用 ortg_update 提交，Role 写实际内容，Constraints 写有依据的约定（文档按 %d 字配额）。初始头写好后先补齐全部文档纲要，再按后续阶段修订与建源码纲要；初始头写好不表示全库初始化完成。文档只作背景，与代码不一致时按代码写并记录差异。" + " " + stagedInitRule + " " + semanticInitRule
+const headerFromDocsNote = "ortg: 文档纲要已经齐了，纲要头还没写（【部署】【系统】仍是模板占位）。根据文档纲要与目录结构写纲要头（ortg_header）：系统是什么、部署与运行方式、架构与模块划分、依赖层次、数据流、不可破坏的约定（含被测试锁定、跨模块的对外行为），并登记 #B模块 字典；写好之后才收源码纲要与目标纲要。文档只作背景，与代码不一致时按代码写。" + " " + stagedInitRule
+const headerNoDocsNote = "ortg: 纲要头还没写（【部署】【系统】仍是模板占位），仓库里也没有文档。先读入口文件与目录结构，写纲要头（ortg_header）：系统是什么、部署与运行方式、架构与模块划分、依赖层次、数据流、不可破坏的约定（含被测试锁定、跨模块的对外行为），并登记 #B模块 字典；写好之后才收文件纲要与目标纲要。没有文档则跳过文档阶段。" + " " + stagedInitRule
+const headerDocsPendingNote = "ortg: 初始纲要头已写，先补齐以下文档的纲要：%s。它们继续留在认知档；文档补齐后根据最新理解修订头与受影响纲要，再优先建立核心代码纲要。初始头写好不表示全库初始化完成。" + " " + stagedInitRule
+const initDocsCompleteNote = "ortg: 文档纲要阶段已完成。根据完整文档的最新理解，用 ortg_header 修订纲要头，并用 ortg_update 更新受影响的已有纲要；随后先读核心代码正文及相关测试、建立核心代码纲要，再次修订头与受影响纲要，最后处理普通文件。"
+const initCompleteNote = "ortg: 所有认知档文件已有纲要，进入初始化最后一轮修订。通读全库纲要，核对职责、接口、约束、关系与整体架构是否一致；用 ortg_header 更新纲要头，用 ortg_update 更新所有描述已不准确的文件纲要。条目齐全不等于语义完整，不以状态对齐替代这轮核查。"
 
 // headerDepNote (%s the file) follows an ortg_update whose Uses is new or
 // changed: the header's description of dependencies and layers does not

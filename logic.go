@@ -24,7 +24,7 @@ import (
 	"ortg/migrate"
 )
 
-const version = "0.5.30"
+const version = "0.5.34"
 
 var (
 	excludeDirs  = []string{".git", "build"}
@@ -3486,6 +3486,7 @@ func Update(rel, line string) (string, error) {
 	var warn string
 	var depChanged bool  // a new dependency edge may outdate the header
 	var distill []string // documents to distill once the last outline lands
+	var docsComplete, initComplete bool
 	err = x.Batch(func() error {
 		if f, _ := x.Inspect(rel); !f.Exists {
 			return fmt.Errorf("磁盘上不存在 %s，无法提交纲要", rel)
@@ -3501,6 +3502,11 @@ func Update(rel, line string) (string, error) {
 		}
 		if !dir && x.Observed(rel, reconcileOpts) {
 			return fmt.Errorf("%s 是观察档(observe_dirs/observe_files)：只记指纹、不写纲要，写了也不会渲染进整份纲要。确实要为它建立认知，把它加进 keep_files", rel)
+		}
+		if !dir && !isDocFile(rel) && !hasSourceOutline(x) {
+			if _, missing := docs(x); len(missing) > 0 {
+				return fmt.Errorf(headerDocsPendingNote, docList(missing))
+			}
 		}
 		w, err := checkOrError(x, rel, line)
 		if err != nil {
@@ -3525,10 +3531,15 @@ func Update(rel, line string) (string, error) {
 		if err := x.SetOutline(rel, line); err != nil {
 			return err
 		}
+		if old.Outline == "" && !headerUnwritten(x.Header()) && isDocFile(rel) {
+			_, missing := docs(x)
+			docsComplete = len(missing) == 0
+		}
 		// The first outline of the last file without one closes the first
 		// build: what the documents say now belongs in the header and the
 		// source outlines, and the documents can move to the observe tier.
 		if old.Outline == "" && !headerUnwritten(x.Header()) && !othersUnoutlined(x, rel) {
+			initComplete = true
 			distill, _ = docs(x)
 		}
 		return x.ClearTarget(rel)
@@ -3549,6 +3560,11 @@ func Update(rel, line string) (string, error) {
 	}
 	if depChanged {
 		msg += "\n" + fmt.Sprintf(headerDepNote, rel)
+	}
+	if initComplete {
+		msg += "\n" + initCompleteNote
+	} else if docsComplete {
+		msg += "\n" + initDocsCompleteNote
 	}
 	if len(distill) > 0 {
 		msg += "\n" + fmt.Sprintf(distillNote, docList(distill))
@@ -3689,6 +3705,18 @@ func depsOf(line string) string {
 		return u
 	}
 	return ""
+}
+
+// hasSourceOutline distinguishes an ongoing first build from a repository
+// already holding source knowledge. Documents and folder outlines do not count.
+func hasSourceOutline(x *base.Index) bool {
+	for _, r := range x.Rows() {
+		if r.Outline != "" && !isDirRow(r.Outline) && !isDocFile(r.Path) && r.Exists && !r.Ignored && !r.Deleted &&
+			!x.Excluded(r.Path, reconcileOpts) && !x.Observed(r.Path, reconcileOpts) {
+			return true
+		}
+	}
+	return false
 }
 
 // othersUnoutlined reports whether a live file other than rel, outside the
@@ -3847,19 +3875,17 @@ func Header(header string, ignoreDirs, ignoreFiles, keepFiles, observeDirs, obse
 		if header == "" {
 			return nil
 		}
-		// The first build writes the documents' outlines before the header
-		// (the config above may first move unneeded documents to observe).
-		if headerUnwritten(x.Header()) && !headerUnwritten(header) {
-			if _, missing := docs(x); len(missing) > 0 {
-				return fmt.Errorf(headerDocsMissingNote, docList(missing))
-			}
-		}
 		return x.SetHeader(header)
 	})
 	if err != nil {
 		return "", err
 	}
 	msg := "纲要头与配置已更新"
+	if header != "" && !headerUnwritten(x.Header()) {
+		if _, missing := docs(x); len(missing) > 0 {
+			msg += "\n" + fmt.Sprintf(headerDocsPendingNote, docList(missing))
+		}
+	}
 	if orphan := orphanKeys(x); len(orphan) > 0 {
 		msg += "\n" + fmt.Sprintf(keysOrphan, strings.Join(orphan, "、"))
 	}
