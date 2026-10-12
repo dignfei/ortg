@@ -40,6 +40,7 @@
 ## 提交
 
 - 一次提交只做一件事，用 conventional commits（`feat:` `fix:` `docs:` `refactor:` `test:` `chore:`），写明改了什么、为什么。
+- 每次 ORTG 改进或优化完成后，都要提交 Git 保存对应修改；代码、规则、文档、版本号与纲要一起提交，提交说明记录改动目的及验证结果。
 - 不提交 `build/`、`ortg.tsv.bak` 等生成物，也不提交 `CLAUDE.local.md`（本机专属设置，已在 `.gitignore`）。
 
 ## 许可证
