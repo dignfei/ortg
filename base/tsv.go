@@ -62,6 +62,14 @@ func (r *record) moduleOrDerived() string {
 
 type config struct{ raw map[string]json.RawMessage }
 
+func (c *config) string(key string) string {
+	var out string
+	if v, ok := c.raw[key]; ok {
+		_ = json.Unmarshal(v, &out)
+	}
+	return out
+}
+
 func (c *config) strings(key string) []string {
 	var out []string
 	if v, ok := c.raw[key]; ok {

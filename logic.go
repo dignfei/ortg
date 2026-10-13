@@ -404,6 +404,8 @@ func Overview(module string, force bool) (string, error) {
 	first := "" // a fresh table: the docs come before any outline
 	if headerUnwritten(x.Header()) {
 		first = headerFirstText(x) + "\n\n"
+	} else if x.Config().Mode == "task" {
+		first = taskModeNote + "\n\n"
 	}
 	opts := renderOpts(x, module)
 	bare, whole := module == "", module == "" || module == "*"
@@ -3752,11 +3754,12 @@ func updateOutlines(entries [][2]string) (string, error) {
 		// Batch may reload a concurrent writer's table. Gates use this latest
 		// pre-batch state: completing documents here must not skip revision.
 		unwritten := headerUnwritten(x.Header())
+		mode := x.Config().Mode
 		var missingDocs []string
-		if !unwritten {
+		if !unwritten && mode != "task" {
 			for _, entry := range entries {
 				if !isDirRow(entry[1]) && !isDocFile(entry[0]) {
-					if !hasSourceOutline(x) {
+					if mode == "build" || !hasSourceOutline(x) {
 						_, missingDocs = docs(x)
 					}
 					break
@@ -3839,13 +3842,13 @@ func updateOutlines(entries [][2]string) (string, error) {
 			messages = append(messages, msg)
 		}
 		if !unwritten {
-			initComplete = added && len(remaining) == 0
+			initComplete = added && len(remaining) == 0 && mode != "task"
 			if len(remaining) == 0 {
 				depChanged = append(depChanged, newDeps...)
 			}
 			if initComplete || addedDoc {
 				all, missing := docs(x)
-				docsComplete = addedDoc && len(missing) == 0
+				docsComplete = addedDoc && len(missing) == 0 && mode != "task"
 				if initComplete {
 					distill = all
 				}
@@ -4119,6 +4122,9 @@ func docList(d []string) string {
 // how far the first build has come: documents to outline, the header to
 // write from them, or — with no documents — the header from the code.
 func headerFirstText(x *base.Index) string {
+	if x.Config().Mode == "task" {
+		return headerTaskFirstNote
+	}
 	all, missing := docs(x)
 	switch {
 	case len(missing) > 0:
@@ -4159,13 +4165,19 @@ func Align(mode string, paths []string) (string, error) {
 }
 
 // Header replaces the header and/or the ignore and directory configuration.
-func Header(header string, ignoreDirs, ignoreFiles, keepFiles, observeDirs, observeFiles, dirs []string) (string, error) {
+func Header(header string, ignoreDirs, ignoreFiles, keepFiles, observeDirs, observeFiles, dirs []string, mode ...string) (string, error) {
+	if len(mode) > 1 || len(mode) == 1 && mode[0] != "" && mode[0] != "build" && mode[0] != "task" {
+		return "", errors.New(headerBadMode)
+	}
 	x, err := openIndex(repoRoot())
 	if err != nil {
 		return "", err
 	}
 	err = x.Batch(func() error {
 		cfg := x.Config()
+		if len(mode) == 1 {
+			cfg.Mode = mode[0]
+		}
 		if ignoreDirs != nil {
 			cfg.IgnoreDirs = ignoreDirs
 		}
@@ -4200,7 +4212,9 @@ func Header(header string, ignoreDirs, ignoreFiles, keepFiles, observeDirs, obse
 		return "", err
 	}
 	msg := "纲要头与配置已更新"
-	if header != "" && !headerUnwritten(x.Header()) {
+	if x.Config().Mode == "task" {
+		msg += "\n" + taskModeNote
+	} else if header != "" && !headerUnwritten(x.Header()) {
 		if _, missing := docs(x); len(missing) > 0 {
 			msg += "\n" + fmt.Sprintf(headerDocsPendingNote, docList(missing))
 		}

@@ -20,6 +20,7 @@ func commands() []base.Command {
 		{Name: "status", Usage: "只读对账报告", Run: func(args []string) error { return printResult(Status()) }},
 		{Name: "align", Usage: "--all | 路径...  人工核对后前移指纹", Run: runAlign},
 		{Name: "target", Usage: "--path P --outline L | --path P --delete | --document FILE", Run: runTarget},
+		{Name: "header", Usage: "--mode build|task|\"\" [--header TEXT]  设置维护模式或纲要头", Run: runHeader},
 		{Name: "hook", Usage: "--event session|subagent|prompt|pre|post|compact|stop  (宿主 hook 入口,读 stdin)", Run: runHook},
 		{Name: "mcp", Usage: "启动 stdio MCP 服务器", Run: runMCP},
 		{Name: "graph", Usage: "启动 CBM 常驻进程并刷新本仓库调用图(会话开始时 hook 在后台调用)", Run: func(args []string) error { return printResult(Graph()) }},
@@ -67,6 +68,25 @@ func runTarget(args []string) error {
 		text = string(b)
 	}
 	return printResult(Target(*p, *line, *del, text))
+}
+
+func runHeader(args []string) error {
+	fs := flag.NewFlagSet("header", flag.ContinueOnError)
+	mode := fs.String("mode", "", "build 全库初始化；task 当前任务；空串恢复旧兼容行为")
+	header := fs.String("header", "", "整块纲要头")
+	if err := fs.Parse(args); err != nil {
+		return base.ErrUsage
+	}
+	var modes []string
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "mode" {
+			modes = []string{*mode}
+		}
+	})
+	if fs.NArg() != 0 || modes == nil && *header == "" {
+		return base.ErrUsage
+	}
+	return printResult(Header(*header, nil, nil, nil, nil, nil, nil, modes...))
 }
 
 func runHook(args []string) (err error) {
@@ -197,12 +217,21 @@ func runMCP(args []string) error {
 			}},
 		{Name: "ortg_header", Description: toolDescription("ortg_header"),
 			Props: map[string]base.Prop{"header": {Type: "string", Description: "整块纲要头，每行以#开头"}, "ignore_dirs": {Type: "array", Description: "忽略目录"},
+				"mode":         {Type: "string", Description: "build 全库初始化；task 部分纲要下任务维护；空串恢复旧兼容行为；不传保持当前模式", Enum: []string{"build", "task", ""}},
 				"ignore_files": {Type: "array", Description: "忽略文件或glob"},
 				"keep_files":   {Type: "array", Description: "白名单，压过忽略规则的文件或glob"},
 				"observe_dirs": {Type: "array", Description: "观察目录：记指纹报变动，不要求纲要"}, "observe_files": {Type: "array", Description: "观察文件或glob：记指纹报变动，不要求纲要"},
 				"dirs": {Type: "array", Description: "目录标题，形如 目录=标题"}},
 			Handler: func(a base.Args) (string, error) {
 				h, _ := a.String("header")
+				var modes []string
+				if value, exists := a["mode"]; exists {
+					mode, ok := value.(string)
+					if !ok {
+						return "", fmt.Errorf("%s", headerBadMode)
+					}
+					modes = []string{mode}
+				}
 				id, err := a.Strings("ignore_dirs")
 				if err != nil {
 					return "", err
@@ -227,7 +256,7 @@ func runMCP(args []string) error {
 				if err != nil {
 					return "", err
 				}
-				return Header(h, id, ifl, kf, od, of, ds)
+				return Header(h, id, ifl, kf, od, of, ds, modes...)
 			}},
 	}
 	return base.Serve(os.Stdin, os.Stdout, "ortg", version, tools)
