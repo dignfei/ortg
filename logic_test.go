@@ -2480,11 +2480,15 @@ func TestClaudeSubagentSession(t *testing.T) {
 	fresh := func() string {
 		return `{"type":"system","subtype":"compact_boundary","timestamp":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}`
 	}
+	sub := filepath.Join(strings.TrimSuffix(tr, ".jsonl"), "subagents", "agent-agent-1.jsonl")
 	writeRecords(tr, `{"type":"user"}`)
-	writeRecords(filepath.Join(strings.TrimSuffix(tr, ".jsonl"), "subagents", "agent-agent-1.jsonl"), `{"type":"user"}`, fresh())
+	writeRecords(sub, `{"type":"user"}`)
+	// As on a real host: the hooks run before the transcript has the
+	// boundary, which is written by the context's next call.
 	time.Sleep(10 * time.Millisecond)
 	HookReply("compact", base.HookInput{Cwd: root, SessionID: "claude-1", TranscriptPath: tr})
 	HookReply("session", base.HookInput{Cwd: root, SessionID: "claude-1", TranscriptPath: tr, Source: "compact"})
+	writeRecords(sub, `{"type":"user"}`, fresh())
 	if out := call(""); strings.Contains(out, whole) {
 		t.Fatalf("a subagent's compaction reported as the session's is still the subagent's:\n%s", out)
 	}
@@ -2493,13 +2497,29 @@ func TestClaudeSubagentSession(t *testing.T) {
 	}
 	// The session's own compaction: its transcript has the fresh boundary.
 	time.Sleep(10 * time.Millisecond)
-	writeRecords(tr, `{"type":"user"}`, fresh())
 	HookReply("compact", base.HookInput{Cwd: root, SessionID: "claude-1", TranscriptPath: tr})
+	writeRecords(tr, `{"type":"user"}`, fresh())
 	if out := call("agent-1"); strings.Contains(out, whole) {
 		t.Fatalf("the session's compaction is not the subagent's:\n%s", out)
 	}
 	if out := call(""); !strings.Contains(out, whole) {
 		t.Fatalf("the session's compaction resends to it:\n%s", out)
+	}
+	// After a /clear the host process runs a new session id while the
+	// server's environment keeps the old one: the transcript is found by the
+	// host process, which its hooks record.
+	tr2 := filepath.Join(t.TempDir(), "claude-2.jsonl")
+	writeRecords(tr2, `{"type":"user"}`)
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "claude-2", TranscriptPath: tr2, Source: "clear"})
+	call("")
+	if out := call(""); strings.Contains(out, whole) {
+		t.Fatalf("settled after the clear:\n%s", out)
+	}
+	time.Sleep(10 * time.Millisecond)
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: "claude-2", TranscriptPath: tr2})
+	writeRecords(tr2, `{"type":"user"}`, fresh())
+	if out := call(""); !strings.Contains(out, whole) {
+		t.Fatalf("the new session's compaction is found through the host process:\n%s", out)
 	}
 	// A call no gate note precedes is the session's.
 	useCallSession(base.Args{"_meta": map[string]any{"claudecode/toolUseId": "toolu_unseen"}})

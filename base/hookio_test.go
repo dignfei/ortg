@@ -440,36 +440,46 @@ func boundary(at time.Time) map[string]any {
 	return map[string]any{"type": "system", "subtype": "compact_boundary", "content": "Conversation compacted", "timestamp": at.UTC().Format(time.RFC3339Nano)}
 }
 
-// Claude Code reports a subagent's compaction as the session's; the fresh
-// compact_boundary says whose context it was.
-func TestCompactedAgent(t *testing.T) {
+// A transcript's last compact_boundary record says when its context last
+// compacted; it is read incrementally, a half-written record waits for its
+// newline, and a mention of the word in a message is no boundary.
+func TestLastCompactAt(t *testing.T) {
 	dir := t.TempDir()
 	main := filepath.Join(dir, "sess.jsonl")
-	sub := filepath.Join(dir, "sess", "subagents", "agent-a1.jsonl")
-	other := filepath.Join(dir, "sess", "subagents", "agent-a2.jsonl")
-	now := time.Now()
-	chat := map[string]any{"type": "user", "message": map[string]any{"content": "talk about \"compact_boundary\" here"}, "timestamp": now.UTC().Format(time.RFC3339Nano)}
-	writeTranscript(t, main, chat, boundary(now.Add(-time.Hour)))
-	writeTranscript(t, sub, chat, boundary(now.Add(-2*time.Second)), map[string]any{"type": "user", "isCompactSummary": true, "message": map[string]any{"content": strings.Repeat("summary ", 5000)}})
-	writeTranscript(t, other, chat, boundary(now.Add(-10*time.Minute)))
-	if agent, known := CompactedAgent(main, now); !known || agent != "a1" {
-		t.Fatalf("the subagent with the fresh boundary compacted: %q %v", agent, known)
+	if got := SubagentTranscript(main, "a1"); got != filepath.Join(dir, "sess", "subagents", "agent-a1.jsonl") {
+		t.Fatalf("subagent transcript: %s", got)
 	}
-	writeTranscript(t, main, chat, boundary(now.Add(-time.Second)))
-	if agent, known := CompactedAgent(main, now); !known || agent != "" {
-		t.Fatalf("the session's newer boundary wins: %q %v", agent, known)
+	now := time.Now().Truncate(time.Millisecond)
+	chat := map[string]any{"type": "user", "message": map[string]any{"content": "talk about \"compact_boundary\""}, "note": "compact_boundary", "timestamp": now.UTC().Format(time.RFC3339Nano)}
+	writeTranscript(t, main, chat)
+	if got := LastCompactAt(main); !got.IsZero() {
+		t.Fatalf("no boundary yet: %v", got)
 	}
-	if _, known := CompactedAgent(main, now.Add(time.Hour)); known {
-		t.Fatal("stale boundaries tell nothing")
+	appendLine := func(s string) {
+		f, _ := os.OpenFile(main, os.O_APPEND|os.O_WRONLY, 0o644)
+		f.WriteString(s)
+		f.Close()
 	}
-	if _, known := CompactedAgent("", now); known {
-		t.Fatal("no transcript, nothing known")
+	b1, _ := json.Marshal(boundary(now.Add(-time.Minute)))
+	appendLine(string(b1) + "\n")
+	if got := LastCompactAt(main); !got.Equal(now.Add(-time.Minute)) {
+		t.Fatalf("appended boundary: %v", got)
 	}
-	quoted := map[string]any{"type": "user", "note": "compact_boundary", "timestamp": now.UTC().Format(time.RFC3339Nano)}
-	writeTranscript(t, main, chat, quoted)
-	writeTranscript(t, sub, chat, quoted)
-	if _, known := CompactedAgent(main, now); known {
-		t.Fatal("a mention of compact_boundary in a message is no boundary")
+	b2, _ := json.Marshal(boundary(now))
+	appendLine(string(b2[:20]))
+	if got := LastCompactAt(main); !got.Equal(now.Add(-time.Minute)) {
+		t.Fatalf("a half-written record is not read yet: %v", got)
+	}
+	appendLine(string(b2[20:]) + "\n")
+	if got := LastCompactAt(main); !got.Equal(now) {
+		t.Fatalf("the finished record is read: %v", got)
+	}
+	writeTranscript(t, main, chat)
+	if got := LastCompactAt(main); !got.IsZero() {
+		t.Fatalf("a rewritten, shorter transcript is read again: %v", got)
+	}
+	if got := LastCompactAt(filepath.Join(dir, "missing.jsonl")); !got.IsZero() {
+		t.Fatalf("no transcript: %v", got)
 	}
 	in := ReadHookInput(strings.NewReader(`{"hook_event_name":"PostCompact","session_id":"s","transcript_path":"/x/s.jsonl"}`), time.Second)
 	if in.TranscriptPath != "/x/s.jsonl" {

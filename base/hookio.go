@@ -31,7 +31,7 @@ type HookInput struct {
 	// thread, the id its MCP calls carry.
 	AgentID string
 	// TranscriptPath is the session's transcript, where a Claude Code
-	// compaction leaves its compact_boundary record (CompactedAgent).
+	// compaction leaves its compact_boundary record (LastCompactAt).
 	TranscriptPath string
 	Model          string // only Claude Code's interactive SessionStart carries it
 	// ToolOutput is what a PostToolUse payload says the tool printed, with
@@ -499,53 +499,50 @@ func ToolUseID(meta map[string]any) string {
 	return s
 }
 
-// compactFresh is how recent a compact_boundary must be to belong to the
-// compaction a hook reports.
-const compactFresh = 2 * time.Minute
-
-// CompactedAgent says whose context a compaction hook is about when the
-// payload names no agent. Claude Code reports a subagent's compaction with
-// the session's id, the session's transcript and no agent_id; only the
-// transcripts tell: the context that compacted ends with a fresh
-// compact_boundary record — the session's own transcript, or a subagent's
-// <transcript without .jsonl>/subagents/agent-<id>.jsonl, <id> being the
-// agent_id its hooks and tool calls carry. The newest fresh boundary wins:
-// agent "" for the session. known is false when no transcript has a fresh
-// boundary (Codex keeps none of this; its hooks name the agent instead).
-func CompactedAgent(transcript string, now time.Time) (agent string, known bool) {
-	if transcript == "" {
-		return "", false
-	}
-	var best time.Time
-	if t := lastCompact(transcript); !t.IsZero() && now.Sub(t) <= compactFresh {
-		best, known = t, true
-	}
-	subs, _ := filepath.Glob(filepath.Join(strings.TrimSuffix(transcript, ".jsonl"), "subagents", "agent-*.jsonl"))
-	for _, f := range subs {
-		if t := lastCompact(f); !t.IsZero() && now.Sub(t) <= compactFresh && t.After(best) {
-			best, known = t, true
-			agent = strings.TrimSuffix(strings.TrimPrefix(filepath.Base(f), "agent-"), ".jsonl")
-		}
-	}
-	return agent, known
+// SubagentTranscript is where Claude Code keeps a subagent's transcript,
+// beside the session's: <transcript without .jsonl>/subagents/agent-<id>.jsonl,
+// <id> being the agent_id its hooks and tool calls carry.
+func SubagentTranscript(transcript, agent string) string {
+	return filepath.Join(strings.TrimSuffix(transcript, ".jsonl"), "subagents", "agent-"+agent+".jsonl")
 }
 
-// lastCompact is the time of the last compact_boundary record in the tail
-// of a transcript (the compaction summary after it can be long); zero when
-// none.
-func lastCompact(path string) time.Time {
-	f, err := os.Open(path)
+// LastCompactAt is when the context this transcript belongs to last
+// compacted: the time of its last compact_boundary record (type system),
+// zero when none. A compaction hook cannot say which context compacted —
+// Claude Code reports a subagent's with the session's id and transcript, and
+// may not have written the record yet when the hook runs — but by the
+// context's next tool call its transcript has it. The file is read once and
+// then only what was appended since (a transcript only grows; a shorter one
+// is read again), so a call costs a stat.
+func LastCompactAt(path string) time.Time {
+	fi, err := os.Stat(path)
 	if err != nil {
 		return time.Time{}
 	}
-	defer f.Close()
-	const tail = 4 << 20
-	if fi, err := f.Stat(); err == nil && fi.Size() > tail {
-		f.Seek(fi.Size()-tail, io.SeekStart)
+	compactScan.Lock()
+	defer compactScan.Unlock()
+	st := compactScan.m[path]
+	if fi.Size() < st.size {
+		st = compactState{}
 	}
-	b, _ := io.ReadAll(f)
-	var last time.Time
-	for _, line := range bytes.Split(b, []byte("\n")) {
+	if fi.Size() == st.size {
+		return st.last
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return st.last
+	}
+	defer f.Close()
+	from := st.size
+	if from == 0 && fi.Size() > compactTail {
+		from = fi.Size() - compactTail
+	}
+	b := make([]byte, fi.Size()-from)
+	n, _ := f.ReadAt(b, from)
+	b = b[:n]
+	// Only whole lines: a record still being written is read next time.
+	end := bytes.LastIndexByte(b, '\n') + 1
+	for _, line := range bytes.Split(b[:end], []byte("\n")) {
 		if !bytes.Contains(line, []byte(`"compact_boundary"`)) {
 			continue
 		}
@@ -553,12 +550,28 @@ func lastCompact(path string) time.Time {
 			Type, Subtype string
 			Timestamp     time.Time
 		}
-		if json.Unmarshal(line, &r) == nil && r.Type == "system" && r.Subtype == "compact_boundary" && r.Timestamp.After(last) {
-			last = r.Timestamp
+		if json.Unmarshal(line, &r) == nil && r.Type == "system" && r.Subtype == "compact_boundary" && r.Timestamp.After(st.last) {
+			st.last = r.Timestamp
 		}
 	}
-	return last
+	st.size = from + int64(end)
+	compactScan.m[path] = st
+	return st.last
 }
+
+// compactTail bounds a transcript's first read: a compaction further back
+// than this is older than anything a running server has sent.
+const compactTail = 4 << 20
+
+type compactState struct {
+	size int64
+	last time.Time
+}
+
+var compactScan = struct {
+	sync.Mutex
+	m map[string]compactState
+}{m: map[string]compactState{}}
 
 // Ancestors lists the processes above this one, nearest first, leaving out
 // itself and pid 1; nil without /proc. A hook's ancestors include the host

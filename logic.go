@@ -549,6 +549,8 @@ var (
 var callSession struct {
 	ids     []string
 	fromEnv bool
+	// subagent: a Claude Code subagent's call (ids holds its agent_id).
+	subagent bool
 }
 
 // useCallSession takes the call's session from its _meta (or the
@@ -557,6 +559,7 @@ func useCallSession(a base.Args) {
 	meta, _ := a["_meta"].(map[string]any)
 	delete(a, "_meta")
 	callSession.ids, callSession.fromEnv = base.CallSession(meta)
+	callSession.subagent = false
 	if use := base.ToolUseID(meta); use != "" {
 		pendingMu.Lock()
 		p, ok := pendingUses[use]
@@ -564,7 +567,7 @@ func useCallSession(a base.Args) {
 		pendingMu.Unlock()
 		if ok && time.Since(p.at) <= pendingUseAge {
 			// A subagent's call: its context, which its hooks name agent_id.
-			callSession.ids, callSession.fromEnv = []string{p.agent}, false
+			callSession.ids, callSession.fromEnv, callSession.subagent = []string{p.agent}, false, true
 		}
 	}
 }
@@ -657,7 +660,67 @@ func lastReset(root string) (time.Time, string) {
 			at, src = t, d
 		}
 	}
+	// Claude Code: a compaction is read from the context's own transcript
+	// (see markCompact), the session's or the subagent's.
+	if callSession.fromEnv || callSession.subagent {
+		if tr := claudeTranscript(root); tr != "" {
+			if callSession.subagent {
+				tr = base.SubagentTranscript(tr, callSession.ids[0])
+			}
+			if t := base.LastCompactAt(tr); t.After(at) {
+				at, src = t, "compact"
+			}
+		}
+	}
 	return at, src
+}
+
+// claudeTranscript is the transcript of the Claude Code session this server
+// serves, as its hooks recorded it: by the host process (the server's
+// parent, which a /clear keeps while the session id changes), else by the
+// session id in the environment.
+func claudeTranscript(root string) string {
+	if _, tr := base.OverviewMark(root, "transcript-p"+strconv.Itoa(os.Getppid())); tr != "" {
+		return tr
+	}
+	if ids, fromEnv := base.CallSession(nil); fromEnv {
+		_, tr := base.OverviewMark(root, "transcript-s"+sessionKey(ids[0]))
+		return tr
+	}
+	return ""
+}
+
+// noteTranscript records a Claude Code hook's transcript for the servers of
+// its session: by session id and by every ancestor process (the host among
+// them).
+func noteTranscript(root, session, transcript string) {
+	if transcript == "" || base.Host() == "codex" {
+		return
+	}
+	if _, old := base.OverviewMark(root, "transcript-s"+sessionKey(session)); old != transcript {
+		base.MarkOverview(root, "transcript-s"+sessionKey(session), transcript)
+	}
+	for _, p := range base.Ancestors() {
+		k := "transcript-p" + strconv.Itoa(p)
+		if _, old := base.OverviewMark(root, k); old != transcript {
+			base.MarkOverview(root, k, transcript)
+		}
+	}
+}
+
+// markCompact records a compaction a hook reports. Codex names the
+// subagent (agent_id) and the hook may mark the context at once. Claude
+// Code reports a subagent's compaction as the session's, before the
+// transcripts show which it was: only the repository-wide mark is written
+// (for servers that know no session), and each server reads its own
+// context's transcript at its next call (lastReset).
+func markCompact(root string, in base.HookInput, source string) {
+	if in.AgentID == "" && in.TranscriptPath != "" && base.Host() != "codex" {
+		noteTranscript(root, in.SessionID, in.TranscriptPath)
+		base.MarkOverview(root, "reset", source)
+		return
+	}
+	markReset(root, in.SessionID, in.AgentID, source)
 }
 
 // sentMark is the mark kind a session's cache is saved under.
@@ -4768,14 +4831,14 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			base.MarkOverview(root, "model", in.Model)
 		}
 		agent := in.AgentID
+		noteTranscript(root, in.SessionID, in.TranscriptPath)
 		switch in.Source {
-		case "compact", "clear":
+		case "compact":
 			// The running MCP server still counts the outline as read; the
 			// context that held it is gone, so let the next overview serve it
-			// — to that context only (a subagent's, when it compacted).
-			if agent == "" && in.Source == "compact" {
-				agent, _ = base.CompactedAgent(in.TranscriptPath, time.Now())
-			}
+			// — to that context only.
+			markCompact(root, in, in.Source)
+		case "clear":
 			markReset(root, in.SessionID, agent, in.Source)
 		case "resume":
 			// The context is the old one: a new MCP server may load the cache
@@ -4822,11 +4885,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		// Silent: Codex rejects context output on PostCompact ("invalid
 		// PostCompact hook JSON output"), and the SessionStart(compact) that
 		// follows already restates the rules and asks for ortg_overview.
-		agent := in.AgentID
-		if agent == "" {
-			agent, _ = base.CompactedAgent(in.TranscriptPath, time.Now())
-		}
-		markReset(root, in.SessionID, agent, "compact")
+		markCompact(root, in, "compact")
 		return "", ""
 	case "prompt":
 		// The host does not reliably render a resume-time SessionStart message,
