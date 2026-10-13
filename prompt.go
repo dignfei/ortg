@@ -414,7 +414,15 @@ const reviewQuickClean = "核对没有发现要补的地方：目标纲要都合
 // semantic ties — a shared concept, config key or data format — so the model
 // is also sent to the global outline. It asks for a judgement per file, not a
 // blanket rewrite.
-const impactNote = "ortg: 判断这次改动的影响面。候选依赖方（Uses=全局纲要里 Uses 写到 %s，调用=CBM 调用图里调用它）：%s。再通读全局纲要做语义判断：Role/API/Constraints 里涉及同一概念、配置项、数据格式、协议或约定的文件，即使不在候选里也可能受影响（相关模块不在上下文就先用 ortg_overview 取）。逐个判断——接口或约定变了、代码要跟着改的，改代码并提交它的新纲要；代码不用改但纲要描述已不准的（如 Uses、API、Constraints 里提到的名字或行为变了），只重写那行纲要用 ortg_update 提交；不受影响的不动。改动涉及的文件纲要里点名的守护测试（「必须保持 X（测试名）」）要运行；它们失败时先回到需求确认，需求没有明确要求改变那个行为，就改实现，不改测试期望值。直接做，不询问。" + " " + dependencyBlockerRule + " " + entryContractRule
+const impactNote = "ortg: 判断这次改动的影响面。候选依赖方（Uses=全局纲要里 Uses 写到 %s，调用=CBM 调用图里调用它）：%s。再通读全局纲要做语义判断：Role/API/Constraints 里涉及同一概念、配置项、数据格式、协议或约定的文件，即使不在候选里也可能受影响（相关模块不在上下文就先用 ortg_overview 取）。逐个判断——接口或约定变了、代码要跟着改的，改代码并提交它的新纲要；代码不用改但纲要描述已不准的（如 Uses、API、Constraints 里提到的名字或行为变了），只重写那行纲要用 ortg_update 提交；不受影响的不动。改动涉及的文件纲要里点名的守护测试（「必须保持 X（测试名）」）要运行；它们失败时先回到需求确认，需求没有明确要求改变那个行为，就改实现，不改测试期望值。直接做，不询问。"
+
+// impactRules goes with updateDiscipline the first time a context gets it
+// (entryContractRule is in updateDiscipline already); disciplineSeen stands
+// for both afterwards — the full text stays in the context until a
+// compaction or a clear, after which it is sent again.
+var impactRules = dependencyBlockerRule
+
+const disciplineSeen = "（纲要行纪律、语义初始化、任务依赖闭环与多入口契约见本上下文前面第一次的完整提示，照它执行；上下文压缩或清空后会重发全文。）"
 
 // dirRowMismatch refuses an outline whose trailing "/" disagrees with the
 // path: a folder outline names a directory ("vendored/[标签]: ..."), a file's

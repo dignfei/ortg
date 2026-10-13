@@ -2546,6 +2546,71 @@ func TestClaudeSubagentSession(t *testing.T) {
 	}
 }
 
+// The fixed discipline text goes to a context once: an edit after the first
+// gets one line pointing back to it. A subagent is its own context; a start,
+// clear or compaction of the session — or a compaction its transcript shows
+// — sends the text again. The impact note no longer repeats the rules.
+func TestDisciplineOncePerContext(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root := t.TempDir()
+	a := filepath.Join(root, "a.go")
+	os.WriteFile(a, []byte("package a"), 0o644)
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	Update("a.go", "a.go[7 L ST T]: Role:a | Uses:- | API:- | Constraints:-")
+	tr := filepath.Join(t.TempDir(), "s1.jsonl")
+	os.WriteFile(tr, []byte(`{"type":"user"}`+"\n"), 0o644)
+	edit := func(session, agent string) string {
+		time.Sleep(10 * time.Millisecond)
+		os.WriteFile(a, []byte("package a // "+time.Now().String()), 0o644)
+		return HookReply("post", base.HookInput{ToolName: "Edit", FilePath: a, Cwd: root, SessionID: session, AgentID: agent, TranscriptPath: tr})
+	}
+	full := func(out string) bool {
+		return strings.Count(out, "纲要行纪律：") == 1 && strings.Count(out, "任务依赖闭环：") == 1 && strings.Count(out, "多入口契约：") == 1
+	}
+	if out := edit("s1", ""); !full(out) || strings.Contains(out, disciplineSeen) {
+		t.Fatalf("the first edit carries the discipline once, nothing doubled:\n%s", out)
+	}
+	if out := edit("s1", ""); strings.Contains(out, "纲要行纪律：") || strings.Contains(out, "任务依赖闭环：") || !strings.Contains(out, disciplineSeen) || !strings.Contains(out, "已改动") {
+		t.Fatalf("later edits point back to it:\n%s", out)
+	}
+	if out := edit("s1", "sub-1"); !full(out) {
+		t.Fatalf("a subagent is its own context:\n%s", out)
+	}
+	if out := edit("s1", "sub-1"); !strings.Contains(out, disciplineSeen) {
+		t.Fatalf("the subagent too gets it once:\n%s", out)
+	}
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "s1", Source: "compact", TranscriptPath: tr})
+	if out := edit("s1", ""); !full(out) {
+		t.Fatalf("after the session's compaction the text goes out again:\n%s", out)
+	}
+	// A Claude subagent's compaction shows only in its transcript.
+	time.Sleep(10 * time.Millisecond)
+	sub := base.SubagentTranscript(tr, "sub-1")
+	os.MkdirAll(filepath.Dir(sub), 0o755)
+	os.WriteFile(sub, []byte(`{"type":"system","subtype":"compact_boundary","timestamp":"`+time.Now().UTC().Format(time.RFC3339Nano)+`"}`+"\n"), 0o644)
+	if out := edit("s1", "sub-1"); !full(out) {
+		t.Fatalf("a compaction in the subagent's transcript sends it again:\n%s", out)
+	}
+	if out := edit("s1", "sub-1"); !strings.Contains(out, disciplineSeen) {
+		t.Fatalf("then once more only the pointer:\n%s", out)
+	}
+	// A Codex subagent's compaction names it (agent_id): its marks re-arm.
+	edit("s1", "sub-2")
+	if out := edit("s1", "sub-2"); !strings.Contains(out, disciplineSeen) {
+		t.Fatalf("sub-2 settled:\n%s", out)
+	}
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "s1", AgentID: "sub-2", Source: "compact"})
+	if out := edit("s1", "sub-2"); !full(out) {
+		t.Fatalf("a named subagent's compaction sends it the text again:\n%s", out)
+	}
+	if strings.Contains(impactNote, "任务依赖闭环") || strings.Contains(impactNote, "多入口契约") {
+		t.Fatal("the impact note carries no fixed rules")
+	}
+}
+
 // The cache outlives the MCP process: a host resuming the conversation in a
 // new process (claude -p --resume) starts a new server whose context still
 // holds the outline, so nothing is sent twice and the gate stays open; a

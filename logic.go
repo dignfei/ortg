@@ -708,6 +708,39 @@ func noteTranscript(root, session, transcript string) {
 	}
 }
 
+// disciplineFor is the outline discipline a hook adds to a notice: in full
+// the first time a context gets one (with impactRules), afterwards one line
+// pointing back to it. The context is the subagent's when agent_id is set.
+// The full text goes out again once that context lost it: a session start,
+// clear or compaction resets the injected marks (ResetInjected), and a
+// Claude Code compaction — whose hook cannot say which context compacted —
+// shows in the context's own transcript after the text was last sent.
+func disciplineFor(root string, in base.HookInput) string {
+	key := in.SessionID
+	if in.AgentID != "" {
+		key = in.AgentID
+	}
+	full := updateDiscipline + " " + impactRules
+	if key == "" {
+		return full
+	}
+	mark := "disc-" + sessionKey(key)
+	first := base.InjectOnce(key, "discipline")
+	if !first && in.TranscriptPath != "" {
+		tr := in.TranscriptPath
+		if in.AgentID != "" {
+			tr = base.SubagentTranscript(tr, in.AgentID)
+		}
+		sent, _ := base.OverviewMark(root, mark)
+		first = base.LastCompactAt(tr).After(sent)
+	}
+	if !first {
+		return disciplineSeen
+	}
+	base.MarkOverview(root, mark, "")
+	return full
+}
+
 // markCompact records a compaction a hook reports. Codex names the
 // subagent (agent_id) and the hook may mark the context at once. Claude
 // Code reports a subagent's compaction as the session's, before the
@@ -4851,7 +4884,8 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		}
 		if agent != "" {
 			// A subagent compacted: the session's context and what was
-			// injected into it stand.
+			// injected into it stand; the subagent's own marks re-arm.
+			base.ResetInjected(agent)
 		} else if in.Source != "resume" { // resume keeps the context; startup/clear/compact lose it
 			base.ResetInjected(in.SessionID)
 		} else {
@@ -4907,7 +4941,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		// Edit|Write matchers, which is exactly how outlines stay missing or go
 		// stale unnoticed. Fall back to the command text and the table itself.
 		if event == "post" {
-			return shellNote(x, in.SessionID, start, in.Command, in.ToolOutput, in.Background), ""
+			return shellNote(x, in, start), ""
 		}
 		return "", ""
 	}
@@ -5008,15 +5042,15 @@ func fileHookReply(event string, in base.HookInput, x *base.Index, rel string) s
 		}
 		if strings.EqualFold(in.ToolName, "Read") {
 			if !ok || f.OutlineEmpty {
-				return skeletonRule + "\n" + updateDiscipline
+				return skeletonRule + "\n" + disciplineFor(x.Root(), in)
 			}
 			if f.FingerprintChanged && f.OutlineOlderThanFile {
-				return fmt.Sprintf("ortg: %s 的纲要已过期(代码在纲要之后改动)。读完先调用 ortg_update 提交新纲要再继续——直接做，不询问。\n%s", rel, updateDiscipline)
+				return fmt.Sprintf("ortg: %s 的纲要已过期(代码在纲要之后改动)。读完先调用 ortg_update 提交新纲要再继续——直接做，不询问。\n%s", rel, disciplineFor(x.Root(), in))
 			}
 			return ""
 		}
 		if isFileEditTool(in.ToolName) {
-			s := fmt.Sprintf("ortg: 已改动 %s。在回复用户之前，先为它生成新纲要并调用 ortg_update 提交——这是改动的一部分，不征求同意、不列为待办。\n%s", rel, updateDiscipline)
+			s := fmt.Sprintf("ortg: 已改动 %s。在回复用户之前，先为它生成新纲要并调用 ortg_update 提交——这是改动的一部分，不征求同意、不列为待办。\n%s", rel, disciplineFor(x.Root(), in))
 			// The change may reach past the file: name the files the global
 			// outline says depend on it (their R names it) and the files the
 			// CBM graph says call into it, then have the model read the
@@ -5034,7 +5068,8 @@ func fileHookReply(event string, in base.HookInput, x *base.Index, rel string) s
 // the survivors are fingerprinted. Each file is named once per session so an
 // unrelated shell command does not repeat the same nag, and the SessionStart
 // report stays the backstop for anything the model lets slide.
-func shellNote(x *base.Index, session, cwd, cmd, output string, background bool) string {
+func shellNote(x *base.Index, in base.HookInput, cwd string) string {
+	session, cmd, output, background := in.SessionID, in.Command, in.ToolOutput, in.Background
 	recordTestResult(x.Root(), session, cwd, cmd, output)
 	if words, _ := scanTestRun(cmd, x.Root()); words != nil && (background || detachedCommand(cmd)) {
 		recordBgRun(x.Root(), session, words)
@@ -5088,7 +5123,7 @@ func shellNote(x *base.Index, session, cwd, cmd, output string, background bool)
 	}
 	var out string
 	if len(notes) > 0 {
-		out = strings.Join(notes, "\n") + "\n" + updateDiscipline
+		out = strings.Join(notes, "\n") + "\n" + disciplineFor(x.Root(), in)
 	}
 	// Names a shell edit removed are checked on every edit, not once per
 	// file like the stale notice: each edit may remove more.
@@ -5556,10 +5591,23 @@ const relatedMax = 20
 // outline injection too — while a warm query on a 4-core server takes ~2s.
 const relatedTimeout = 4 * time.Second
 
-// graphIndexTimeout bounds the synchronous CBM re-index of a post-edit hook
-// (~2s warm). With the two queries around it the hook needs up to 18s, so the
-// post Edit and Bash hooks carry a 20s timeout in hooks.json.
-const graphIndexTimeout = 10 * time.Second
+// graphRefreshGap is how often a repository's call graph is re-indexed
+// after edits at most: one background re-index covers the edits of the
+// seconds before it.
+const graphRefreshGap = 10 * time.Second
+
+// refreshGraph re-indexes the call graph in a detached process so the hook
+// does not wait for it; edits in quick succession share one re-index.
+func refreshGraph(x *base.Index) {
+	if !x.GraphEnabled() {
+		return
+	}
+	if at, _ := base.OverviewMark(x.Root(), "graph-refresh"); time.Since(at) < graphRefreshGap {
+		return
+	}
+	base.MarkOverview(x.Root(), "graph-refresh", "")
+	spawnGraph(x)
+}
 
 // relatedNote lists, under the pre-edit injection, the outlines of the files
 // that call into rel or that rel calls, as the local CBM call graph sees them.
@@ -6177,29 +6225,24 @@ func impactTests(x *base.Index, rels []string) string {
 // dependentsMax are named, and "无" stands for none. The CBM queries run in
 // parallel so several files still fit the hook's timeout.
 func impactCandidates(x *base.Index, session string, rels []string) string {
-	// The graph is read twice around a synchronous re-index: the edit is
-	// already on disk but not yet in the graph, so the first answer still has
-	// the callers of a renamed or removed symbol — the very files the edit
-	// breaks, which the re-indexed graph no longer links — and the second
-	// has the callers the edit added. The first answer is the pre-edit hook's
-	// when it kept one (an Edit's first touch of the file), else a query.
-	related := make([][]base.Relation, 2*len(rels))
-	query := func(off int, need func(i int) bool) {
-		var wg sync.WaitGroup
-		for i, rel := range rels {
-			if need(i) {
-				wg.Go(func() { related[off+i] = x.Related(rel, 2*relatedMax, relatedTimeout) })
-			}
-		}
-		wg.Wait()
-	}
-	query(0, func(i int) bool {
+	// The graph is read once, before it learns of the edit: the edit is
+	// already on disk but not yet in the graph, so the answer still has the
+	// callers of a renamed or removed symbol — the very files the edit
+	// breaks. It is the pre-edit hook's when it kept one (an Edit's first
+	// touch of the file), else a query. The re-index runs in the background
+	// (refreshGraph): waiting for it and a second query cost 5–7 seconds a
+	// hook for the callers the edit itself added, which are mostly in the
+	// edited files anyway.
+	related := make([][]base.Relation, len(rels))
+	var wg sync.WaitGroup
+	for i, rel := range rels {
 		var kept bool
-		related[i], kept = base.TakeRelations(session, rels[i])
-		return !kept
-	})
-	x.IndexGraph(graphIndexTimeout)
-	query(len(rels), func(int) bool { return true })
+		if related[i], kept = base.TakeRelations(session, rel); !kept {
+			wg.Go(func() { related[i] = x.Related(rel, 2*relatedMax, relatedTimeout) })
+		}
+	}
+	wg.Wait()
+	refreshGraph(x)
 	var names []string
 	src := map[string]string{}
 	for _, rel := range rels {
@@ -6225,7 +6268,7 @@ func impactCandidates(x *base.Index, session string, rels []string) string {
 				}
 			}
 		}
-		for _, r := range append(related[i], related[len(rels)+i]...) {
+		for _, r := range related[i] {
 			if _, ok := liveHead(x, r.Path); ok && !r.Calls {
 				add(r.Path, "调用")
 			}
