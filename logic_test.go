@@ -2611,6 +2611,41 @@ func TestDisciplineOncePerContext(t *testing.T) {
 	}
 }
 
+// A resumed session (an IDE reopening the conversation fires SessionStart
+// with source resume) still holds the rules and the outline: it gets one
+// line, not the rules, the "fetch first" or the "report first" again — which
+// made the model call ortg_overview on every turn. Files waiting on the
+// user's call bring the report; a start or a compaction gets everything.
+func TestResumeKeepsContext(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root := t.TempDir()
+	a := filepath.Join(root, "a.go")
+	os.WriteFile(a, []byte("package a"), 0o644)
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	Update("a.go", "a.go[7 L ST T]: Role:a | Uses:- | API:- | Constraints:-")
+	full := func(ctx string) bool {
+		return strings.Contains(ctx, "三条硬规则") && strings.Contains(ctx, sessionFetchNote) && strings.Contains(ctx, sessionReportNote)
+	}
+	for _, src := range []string{"startup", "compact", "clear"} {
+		if ctx, _ := HookReplyFull("session", base.HookInput{Cwd: root, SessionID: "s1", Source: src}); !full(ctx) {
+			t.Fatalf("%s gets the rules and the fetch note:\n%s", src, ctx)
+		}
+	}
+	ctx, user := HookReplyFull("session", base.HookInput{Cwd: root, SessionID: "s1", Source: "resume"})
+	if ctx != resumeNote || !strings.HasPrefix(user, "ortg 对账：") {
+		t.Fatalf("an aligned resume gets one line, the user the summary:\n%q\n%q", ctx, user)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	os.WriteFile(a, []byte("package a // changed"), 0o644)
+	ctx, _ = HookReplyFull("session", base.HookInput{Cwd: root, SessionID: "s1", Source: "resume"})
+	if !strings.HasPrefix(ctx, resumeNote) || !strings.Contains(ctx, "a.go") || full(ctx) || strings.Contains(ctx, "三条硬规则") {
+		t.Fatalf("a resume with files to decide on adds the report, still no rules:\n%s", ctx)
+	}
+}
+
 // The cache outlives the MCP process: a host resuming the conversation in a
 // new process (claude -p --resume) starts a new server whose context still
 // holds the outline, so nothing is sent twice and the gate stays open; a

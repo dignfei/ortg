@@ -4900,10 +4900,23 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			s, err := reconcileAndApply(x)
 			ch <- res{s, err}
 		}()
+		resumed := in.Source == "resume"
 		select {
 		case r := <-ch:
 			if r.err != nil {
+				if resumed {
+					return resumeNote, ""
+				}
 				return rulesText(), ""
+			}
+			if resumed {
+				// The context still holds the rules and the outline: no rules,
+				// no "fetch first", no "report first" again — only the report
+				// when files wait on the user's call.
+				if r.s.needsDecision() {
+					return resumeNote + "\n\n" + r.s.report(), "ortg 对账：" + r.s.oneLine()
+				}
+				return resumeNote, "ortg 对账：" + r.s.oneLine()
 			}
 			graph := ""
 			if x.GraphRefused() {
@@ -4912,6 +4925,9 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			return rulesText() + "\n\n" + r.s.report() + "\n" + graph + sessionFetchNote + sessionReportNote,
 				"ortg 对账：" + r.s.oneLine()
 		case <-time.After(4 * time.Second):
+			if resumed {
+				return resumeNote, ""
+			}
 			return rulesText() + "\n\n" + sessionFetchNote, ""
 		}
 	case "subagent":

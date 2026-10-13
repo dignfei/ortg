@@ -48,6 +48,13 @@ const overviewShortFooter = "以上是实时对账报告，纲要条目本身仍
 
 // sessionReportNote follows the alignment report in the session-start
 // context; sessionFetchNote replaces everything when reconciliation timed out.
+// resumeNote is all a resumed session gets (an IDE reopening the
+// conversation fires SessionStart with source resume, often every time the
+// user comes back): its context still holds the rules and the outline, and
+// repeating "fetch the outline first" there made the model call
+// ortg_overview on every turn for the same short reply.
+const resumeNote = "ortg: 会话已恢复——之前注入的 ORTG 规则与已取过的纲要仍在上下文里，照常使用，不用再调用 ortg_overview；文件有变动时 hook 会提示。上下文压缩或清空后会重新注入规则并提示重取。"
+
 const sessionReportNote = "第一次回复用户时，先用一句话报告上面的对账结果（对齐/过期/无纲要各多少），再谈正事。"
 const sessionFetchNote = "开工前先调用 ortg_overview（不带参数）取纲要（超过整份预算时先给纲要头与模块清单，再按问题取相关模块）。"
 
