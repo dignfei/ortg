@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,27 @@ func cbmPath() string {
 	return p
 }
 
+// cbmFor returns the binary for indexing or querying root: "" when CBM is
+// off or absent, or when root sits directly under a filesystem root (/app,
+// /testbed, /workspace — common in containers). CBM refuses such a path as
+// "too broad to index as one root"; neither allow-root --approve-sensitive
+// nor a symlink below it gets past that (CBM resolves the link), so a call
+// would only fail, about a second each time.
+func cbmFor(root string) string {
+	if cbmRefuses(root) {
+		return ""
+	}
+	return cbmPath()
+}
+
+// cbmRefuses reports whether CBM refuses to index root: the root itself, or
+// a directory right below it, of a filesystem or volume.
+func cbmRefuses(root string) bool {
+	p := filepath.Clean(root)
+	parent := filepath.Dir(p)
+	return parent == p || filepath.Dir(parent) == parent
+}
+
 // cbmProject is ORTG's own project name for root, so the graph it refreshes
 // and the graph it queries are always the same one.
 func cbmProject(root string) string {
@@ -60,7 +82,7 @@ func cbmIndexCmd(ctx context.Context, bin, root string) *exec.Cmd {
 // server). `daemon start` is idempotent, so running this at every session
 // start also brings the daemon back after a reboot or container restart.
 func cbmWarm(root string) error {
-	bin := cbmPath()
+	bin := cbmFor(root)
 	if bin == "" {
 		return nil
 	}
@@ -85,7 +107,7 @@ var cbmBusy, cbmDirty = map[string]bool{}, map[string]bool{}
 // MCP server): refreshes run one at a time per root, and requests that
 // arrive meanwhile collapse into one more run.
 func cbmRefresh(root string) {
-	bin := cbmPath()
+	bin := cbmFor(root)
 	if bin == "" {
 		return
 	}
@@ -120,7 +142,7 @@ func cbmRefresh(root string) {
 // deduplicated per direction, nil on any failure and non-nil (maybe empty)
 // on success, so a caller can tell "no callers" from "not known".
 func cbmRelated(root, rel string, limit int, timeout time.Duration) []Relation {
-	bin := cbmPath()
+	bin := cbmFor(root)
 	if bin == "" {
 		return nil
 	}

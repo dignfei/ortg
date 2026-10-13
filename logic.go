@@ -4905,7 +4905,11 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			if r.err != nil {
 				return rulesText(), ""
 			}
-			return rulesText() + "\n\n" + r.s.report() + "\n" + sessionFetchNote + sessionReportNote,
+			graph := ""
+			if x.GraphRefused() {
+				graph = fmt.Sprintf(graphRefusedNote, x.Root())
+			}
+			return rulesText() + "\n\n" + r.s.report() + "\n" + graph + sessionFetchNote + sessionReportNote,
 				"ortg 对账：" + r.s.oneLine()
 		case <-time.After(4 * time.Second):
 			return rulesText() + "\n\n" + sessionFetchNote, ""

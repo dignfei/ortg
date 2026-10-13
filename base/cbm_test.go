@@ -78,3 +78,26 @@ func TestCbmWarmOrder(t *testing.T) {
 		t.Fatalf("got %q", b)
 	}
 }
+
+// CBM refuses a repository right below a filesystem root ("too broad"),
+// with no way to approve it: such roots count as having no CBM at all.
+func TestCbmRefusesRootLevel(t *testing.T) {
+	for root, want := range map[string]bool{"/": true, "/app": true, "/testbed/": true, "/root/repo": false, "/home/d/aicode/ortg": false, "/tmp/x/y": false} {
+		if got := cbmRefuses(root); got != want {
+			t.Errorf("cbmRefuses(%q) = %v, want %v", root, got, want)
+		}
+	}
+	t.Setenv("ORTG_CBM", "")
+	stub := t.TempDir()
+	os.WriteFile(filepath.Join(stub, cbmBin), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	t.Setenv("PATH", stub)
+	if cbmFor("/app") != "" || cbmFor("/root/repo") == "" {
+		t.Fatalf("root-level repositories get no CBM, others do: %q %q", cbmFor("/app"), cbmFor("/root/repo"))
+	}
+	if !(&Index{root: "/app"}).GraphRefused() || (&Index{root: "/root/repo"}).GraphRefused() || (&Index{root: "/app"}).GraphEnabled() {
+		t.Fatal("GraphRefused/GraphEnabled follow the root")
+	}
+	if cbmRelated("/app", "a.go", 10, 0) != nil {
+		t.Fatal("a refused root answers \"unknown\" without calling CBM")
+	}
+}

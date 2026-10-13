@@ -422,6 +422,10 @@ const impactNote = "ortg: 判断这次改动的影响面。候选依赖方（Use
 // compaction or a clear, after which it is sent again.
 var impactRules = dependencyBlockerRule
 
+// graphRefusedNote (%s the root) joins the session report when CBM is
+// installed but refuses this root.
+const graphRefusedNote = "ortg: 本仓库直接在根目录下（%s），codebase-memory-mcp 拒绝索引这种位置，调用图不可用；改动的影响面只按 Uses 依赖与契约列出。\n"
+
 const disciplineSeen = "（纲要行纪律、语义初始化、任务依赖闭环与多入口契约见本上下文前面第一次的完整提示，照它执行；上下文压缩或清空后会重发全文。）"
 
 // dirRowMismatch refuses an outline whose trailing "/" disagrees with the

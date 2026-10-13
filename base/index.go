@@ -902,7 +902,7 @@ func (x *Index) RefreshGraph() { cbmRefresh(x.root) }
 // hook that must answer from the graph as it stands after an edit. A no-op
 // when CBM is absent or disabled; a failure only leaves the graph stale.
 func (x *Index) IndexGraph(timeout time.Duration) {
-	bin := cbmPath()
+	bin := cbmFor(x.root)
 	if bin == "" {
 		return
 	}
@@ -918,7 +918,12 @@ func (x *Index) IndexGraph(timeout time.Duration) {
 // GraphEnabled reports whether the CBM call graph is in use: the binary is on
 // PATH and ORTG_CBM is not "off". Guard Spawn("graph") with it — under go test
 // the executable is the test binary, which would rerun the suite.
-func (x *Index) GraphEnabled() bool { return cbmPath() != "" }
+func (x *Index) GraphEnabled() bool { return cbmFor(x.root) != "" }
+
+// GraphRefused reports whether CBM is installed and on but cannot index this
+// root (it sits directly under a filesystem root): there is no call graph
+// here, which the session report says once.
+func (x *Index) GraphRefused() bool { return cbmPath() != "" && cbmRefuses(x.root) }
 
 // WarmGraph starts CBM's permanent daemon and then re-indexes this root,
 // synchronously. A no-op when CBM is absent or disabled.
