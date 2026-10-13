@@ -25,7 +25,7 @@ claude plugin marketplace add "$PWD"   # 在 ortg 仓库根目录执行
 claude plugin install ortg@ortg
 ```
 
-装进去的是仓库工作树在那一刻的拷贝（`~/.claude/plugins/cache/ortg/ortg/<版本>/`），不会自动跟着仓库走。`hooks/hooks.json` 或 `.mcp.json` 改了之后要重新拷一次再重启会话；版本号不变时 `claude plugin update` 只会说"已是最新"而什么都不拷，所以直接卸了重装。重装前先删掉插件缓存：旧版本的缓存目录还在时，实测重装后缓存里仍是旧版的 `hooks.json`（从 0.1.0 直接装 0.3.39，拿到的是 0.1.0 的 hooks），删掉缓存就整份从仓库重拷：
+装进去的是仓库工作树在那一刻的拷贝（`~/.claude/plugins/cache/ortg/ortg/<版本>/`），不会自动跟着仓库走。`hooks/hooks.json` 或 `.mcp.json` 改了之后要重新拷一次再重启会话；Claude Code 的插件版本就是仓库当前的 git 提交哈希，没有新提交时 `claude plugin update` 只会说"已是最新"而什么都不拷，所以直接卸了重装。重装前先删掉插件缓存：旧版本的缓存目录还在时，实测重装后缓存里仍是旧版的 `hooks.json`（从 0.1.0 直接装 0.3.39，拿到的是 0.1.0 的 hooks），删掉缓存就整份从仓库重拷：
 
 ```bash
 claude plugin uninstall ortg@ortg && rm -rf ~/.claude/plugins/cache/ortg && claude plugin install ortg@ortg
@@ -37,7 +37,7 @@ claude plugin uninstall ortg@ortg && rm -rf ~/.claude/plugins/cache/ortg && clau
 python3 -c "import json,glob;print(all(json.load(open(f))==json.load(open('hooks/hooks.json')) for f in glob.glob('$HOME/.claude/plugins/cache/ortg/ortg/*/hooks/hooks.json')))"
 ```
 
-（或者把四处版本号一起提一级——`.claude-plugin/plugin.json`、`.claude-plugin/marketplace.json`、`.codex-plugin/plugin.json` 与 `logic.go` 的 `version`，`manifest_test` 盯着它们一致——再 `claude plugin marketplace update ortg && claude plugin update ortg@ortg`。）
+（或者先把改动提交——有了新提交就是新版本——再 `claude plugin marketplace update ortg && claude plugin update ortg@ortg`。ORTG 自己的版本号只写在 `.codex-plugin/plugin.json`，二进制构建时读取它，`manifest_test` 校验 Claude 的两份清单不写版本。）
 
 Codex（codex-cli 0.154 实测）：同样把本仓库当插件市场装上，在 ortg 仓库根目录执行
 

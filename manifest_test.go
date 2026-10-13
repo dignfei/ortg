@@ -22,14 +22,23 @@ func TestManifestsAgree(t *testing.T) {
 		}
 		return m
 	}
-	for _, p := range []string{".claude-plugin/plugin.json", ".codex-plugin/plugin.json"} {
-		if v := read(p)["version"]; v != version {
-			t.Errorf("%s version %v != binary %s", p, v, version)
-		}
+	// The version lives in one place, the Codex manifest, which the binary
+	// embeds. Claude Code versions the plugin by git commit: a version in its
+	// manifests would be a second copy to keep in step, and would pin the
+	// cache so that a new commit is "already up to date".
+	if v := read(".codex-plugin/plugin.json")["version"]; v != version || version == "dev" {
+		t.Errorf(".codex-plugin/plugin.json version %v, binary %s", v, version)
+	}
+	if v, ok := read(".claude-plugin/plugin.json")["version"]; ok {
+		t.Errorf(".claude-plugin/plugin.json carries version %v; Claude Code versions by commit", v)
 	}
 	mk := read(".claude-plugin/marketplace.json")
-	if plugins, _ := mk["plugins"].([]any); len(plugins) != 1 || plugins[0].(map[string]any)["version"] != version {
-		t.Errorf("marketplace version mismatch: %v", mk["plugins"])
+	plugins, _ := mk["plugins"].([]any)
+	if len(plugins) != 1 {
+		t.Fatalf("marketplace lists %d plugins, want 1", len(plugins))
+	}
+	if v, ok := plugins[0].(map[string]any)["version"]; ok {
+		t.Errorf("marketplace entry carries version %v; Claude Code versions by commit", v)
 	}
 	// Hooks reach every repo, this one included, through the installed plugin.
 	// A copy in the repo's own settings is not a fallback but a second

@@ -5,6 +5,7 @@ package main
 
 import (
 	"crypto/sha1"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +25,24 @@ import (
 	"ortg/migrate"
 )
 
-const version = "0.5.38"
+// codexManifest carries the repo's one version number. Claude Code versions
+// the plugin by git commit, so its manifests hold none; the binary takes its
+// version from here at build time.
+//
+//go:embed .codex-plugin/plugin.json
+var codexManifest []byte
+
+// version falls back to "dev" rather than panicking: a broken manifest must
+// not take every hook down with the binary (manifest_test catches it).
+var version = func() string {
+	var m struct {
+		Version string `json:"version"`
+	}
+	if json.Unmarshal(codexManifest, &m) != nil || m.Version == "" {
+		return "dev"
+	}
+	return m.Version
+}()
 
 var (
 	excludeDirs  = []string{".git", "build"}

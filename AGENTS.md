@@ -23,7 +23,7 @@
 
 ## 必须同步改的地方
 
-- 版本号四处一致：`.claude-plugin/plugin.json`、`.claude-plugin/marketplace.json`、`.codex-plugin/plugin.json`、`logic.go` 的 `version`（`manifest_test.go` 校验）。
+- 版本号只写在 `.codex-plugin/plugin.json` 一处：二进制构建时经 `go:embed` 读取；Claude Code 以 git 提交哈希作插件版本，它的两份清单不写 `version`（`manifest_test.go` 校验）。
 - `hooks/hooks.json` 与 `hooks/codex.json` 的命令式条目必须一模一样；新增 hook 事件要同改两份文件与 `manifest_test.go`。
 - 行为变了，同步改 `README.md` 与 `docs/rules.md`。
 
