@@ -1644,7 +1644,8 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 		return
 	}
 	last := summaries[len(summaries)-1]
-	terminal := last.complete && strings.TrimSpace(output[last.end:]) == "" && !pytestOutputTruncated(output)
+	terminalSummary := last.complete && strings.TrimSpace(output[last.end:]) == ""
+	terminal := terminalSummary && !pytestOutputTruncated(output)
 	start := 0
 	if len(summaries) > 1 {
 		start = summaries[len(summaries)-2].end
@@ -1652,7 +1653,13 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	// One static, foreground command has one outer result. Earlier summaries
 	// can be output captured from tests; compound or dynamic commands cannot
 	// safely assign their summaries this way. A missing tail stays unknown.
-	singleResult := len(segments) == 1 && !segments[0].piped && !detachedCommand(cmd) && !strings.ContainsAny(cmd, "$`") && terminal
+	singleCommand := len(segments) == 1 && !segments[0].piped && !detachedCommand(cmd) && !strings.ContainsAny(cmd, "$`")
+	if singleCommand && !terminalSummary {
+		// A captured pytester abort followed by outer progress has no outer
+		// terminal summary. It proves neither a collection failure nor pass.
+		summaries = slices.DeleteFunc(summaries, func(s pytestSummary) bool { return s.collectionErrors })
+	}
+	singleResult := singleCommand && terminal
 	if singleResult {
 		summaries = summaries[len(summaries)-1:]
 	}
