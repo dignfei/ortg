@@ -2470,6 +2470,37 @@ func TestClaudeSubagentSession(t *testing.T) {
 	if out := call("agent-1"); !strings.Contains(out, whole) || !strings.Contains(out, "被压缩") {
 		t.Fatalf("the subagent's own compaction resends to it:\n%s", out)
 	}
+	// Claude Code reports a subagent's compaction as the session's (no
+	// agent_id); the subagent's transcript, with the fresh boundary, tells.
+	tr := filepath.Join(t.TempDir(), "claude-1.jsonl")
+	writeRecords := func(path string, recs ...string) {
+		os.MkdirAll(filepath.Dir(path), 0o755)
+		os.WriteFile(path, []byte(strings.Join(recs, "\n")+"\n"), 0o644)
+	}
+	fresh := func() string {
+		return `{"type":"system","subtype":"compact_boundary","timestamp":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}`
+	}
+	writeRecords(tr, `{"type":"user"}`)
+	writeRecords(filepath.Join(strings.TrimSuffix(tr, ".jsonl"), "subagents", "agent-agent-1.jsonl"), `{"type":"user"}`, fresh())
+	time.Sleep(10 * time.Millisecond)
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: "claude-1", TranscriptPath: tr})
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "claude-1", TranscriptPath: tr, Source: "compact"})
+	if out := call(""); strings.Contains(out, whole) {
+		t.Fatalf("a subagent's compaction reported as the session's is still the subagent's:\n%s", out)
+	}
+	if out := call("agent-1"); !strings.Contains(out, whole) || !strings.Contains(out, "被压缩") {
+		t.Fatalf("the subagent learns of its compaction from its transcript:\n%s", out)
+	}
+	// The session's own compaction: its transcript has the fresh boundary.
+	time.Sleep(10 * time.Millisecond)
+	writeRecords(tr, `{"type":"user"}`, fresh())
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: "claude-1", TranscriptPath: tr})
+	if out := call("agent-1"); strings.Contains(out, whole) {
+		t.Fatalf("the session's compaction is not the subagent's:\n%s", out)
+	}
+	if out := call(""); !strings.Contains(out, whole) {
+		t.Fatalf("the session's compaction resends to it:\n%s", out)
+	}
 	// A call no gate note precedes is the session's.
 	useCallSession(base.Args{"_meta": map[string]any{"claudecode/toolUseId": "toolu_unseen"}})
 	if out, _ := Overview("", false); strings.Contains(out, whole) {

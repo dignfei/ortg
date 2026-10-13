@@ -4767,12 +4767,16 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		if in.Model != "" {
 			base.MarkOverview(root, "model", in.Model)
 		}
+		agent := in.AgentID
 		switch in.Source {
 		case "compact", "clear":
 			// The running MCP server still counts the outline as read; the
 			// context that held it is gone, so let the next overview serve it
-			// — to this session only.
-			markReset(root, in.SessionID, in.AgentID, in.Source)
+			// — to that context only (a subagent's, when it compacted).
+			if agent == "" && in.Source == "compact" {
+				agent, _ = base.CompactedAgent(in.TranscriptPath, time.Now())
+			}
+			markReset(root, in.SessionID, agent, in.Source)
 		case "resume":
 			// The context is the old one: a new MCP server may load the cache
 			// the old server saved.
@@ -4782,7 +4786,10 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			base.MarkOverview(root, "start", "")
 			base.PruneOverviewMarks(root, []string{"reset-s", "reset-p", "sent-s"}, staleMarkAge)
 		}
-		if in.Source != "resume" { // resume keeps the context; startup/clear/compact lose it
+		if agent != "" {
+			// A subagent compacted: the session's context and what was
+			// injected into it stand.
+		} else if in.Source != "resume" { // resume keeps the context; startup/clear/compact lose it
 			base.ResetInjected(in.SessionID)
 		} else {
 			base.ResetInjectedKey(in.SessionID, decisionKey)
@@ -4815,7 +4822,11 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		// Silent: Codex rejects context output on PostCompact ("invalid
 		// PostCompact hook JSON output"), and the SessionStart(compact) that
 		// follows already restates the rules and asks for ortg_overview.
-		markReset(root, in.SessionID, in.AgentID, "compact")
+		agent := in.AgentID
+		if agent == "" {
+			agent, _ = base.CompactedAgent(in.TranscriptPath, time.Now())
+		}
+		markReset(root, in.SessionID, agent, "compact")
 		return "", ""
 	case "prompt":
 		// The host does not reliably render a resume-time SessionStart message,

@@ -30,7 +30,10 @@ type HookInput struct {
 	// still gives the parent's session_id: agent_id is the subagent's own
 	// thread, the id its MCP calls carry.
 	AgentID string
-	Model   string // only Claude Code's interactive SessionStart carries it
+	// TranscriptPath is the session's transcript, where a Claude Code
+	// compaction leaves its compact_boundary record (CompactedAgent).
+	TranscriptPath string
+	Model          string // only Claude Code's interactive SessionStart carries it
 	// ToolOutput is what a PostToolUse payload says the tool printed, with
 	// terminal color codes removed and at most its last toolOutputMax bytes.
 	// A host may already have cut a long output (Claude Code keeps its head
@@ -309,16 +312,17 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 	mu.Unlock()
 	var in HookInput
 	var m struct {
-		Event     string          `json:"hook_event_name"`
-		ToolName  string          `json:"tool_name"`
-		Cwd       string          `json:"cwd"`
-		Source    string          `json:"source"`
-		SessionID string          `json:"session_id"`
-		AgentID   string          `json:"agent_id"`
-		Model     string          `json:"model"`
-		Response  json.RawMessage `json:"tool_response"`
-		StopHook  bool            `json:"stop_hook_active"`
-		Input     struct {
+		Event      string          `json:"hook_event_name"`
+		ToolName   string          `json:"tool_name"`
+		Cwd        string          `json:"cwd"`
+		Source     string          `json:"source"`
+		SessionID  string          `json:"session_id"`
+		AgentID    string          `json:"agent_id"`
+		Transcript string          `json:"transcript_path"`
+		Model      string          `json:"model"`
+		Response   json.RawMessage `json:"tool_response"`
+		StopHook   bool            `json:"stop_hook_active"`
+		Input      struct {
 			FilePath     string `json:"file_path"`
 			NotebookPath string `json:"notebook_path"`
 			Command      string `json:"command"`
@@ -333,6 +337,7 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 	if m.AgentID != "" {
 		in.AgentID = filepath.Base(m.AgentID)
 	}
+	in.TranscriptPath = m.Transcript
 	in.ToolOutput = toolOutput(m.Response)
 	in.FilePath = m.Input.FilePath
 	if in.FilePath == "" {
@@ -492,6 +497,67 @@ func CallSession(meta map[string]any) (ids []string, fromEnv bool) {
 func ToolUseID(meta map[string]any) string {
 	s, _ := meta["claudecode/toolUseId"].(string)
 	return s
+}
+
+// compactFresh is how recent a compact_boundary must be to belong to the
+// compaction a hook reports.
+const compactFresh = 2 * time.Minute
+
+// CompactedAgent says whose context a compaction hook is about when the
+// payload names no agent. Claude Code reports a subagent's compaction with
+// the session's id, the session's transcript and no agent_id; only the
+// transcripts tell: the context that compacted ends with a fresh
+// compact_boundary record — the session's own transcript, or a subagent's
+// <transcript without .jsonl>/subagents/agent-<id>.jsonl, <id> being the
+// agent_id its hooks and tool calls carry. The newest fresh boundary wins:
+// agent "" for the session. known is false when no transcript has a fresh
+// boundary (Codex keeps none of this; its hooks name the agent instead).
+func CompactedAgent(transcript string, now time.Time) (agent string, known bool) {
+	if transcript == "" {
+		return "", false
+	}
+	var best time.Time
+	if t := lastCompact(transcript); !t.IsZero() && now.Sub(t) <= compactFresh {
+		best, known = t, true
+	}
+	subs, _ := filepath.Glob(filepath.Join(strings.TrimSuffix(transcript, ".jsonl"), "subagents", "agent-*.jsonl"))
+	for _, f := range subs {
+		if t := lastCompact(f); !t.IsZero() && now.Sub(t) <= compactFresh && t.After(best) {
+			best, known = t, true
+			agent = strings.TrimSuffix(strings.TrimPrefix(filepath.Base(f), "agent-"), ".jsonl")
+		}
+	}
+	return agent, known
+}
+
+// lastCompact is the time of the last compact_boundary record in the tail
+// of a transcript (the compaction summary after it can be long); zero when
+// none.
+func lastCompact(path string) time.Time {
+	f, err := os.Open(path)
+	if err != nil {
+		return time.Time{}
+	}
+	defer f.Close()
+	const tail = 4 << 20
+	if fi, err := f.Stat(); err == nil && fi.Size() > tail {
+		f.Seek(fi.Size()-tail, io.SeekStart)
+	}
+	b, _ := io.ReadAll(f)
+	var last time.Time
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		if !bytes.Contains(line, []byte(`"compact_boundary"`)) {
+			continue
+		}
+		var r struct {
+			Type, Subtype string
+			Timestamp     time.Time
+		}
+		if json.Unmarshal(line, &r) == nil && r.Type == "system" && r.Subtype == "compact_boundary" && r.Timestamp.After(last) {
+			last = r.Timestamp
+		}
+	}
+	return last
 }
 
 // Ancestors lists the processes above this one, nearest first, leaving out

@@ -421,3 +421,58 @@ func TestToolUseID(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// writeTranscript writes JSONL records as Claude Code does.
+func writeTranscript(t *testing.T, path string, recs ...map[string]any) {
+	t.Helper()
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	var b bytes.Buffer
+	for _, r := range recs {
+		j, _ := json.Marshal(r)
+		b.Write(append(j, '\n'))
+	}
+	if err := os.WriteFile(path, b.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func boundary(at time.Time) map[string]any {
+	return map[string]any{"type": "system", "subtype": "compact_boundary", "content": "Conversation compacted", "timestamp": at.UTC().Format(time.RFC3339Nano)}
+}
+
+// Claude Code reports a subagent's compaction as the session's; the fresh
+// compact_boundary says whose context it was.
+func TestCompactedAgent(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "sess.jsonl")
+	sub := filepath.Join(dir, "sess", "subagents", "agent-a1.jsonl")
+	other := filepath.Join(dir, "sess", "subagents", "agent-a2.jsonl")
+	now := time.Now()
+	chat := map[string]any{"type": "user", "message": map[string]any{"content": "talk about \"compact_boundary\" here"}, "timestamp": now.UTC().Format(time.RFC3339Nano)}
+	writeTranscript(t, main, chat, boundary(now.Add(-time.Hour)))
+	writeTranscript(t, sub, chat, boundary(now.Add(-2*time.Second)), map[string]any{"type": "user", "isCompactSummary": true, "message": map[string]any{"content": strings.Repeat("summary ", 5000)}})
+	writeTranscript(t, other, chat, boundary(now.Add(-10*time.Minute)))
+	if agent, known := CompactedAgent(main, now); !known || agent != "a1" {
+		t.Fatalf("the subagent with the fresh boundary compacted: %q %v", agent, known)
+	}
+	writeTranscript(t, main, chat, boundary(now.Add(-time.Second)))
+	if agent, known := CompactedAgent(main, now); !known || agent != "" {
+		t.Fatalf("the session's newer boundary wins: %q %v", agent, known)
+	}
+	if _, known := CompactedAgent(main, now.Add(time.Hour)); known {
+		t.Fatal("stale boundaries tell nothing")
+	}
+	if _, known := CompactedAgent("", now); known {
+		t.Fatal("no transcript, nothing known")
+	}
+	quoted := map[string]any{"type": "user", "note": "compact_boundary", "timestamp": now.UTC().Format(time.RFC3339Nano)}
+	writeTranscript(t, main, chat, quoted)
+	writeTranscript(t, sub, chat, quoted)
+	if _, known := CompactedAgent(main, now); known {
+		t.Fatal("a mention of compact_boundary in a message is no boundary")
+	}
+	in := ReadHookInput(strings.NewReader(`{"hook_event_name":"PostCompact","session_id":"s","transcript_path":"/x/s.jsonl"}`), time.Second)
+	if in.TranscriptPath != "/x/s.jsonl" {
+		t.Fatalf("transcript_path not read: %q", in.TranscriptPath)
+	}
+}
