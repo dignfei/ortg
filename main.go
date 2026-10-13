@@ -143,11 +143,24 @@ func runMCP(args []string) error {
 			Props:   map[string]base.Prop{},
 			Handler: func(a base.Args) (string, error) { return Scan() }},
 		{Name: "ortg_update", Description: toolDescription("ortg_update"),
-			Props:    map[string]base.Prop{"path": {Type: "string", Description: "仓库相对路径"}, "outline": {Type: "string", Description: "完整纲要行"}},
-			Required: []string{"path", "outline"},
+			Props: map[string]base.Prop{"path": {Type: "string", Description: "仓库相对路径"}, "outline": {Type: "string", Description: "完整纲要行"},
+				"items": {Type: "array", Description: updateItemsDescription}},
 			Handler: func(a base.Args) (string, error) {
-				p, _ := a.String("path")
-				l, _ := a.String("outline")
+				if _, ok := a["items"]; ok {
+					items, err := a.Strings("items")
+					if err != nil {
+						return "", err
+					}
+					return UpdateItems(items)
+				}
+				p, err := a.String("path")
+				if err != nil {
+					return "", err
+				}
+				l, err := a.String("outline")
+				if err != nil {
+					return "", err
+				}
 				return Update(p, l)
 			}},
 		{Name: "ortg_target", Description: toolDescription("ortg_target"),

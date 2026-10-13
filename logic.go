@@ -24,7 +24,7 @@ import (
 	"ortg/migrate"
 )
 
-const version = "0.5.35"
+const version = "0.5.36"
 
 var (
 	excludeDirs  = []string{".git", "build"}
@@ -3639,94 +3639,183 @@ func keyContracts(x *base.Index, set, quoted map[string]bool) ([]string, map[str
 
 // Update stores a submitted outline line and applies any target outline.
 func Update(rel, line string) (string, error) {
+	if strings.TrimSpace(rel) == "" || strings.TrimSpace(line) == "" {
+		return "", errors.New(updateNeedArgs)
+	}
+	return updateOutlines([][2]string{{rel, line}})
+}
+
+// UpdateItems submits complete current outlines in one atomic transaction.
+// Each item is "path outline"; unlike targets, neither "=" nor deletion is accepted.
+func UpdateItems(items []string) (string, error) {
+	if len(items) == 0 {
+		return "", errors.New(updateEmptyItems)
+	}
+	entries := make([][2]string, 0, len(items))
+	for _, item := range items {
+		it := strings.TrimSpace(item)
+		i := strings.IndexAny(it, " \t")
+		if i <= 0 || strings.TrimSpace(it[i+1:]) == "" {
+			return "", fmt.Errorf(updateBadItem, item)
+		}
+		entries = append(entries, [2]string{it[:i], strings.TrimSpace(it[i+1:])})
+	}
+	return updateOutlines(entries)
+}
+
+// updateOutlines shares the single-file validations, one table load and one
+// Batch. Only a committed batch may change session state or refresh the graph.
+func updateOutlines(entries [][2]string) (string, error) {
 	x, err := openIndex(repoRoot())
 	if err != nil {
 		return "", err
 	}
-	if rel, err = normRel(x.Root(), rel); err != nil {
-		return "", err
+	paths := make([]string, 0, len(entries))
+	seen := map[string]bool{}
+	for i := range entries {
+		rel, err := normRel(x.Root(), entries[i][0])
+		if err != nil {
+			return "", fmt.Errorf(updateFailed, entries[i][0], err)
+		}
+		if seen[rel] {
+			return "", fmt.Errorf(updateDuplicate, rel)
+		}
+		seen[rel] = true
+		entries[i][0] = rel
+		paths = append(paths, rel)
 	}
-	// a fresh table takes the documents' outlines first, nothing else
-	if headerUnwritten(x.Header()) && !isDocFile(rel) {
-		return "", errors.New(headerFirstText(x))
-	}
-	var warn string
-	var depChanged bool  // a new dependency edge may outdate the header
-	var distill []string // documents to distill once the last outline lands
+	var messages, depChanged, newDeps, distill []string
 	var docsComplete, initComplete bool
+	failedPath := ""
 	err = x.Batch(func() error {
-		if f, _ := x.Inspect(rel); !f.Exists {
-			return fmt.Errorf("磁盘上不存在 %s，无法提交纲要", rel)
-		}
-		dir := isDirRow(line)
-		if st, err := os.Stat(filepath.Join(x.Root(), filepath.FromSlash(rel))); err == nil && st.IsDir() != dir {
-			return fmt.Errorf(dirRowMismatch, rel)
-		}
-		// A folder outline stands for a directory kept out of per-file
-		// outlines, so the tier of the files under it does not apply to it.
-		if !dir && x.Excluded(rel, reconcileOpts) {
-			return fmt.Errorf("%s 命中排除或忽略规则，不进纲要", rel)
-		}
-		if !dir && x.Observed(rel, reconcileOpts) {
-			return fmt.Errorf("%s 是观察档(observe_dirs/observe_files)：只记指纹、不写纲要，写了也不会渲染进整份纲要。确实要为它建立认知，把它加进 keep_files", rel)
-		}
-		if !dir && !isDocFile(rel) && !hasSourceOutline(x) {
-			if _, missing := docs(x); len(missing) > 0 {
-				return fmt.Errorf(headerDocsPendingNote, docList(missing))
+		// Batch may reload a concurrent writer's table. Gates use this latest
+		// pre-batch state: completing documents here must not skip revision.
+		unwritten := headerUnwritten(x.Header())
+		var missingDocs []string
+		if !unwritten {
+			for _, entry := range entries {
+				if !isDirRow(entry[1]) && !isDocFile(entry[0]) {
+					if !hasSourceOutline(x) {
+						_, missingDocs = docs(x)
+					}
+					break
+				}
 			}
 		}
-		w, err := checkOrError(x, rel, line)
-		if err != nil {
-			return err
+		remaining := map[string]bool{}
+		// Rewrites cannot complete a build. Avoid scanning the entire table
+		// for phase counts unless this batch establishes a first outline.
+		for _, entry := range entries {
+			if old, _ := x.Row(entry[0]); old.Outline == "" {
+				for _, r := range x.Rows() {
+					if r.Outline == "" && !r.Ignored && !r.Deleted && r.Exists && !x.Observed(r.Path, reconcileOpts) {
+						remaining[r.Path] = true
+					}
+				}
+				break
+			}
 		}
-		if err := checkUses(x, line); err != nil {
-			return err
+		var added, addedDoc bool
+		for _, entry := range entries {
+			rel, line := entry[0], entry[1]
+			failedPath = rel
+			if unwritten && !isDocFile(rel) {
+				return errors.New(headerFirstText(x))
+			}
+			if f, _ := x.Inspect(rel); !f.Exists {
+				return fmt.Errorf("磁盘上不存在 %s，无法提交纲要", rel)
+			}
+			dir := isDirRow(line)
+			if st, err := os.Stat(filepath.Join(x.Root(), filepath.FromSlash(rel))); err == nil && st.IsDir() != dir {
+				return fmt.Errorf(dirRowMismatch, rel)
+			}
+			// Directory outlines bypass the tiers of their contained files.
+			if !dir && x.Excluded(rel, reconcileOpts) {
+				return fmt.Errorf("%s 命中排除或忽略规则，不进纲要", rel)
+			}
+			if !dir && x.Observed(rel, reconcileOpts) {
+				return fmt.Errorf("%s 是观察档(observe_dirs/observe_files)：只记指纹、不写纲要，写了也不会渲染进整份纲要。确实要为它建立认知，把它加进 keep_files", rel)
+			}
+			if !dir && !isDocFile(rel) && len(missingDocs) > 0 {
+				return fmt.Errorf(headerDocsPendingNote, docList(missingDocs))
+			}
+			warn, err := checkOrError(x, rel, line)
+			if err != nil {
+				return err
+			}
+			if err := checkUses(x, line); err != nil {
+				return err
+			}
+			if err := checkKeys(x, line); err != nil {
+				return err
+			}
+			if err := checkNewAPI(x, rel, line); err != nil {
+				return err
+			}
+			old, _ := x.Row(rel)
+			delete(remaining, rel)
+			if depsOf(old.Outline) != depsOf(line) && !unwritten {
+				if old.Outline != "" {
+					depChanged = append(depChanged, rel)
+				} else {
+					newDeps = append(newDeps, rel)
+				}
+			}
+			if err := x.SetOutline(rel, line); err != nil {
+				return err
+			}
+			if err := x.ClearTarget(rel); err != nil {
+				return err
+			}
+			if old.Outline == "" {
+				added = true
+				addedDoc = addedDoc || isDocFile(rel)
+			}
+			msg := fmt.Sprintf(updateSubmitted, rel)
+			if warn != "" {
+				msg += "\n" + warn
+			}
+			messages = append(messages, msg)
 		}
-		if err := checkKeys(x, line); err != nil {
-			return err
+		if !unwritten {
+			initComplete = added && len(remaining) == 0
+			if len(remaining) == 0 {
+				depChanged = append(depChanged, newDeps...)
+			}
+			if initComplete || addedDoc {
+				all, missing := docs(x)
+				docsComplete = addedDoc && len(missing) == 0
+				if initComplete {
+					distill = all
+				}
+			}
 		}
-		if err := checkNewAPI(x, rel, line); err != nil {
-			return err
-		}
-		warn = w
-		// A dependency edge that appeared or went may outdate the header's
-		// account of the layers; a fresh table has no such account yet, and a
-		// first outline while other files still lack one is a bulk build.
-		old, _ := x.Row(rel)
-		depChanged = depsOf(old.Outline) != depsOf(line) && !headerUnwritten(x.Header()) &&
-			(old.Outline != "" || !othersUnoutlined(x, rel))
-		if err := x.SetOutline(rel, line); err != nil {
-			return err
-		}
-		if old.Outline == "" && !headerUnwritten(x.Header()) && isDocFile(rel) {
-			_, missing := docs(x)
-			docsComplete = len(missing) == 0
-		}
-		// The first outline of the last file without one closes the first
-		// build: what the documents say now belongs in the header and the
-		// source outlines, and the documents can move to the observe tier.
-		if old.Outline == "" && !headerUnwritten(x.Header()) && !othersUnoutlined(x, rel) {
-			initComplete = true
-			distill, _ = docs(x)
-		}
-		return x.ClearTarget(rel)
+		failedPath = "" // a save/lock error concerns the whole batch
+		return nil
 	})
 	if err != nil {
-		return "", err
+		if failedPath != "" {
+			return "", fmt.Errorf(updateFailed, failedPath, err)
+		}
+		return "", fmt.Errorf(updateBatchFailed, strings.Join(paths, "、"), err)
 	}
 	overviewMu.Lock()
-	if c := sentFor(x.Root()); c.solo[rel] {
-		delete(c.solo, rel)
+	c := sentFor(x.Root())
+	cacheChanged := false
+	for _, rel := range paths {
+		if c.solo[rel] {
+			delete(c.solo, rel)
+			cacheChanged = true
+		}
+	}
+	if cacheChanged {
 		saveSent(x.Root(), c)
 	}
 	overviewMu.Unlock()
 	x.RefreshGraph()
-	msg := fmt.Sprintf("已提交 %s 的纲要，指纹已前移，状态：对齐", rel)
-	if warn != "" {
-		msg += "\n" + warn
-	}
-	if depChanged {
-		msg += "\n" + fmt.Sprintf(headerDepNote, rel)
+	msg := strings.Join(messages, "\n")
+	if len(depChanged) > 0 {
+		msg += "\n" + fmt.Sprintf(headerDepNote, strings.Join(depChanged, "、"))
 	}
 	if initComplete {
 		msg += "\n" + initCompleteNote
@@ -3736,8 +3825,10 @@ func Update(rel, line string) (string, error) {
 	if len(distill) > 0 {
 		msg += "\n" + fmt.Sprintf(distillNote, docList(distill))
 	}
-	if note, _ := removedTestedNote(x, rel); note != "" {
-		msg += "\n" + note
+	for _, rel := range paths {
+		if note, _ := removedTestedNote(x, rel); note != "" {
+			msg += "\n" + note
+		}
 	}
 	return msg, nil
 }
