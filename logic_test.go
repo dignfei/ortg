@@ -3837,6 +3837,229 @@ func TestFailedTestsNestedRerunCoverage(t *testing.T) {
 	}
 }
 
+func TestFailedTestsCompleteNodeRerun(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	const command = "python -m pytest -v cases"
+	const rerun = "python -m pytest -v 'cases/check.py::test_left[value - 1]' cases/check.py::test_right"
+	const left = "cases/check.py::test_left[value - 1] PASSED          [ 50%]\n"
+	const right = "cases/check.py::test_right PASSED                 [100%]\n"
+	for _, name := range []string{
+		"all", "same behavior", "direct pytest", "default testpaths", "initial plain", "one", "missing verbose", "summary only", "count mismatch", "duplicate", "parameter changed",
+		"skipped", "xfailed", "xpassed", "truncated tail", "truncated head", "missing header", "retained inner header", "captured statuses", "mixed stdout", "mixed stdout section", "nested status",
+		"interpreter", "runner path", "environment", "wrapper", "filter", "plugin option", "ini override", "config option", "unknown option", "arg file", "behavior",
+		"rootdir", "configfile", "plugin header", "runtime", "directory", "session", "background", "compound",
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			header := "=== test session starts ===\nplatform linux -- Python 3.11, pytest-8.0, pluggy-1.0 -- /usr/bin/python\nrootdir: " + root + "\nconfigfile: pytest.ini\nplugins: example-1.0\ncollecting ... collected 2 items\n\n"
+			progress := "cases/check.py::test_left[value - 1] FAILED          [  1%]\ncases/check.py::test_right FAILED                   [  1%]\n"
+			for i := 0; i < 198; i++ {
+				progress += fmt.Sprintf("cases/check.py::test_other[%d] PASSED [100%%]\n", i)
+			}
+			failed := strings.Replace(header, "collected 2", "collected 200", 1) + progress + "=== FAILURES ===\n=== short test summary info ===\nFAILED cases/check.py::test_left[value - 1] - AssertionError\nFAILED cases/check.py::test_right - AssertionError\n=== 2 failed, 198 passed in 1.2s ===\n"
+			passed := header + left + right + "=== 2 passed in 0.2s ===\n"
+			first, retry, dir, session := command, rerun, root, "node-rerun"
+			cleared := false
+			switch name {
+			case "all":
+				cleared = true
+			case "same behavior":
+				first += " --doctest-modules"
+				retry += " --doctest-modules --tb=short --color=no"
+				cleared = true
+			case "direct pytest":
+				first, retry = strings.TrimPrefix(first, "python -m "), strings.TrimPrefix(retry, "python -m ")
+				cleared = true
+			case "default testpaths":
+				first = strings.TrimSuffix(first, " cases")
+				failed = strings.Replace(failed, "configfile: pytest.ini\n", "configfile: pytest.ini\ntestpaths: cases\n", 1)
+				cleared = true
+			case "initial plain":
+				first = strings.Replace(first, " -v", "", 1)
+			case "one":
+				passed = header + left + "=== 1 passed in 0.2s ===\n"
+			case "missing verbose":
+				retry = strings.Replace(retry, "-v", "-q", 1)
+			case "summary only":
+				passed = header + "=== 2 passed in 0.2s ===\n"
+			case "count mismatch":
+				passed = strings.Replace(passed, "2 passed", "1 passed", 1)
+			case "duplicate":
+				passed = header + left + left + "=== 2 passed in 0.2s ===\n"
+			case "parameter changed":
+				passed = strings.Replace(passed, "value - 1", "value - 2", 1)
+			case "skipped", "xfailed", "xpassed":
+				passed = strings.Replace(passed, "2 passed in", "2 passed, 1 "+name+" in", 1)
+			case "truncated tail":
+				passed += "[output truncated]"
+			case "truncated head":
+				passed = "Warning: truncated output\n" + passed
+			case "missing header":
+				passed = strings.TrimPrefix(passed, header)
+			case "retained inner header":
+				// The native hook retains only the final 64KiB. Even if that
+				// tail begins at an inner banner, it cannot assert outer config.
+				passed = header + strings.Repeat(" ", (64<<10)-len(passed)) + strings.TrimPrefix(passed, header)
+			case "captured statuses":
+				passed = header + "=== PASSES ===\n" + left + right + "=== 2 passed in 0.2s ===\n"
+			case "mixed stdout":
+				passed = header + "cases/check.py::test_other_a\n" + left + "PASSED [ 50%]\ncases/check.py::test_other_b\n" + right + "PASSED [100%]\n=== 2 passed in 0.2s ===\n"
+			case "mixed stdout section":
+				passed = header + left + right + "=== debug ===\ncases/check.py::test_other_a PASSED [ 50%]\ncases/check.py::test_other_b PASSED [100%]\n=== 2 passed in 0.2s ===\n"
+			case "nested status":
+				passed = header + left + "cases/check.py::test_other PASSED [100%]\n" + right + "=== 2 passed in 0.2s ===\n"
+			case "interpreter":
+				retry = strings.Replace(retry, "python", "python3", 1)
+			case "runner path":
+				retry = strings.Replace(retry, "python", "/alternate/python", 1)
+			case "environment":
+				retry = "PYTEST_ADDOPTS=--noconftest " + retry
+			case "wrapper":
+				retry = "timeout 300 " + retry
+			case "filter":
+				retry += " -k test_left"
+			case "plugin option":
+				retry += " -p no:example"
+			case "ini override":
+				retry += " --override-ini=addopts="
+			case "config option":
+				retry += " -c alternate.ini"
+			case "unknown option":
+				retry += " --custom-mode alternate"
+			case "arg file":
+				retry += " @args.txt"
+			case "behavior":
+				retry += " --doctest-modules"
+			case "rootdir":
+				passed = strings.Replace(passed, "rootdir: "+root, "rootdir: "+filepath.Join(root, "nested"), 1)
+			case "configfile":
+				passed = strings.Replace(passed, "pytest.ini", "alternate.ini", 1)
+			case "plugin header":
+				passed = strings.Replace(passed, "example-1.0", "example-2.0", 1)
+			case "runtime":
+				passed = strings.Replace(passed, "Python 3.11", "Python 3.12", 1)
+			case "directory":
+				dir = filepath.Join(root, "nested")
+			case "session":
+				session = "another-session"
+			case "background":
+				retry += " &"
+			case "compound":
+				retry += "; pytest other"
+			}
+			recordTestResult(root, "node-rerun", root, first, failed)
+			recordTestResult(root, session, dir, retry, passed)
+			got := loadFailedTests(root, "node-rerun").Runs
+			if (len(got) == 0) != cleared {
+				t.Fatalf("complete actual node coverage=%v, records=%#v", cleared, got)
+			}
+		})
+	}
+}
+
+func TestFailedTestsNodeProofCompleteness(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	for _, name := range []string{"complete", "nested complete", "nested only", "nested banner", "captured short summary", "missing", "duplicate", "collection error", "misclassified", "truncated", "missing header", "parameter ambiguity", "overflow", "wrapper"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			const session = "node-proof"
+			command := "pytest -v cases"
+			header := "=== test session starts ===\nplatform linux -- Python 3.11, pytest-8.0, pluggy-1.0 -- /usr/bin/python\nrootdir: " + root + "\ncollecting ... collected 2 items\n"
+			const progress = "cases/check.py::test_left[value - 1] FAILED [ 50%]\ncases/check.py::test_right FAILED [100%]\n=== FAILURES ===\n"
+			const short = "=== short test summary info ===\n"
+			const left = "FAILED cases/check.py::test_left[value - 1] - AssertionError\n"
+			const right = "FAILED cases/check.py::test_right - AssertionError\n"
+			const summary = "=== 2 failed in 0.2s ===\n"
+			output := header + progress + short + left + right + summary
+			complete := false
+			switch name {
+			case "complete":
+				complete = true
+			case "nested complete":
+				output = header + progress + short + "ERROR nested/check.py::test_old - RuntimeError\n=== 1 error in 0.1s ===\n" + short + left + right + summary
+				complete = true
+			case "nested only":
+				output += summary
+			case "nested banner":
+				output = header + strings.Replace(header, root, filepath.Join(root, "nested"), 1) + short + left + right + summary
+			case "captured short summary":
+				output = strings.Replace(header, "collected 2", "collected 1", 1) + "cases/check.py::test_other FAILED [100%]\n=== FAILURES ===\nCaptured stdout:\n" + short + right + "=== 1 failed in 0.2s ===\n"
+			case "missing":
+				output = header + progress + short + left + summary
+			case "duplicate":
+				output = header + progress + short + left + left + summary
+			case "collection error":
+				output = header + short + "ERROR cases/check.py - ImportError\n=== 1 error in 0.2s ===\n"
+			case "misclassified":
+				output = strings.Replace(output, right, "ERROR cases/check.py::test_right - RuntimeError\n", 1)
+			case "truncated":
+				output = "Warning: truncated output\n" + output
+			case "missing header":
+				output = strings.TrimPrefix(output, header)
+			case "parameter ambiguity":
+				output = strings.Replace(output, "[value - 1]", "[value - 1", 1)
+			case "overflow":
+				output = header + short
+				for i := 0; i <= failedNodeMax; i++ {
+					output += fmt.Sprintf("FAILED cases/check.py::test_item[%d] - AssertionError\n", i)
+				}
+				output += fmt.Sprintf("=== %d failed in 0.2s ===\n", failedNodeMax+1)
+			case "wrapper":
+				command = "bash -c '" + command + "'"
+			}
+			recordTestResult(root, session, root, command, output)
+			r := loadFailedTests(root, session).Runs[root+"\x00"+command]
+			if (r.Signature != "" && len(r.FailedNodeIDs) == 2) != complete || !complete && len(r.FailedNodeIDs) != 0 {
+				t.Fatalf("complete proof=%v, record=%+v", complete, r)
+			}
+			if complete && (!slices.Contains(r.FailedNodeIDs, "cases/check.py::test_left[value - 1]") || slices.Contains(r.FailedNodeIDs, "nested/check.py::test_old")) {
+				t.Fatalf("only complete outer IDs with full parameters are evidence: %+v", r)
+			}
+		})
+	}
+}
+
+func TestFailedTestsNodeProofHistoryAndStop(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root, _ := gitRepo(t, map[string]string{"a.py": "x = 1\n"})
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(root, "a.py"), []byte("x = 2\n"), 0o644)
+	const cmd = "pytest -v cases"
+	header := "=== test session starts ===\nplatform linux -- Python 3.11, pytest-8.0, pluggy-1.0 -- /usr/bin/python\nrootdir: " + root + "\ncollecting ... collected 1 item\n"
+	failed := func(id string) string {
+		return header + id + " FAILED [100%]\n=== FAILURES ===\n=== short test summary info ===\nFAILED " + id + " - AssertionError\n=== 1 failed in 0.2s ===\n"
+	}
+	passed := func(id string) string { return header + id + " PASSED [100%]\n=== 1 passed in 0.2s ===\n" }
+	for _, legacy := range []bool{false, true} {
+		session := fmt.Sprintf("node-history-%v", legacy)
+		first := failed("cases/check.py::test_left")
+		if legacy {
+			first = "=== 1 failed in 0.2s ===\n"
+		}
+		recordTestResult(root, session, root, cmd, first)
+		recordTestResult(root, session, root, cmd, failed("cases/check.py::test_right"))
+		r := loadFailedTests(root, session).Runs[root+"\x00"+cmd]
+		if legacy && (r.Signature != "" || len(r.FailedNodeIDs) != 0) || !legacy && len(r.FailedNodeIDs) != 2 {
+			t.Fatalf("older failures were lost/upgraded: legacy=%v, %+v", legacy, r)
+		}
+		recordTestResult(root, session, root, "pytest -v cases/check.py::test_right", passed("cases/check.py::test_right"))
+		if len(loadFailedTests(root, session).Runs) != 1 {
+			t.Fatal("a new failure must not discard an earlier unverified one")
+		}
+		note := failedTestStopNote(root, base.HookInput{SessionID: session})
+		if legacy && !strings.Contains(note, "同原命令完整通过") || !legacy && (!strings.Contains(note, "全部 2 个真实失败节点") || !strings.Contains(note, "用 -v")) {
+			t.Fatalf("Stop must distinguish complete node proof from unknown scope: %q", note)
+		}
+		recordTestResult(root, session, root, cmd, header+"=== 2 passed in 0.2s ===\n")
+		if len(loadFailedTests(root, session).Runs) != 0 {
+			t.Fatal("an original full-scope pass must still discharge the record")
+		}
+	}
+}
+
 func TestStopWhileBackgroundRun(t *testing.T) {
 	if _, err := os.Stat("/proc/self/cmdline"); err != nil {
 		t.Skip("no /proc")

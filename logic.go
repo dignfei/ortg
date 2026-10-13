@@ -1023,15 +1023,17 @@ func stopNote(root string, in base.HookInput) string {
 	return fmt.Sprintf(stopBgRunNote, strings.Join(b.Words, " "))
 }
 
-// Failed pytest runs survive compaction and process restarts. A narrower run
-// cannot discharge a failure: only the same command with a complete passing
-// summary clears its record. Other runners and missing summaries stay unknown.
+// Failed pytest runs survive compaction and process restarts. Complete actual
+// node results can close known failures; without that proof the original
+// command and scope must pass. Other runners and missing results stay unknown.
 type failedTestRun struct {
-	Command  string
-	Cwd      string
-	Summary  string
-	Selected []int
-	At       time.Time
+	Command       string
+	Cwd           string
+	Summary       string
+	Selected      []int
+	Signature     string
+	FailedNodeIDs []string
+	At            time.Time
 }
 
 type failedTestRuns struct {
@@ -1048,6 +1050,253 @@ func loadFailedTests(root, session string) failedTestRuns {
 	_, data := base.OverviewMark(root, failedTestsMark(session))
 	_ = json.Unmarshal([]byte(data), &v)
 	return v
+}
+
+const failedNodeMax = 256
+
+// ponytail: only literal pytest and python -m pytest have node proofs. Unknown
+// options and wrappers fall back to the existing whole-command check.
+func pytestNodeSignature(cmd, output string) (string, bool) {
+	segs := shellSegments(cmd)
+	if len(segs) != 1 || segs[0].piped || segs[0].bg || detachedCommand(cmd) || strings.ContainsAny(cmd, "$`") {
+		return "", false
+	}
+	w := segs[0].words
+	if len(w) == 0 {
+		return "", false
+	}
+	i := 1
+	if pythonRe.MatchString(filepath.Base(w[0])) && len(w) >= 3 && w[1] == "-m" && w[2] == "pytest" {
+		i = 3
+	} else if verb := filepath.Base(w[0]); verb != "pytest" && verb != "py.test" {
+		return "", false
+	}
+	sig := append([]string(nil), w[:i]...)
+	verbosity := 0
+	for ; i < len(w); i++ {
+		a := w[i]
+		switch {
+		case a == "--verbose":
+			verbosity++
+		case a == "--quiet":
+			verbosity--
+		case len(a) > 1 && a[0] == '-' && strings.Trim(a[1:], "qv") == "":
+			verbosity += strings.Count(a, "v") - strings.Count(a, "q")
+		case a == "--tb" || a == "--color" || a == "--verbosity":
+			if i+1 >= len(w) {
+				return "", false
+			}
+			i++
+			if a == "--verbosity" {
+				n, err := strconv.Atoi(w[i])
+				if err != nil {
+					return "", false
+				}
+				verbosity = n
+			}
+		case strings.HasPrefix(a, "--tb=") || strings.HasPrefix(a, "--color="):
+		case strings.HasPrefix(a, "--verbosity="):
+			n, err := strconv.Atoi(strings.TrimPrefix(a, "--verbosity="))
+			if err != nil {
+				return "", false
+			}
+			verbosity = n
+		case a == "-l" || a == "--showlocals" || a == "--no-showlocals":
+		case a == "--disable-warnings" || a == "--strict-config" || a == "--strict-markers" || a == "--doctest-modules" || a == "--doctest-ignore-import-errors" || a == "-x" || a == "--exitfirst":
+			sig = append(sig, a)
+		case a == "--import-mode" || a == "--maxfail":
+			if i+1 >= len(w) {
+				return "", false
+			}
+			sig = append(sig, a, w[i+1])
+			i++
+		case strings.HasPrefix(a, "--import-mode=") || strings.HasPrefix(a, "--maxfail="):
+			sig = append(sig, a)
+		case a == "" || strings.HasPrefix(a, "-") || strings.HasPrefix(a, "@") || strings.ContainsAny(a, "<>*?"):
+			return "", false
+		default: // pytest's positional file/directory/node selection
+		}
+	}
+	if verbosity <= 0 {
+		return "", false
+	}
+	// Paths can change pytest's inferred root/config and therefore the
+	// meaning of a relative nodeid. Require the actual outer run header.
+	headers := pytestSessionHeaderRe.FindAllStringIndex(output, -1)
+	if len(output) >= 64<<10 || len(headers) != 1 || strings.TrimSpace(output[:headers[0][0]]) != "" {
+		return "", false
+	}
+	header := headers[0]
+	root, runtime, collected := false, false, false
+	for _, line := range strings.Split(output[header[1]:], "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if pytestCollectedRe.MatchString(line) {
+			collected = true
+			break
+		}
+		if strings.HasPrefix(line, "rootdir: ") {
+			if root {
+				return "", false
+			}
+			root = true
+		}
+		if strings.HasPrefix(line, "platform ") {
+			runtime = strings.Count(line, " -- ") >= 2 // verbose includes sys.executable
+		}
+		if strings.TrimSpace(line) != "" && !strings.HasPrefix(line, "testpaths: ") {
+			sig = append(sig, line)
+		}
+	}
+	if !root || !runtime || !collected {
+		return "", false
+	}
+	b, _ := json.Marshal(sig)
+	return string(b), verbosity > 0
+}
+
+var (
+	pytestSessionHeaderRe = regexp.MustCompile(`(?m)^=+ test session starts =+[ \t]*\r?$`)
+	pytestCollectedRe     = regexp.MustCompile(`^(?:collecting \.\.\. )?collected \d+ items?(?: / .*)?$`)
+	pytestShortSummaryRe  = regexp.MustCompile(`(?m)^=+ short test summary info =+[ \t]*\r?$`)
+	pytestNodeStatusRe    = regexp.MustCompile(`^(.+) (PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)(?:[ \t]+\[ *\d+%\])?$`)
+)
+
+// Split a short-summary reason only outside a balanced parameter suffix.
+// Unbalanced brackets, controls and abbreviated IDs have no exact proof.
+func pytestResultNodeID(s string, failure bool) string {
+	depth := 0
+	for i, r := range s {
+		if failure && depth == 0 && strings.HasPrefix(s[i:], " - ") {
+			s = s[:i]
+			break
+		}
+		if r == '[' {
+			depth++
+		} else if r == ']' {
+			depth--
+		}
+		if depth < 0 || unicode.IsControl(r) || depth == 0 && unicode.IsSpace(r) {
+			return ""
+		}
+	}
+	if depth != 0 || len(s) > 2048 || strings.TrimSpace(s) != s || !strings.Contains(s, "::") || strings.Contains(s, "...") || strings.ContainsRune(s, '…') {
+		return ""
+	}
+	return s
+}
+
+func pytestVerboseNodes(output string, counts map[string]int, failed bool) []string {
+	lines := strings.Split(output, "\n")
+	collected := false
+	for i, line := range lines {
+		if pytestCollectedRe.MatchString(strings.TrimSuffix(line, "\r")) {
+			lines, collected = lines[i+1:], true
+			break
+		}
+	}
+	if !collected {
+		return nil
+	}
+	var nodes []string
+	seen, outcomes := map[string]bool{}, map[string]int{}
+	for _, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "===") {
+			if failed {
+				break // failure reports follow the actual progress block
+			}
+			return nil
+		}
+		m := pytestNodeStatusRe.FindStringSubmatch(line)
+		if len(m) == 0 {
+			return nil // mixed stdout is not actual node-result evidence
+		}
+		id := pytestResultNodeID(m[1], false)
+		if id == "" || !failed && m[2] != "PASSED" {
+			return nil
+		}
+		outcome := strings.ToLower(m[2])
+		if outcome == "xfail" || outcome == "xpass" {
+			outcome += "ed"
+		}
+		outcomes[outcome]++
+		if !failed || m[2] == "FAILED" || m[2] == "ERROR" {
+			if seen[id] {
+				return nil
+			}
+			seen[id] = true
+			nodes = append(nodes, id)
+		}
+	}
+	for _, outcome := range []string{"passed", "failed", "skipped", "xfailed", "xpassed"} {
+		if outcomes[outcome] != counts[outcome] {
+			return nil
+		}
+	}
+	if outcomes["error"] != counts["error"]+counts["errors"] {
+		return nil
+	}
+	sort.Strings(nodes)
+	return nodes
+}
+
+func pytestResultNodes(output string, start, end int, counts map[string]int, failed bool) []string {
+	n := counts["passed"]
+	if failed {
+		n = counts["failed"] + counts["error"] + counts["errors"]
+	}
+	if n == 0 || n > failedNodeMax {
+		return nil
+	}
+	part := output[start:end]
+	for _, marker := range []string{"output truncated", "tokens truncated", "truncated output", "output omitted"} {
+		if strings.Contains(strings.ToLower(output), marker) {
+			return nil
+		}
+	}
+	if !failed {
+		return pytestVerboseNodes(part, counts, false)
+	}
+	headers := pytestShortSummaryRe.FindAllStringIndex(part, -1)
+	if len(headers) == 0 {
+		return nil
+	}
+	part = part[headers[len(headers)-1][1]:]
+	var nodes []string
+	seen := map[string]bool{}
+	failedLines, errorLines := 0, 0
+	for _, line := range strings.Split(part, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		id := ""
+		if strings.HasPrefix(line, "FAILED ") || strings.HasPrefix(line, "ERROR ") {
+			if strings.HasPrefix(line, "FAILED ") {
+				failedLines++
+			} else {
+				errorLines++
+			}
+			id = pytestResultNodeID(line[strings.IndexByte(line, ' ')+1:], true)
+		} else if strings.TrimSpace(line) != "" && !strings.HasPrefix(line, "SKIPPED ") && !strings.HasPrefix(line, "XFAIL ") && !strings.HasPrefix(line, "XPASS ") {
+			return nil
+		} else {
+			continue
+		}
+		if id == "" || seen[id] {
+			return nil
+		}
+		seen[id] = true
+		nodes = append(nodes, id)
+	}
+	if len(nodes) != n || failed && (failedLines != counts["failed"] || errorLines != counts["error"]+counts["errors"]) {
+		return nil
+	}
+	sort.Strings(nodes)
+	if !slices.Equal(nodes, pytestVerboseNodes(output[:end], counts, true)) {
+		return nil // a captured short summary cannot name the outer failures
+	}
+	return nodes
 }
 
 func recordTestResult(root, session, cwd, cmd, output string) {
@@ -1093,6 +1342,10 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	if singleResult {
 		summaries = summaries[len(summaries)-1:]
 	}
+	signature, verbose := "", false
+	if singleResult {
+		signature, verbose = pytestNodeSignature(cmd, output)
+	}
 	counts := map[string]int{}
 	var failures []string
 	for _, s := range summaries {
@@ -1122,6 +1375,14 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	if v.Session != session || v.Runs == nil {
 		v = failedTestRuns{Session: session, Runs: map[string]failedTestRun{}}
 	}
+	start := 0
+	if len(matches) > 1 {
+		start = matches[len(matches)-2][1]
+	}
+	var nodes []string
+	if signature != "" && (len(failures) > 0 || verbose) {
+		nodes = pytestResultNodes(output, start, matches[len(matches)-1][0], counts, len(failures) > 0)
+	}
 	selected := append([]int(nil), v.Runs[key].Selected...)
 	if singleResult && len(selected) > 1 {
 		// Older records counted captured summaries as invocations. Keep the
@@ -1140,17 +1401,50 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 			}
 			selected[i] = max(selected[i], n)
 		}
-		v.Runs[key] = failedTestRun{Command: cmd, Cwd: cwd, Summary: strings.Join(failures, "; "), Selected: selected, At: time.Now()}
-	} else {
-		if len(selected) > 0 && len(selected) != len(summaries) {
-			return
-		}
-		for i, n := range selected {
-			if pytestCounts("pytest", summaries[i][0])["passed"] < n {
-				return
+		old, exists := v.Runs[key]
+		if exists {
+			if old.Signature == "" || old.Signature != signature || len(old.FailedNodeIDs) == 0 || len(nodes) == 0 {
+				nodes = nil // never upgrade an earlier unknown failure to a partial proof
+			} else {
+				nodes = append(nodes, old.FailedNodeIDs...)
+				sort.Strings(nodes)
+				nodes = slices.Compact(nodes)
+				if len(nodes) > failedNodeMax {
+					nodes = nil
+				}
 			}
 		}
-		delete(v.Runs, key)
+		if len(nodes) == 0 {
+			signature = ""
+		}
+		v.Runs[key] = failedTestRun{Command: cmd, Cwd: cwd, Summary: strings.Join(failures, "; "), Selected: selected, Signature: signature, FailedNodeIDs: nodes, At: time.Now()}
+	} else {
+		covered := len(selected) == 0 || len(selected) == len(summaries)
+		if old := v.Runs[key]; old.Signature != "" && old.Signature != signature {
+			covered = false
+		}
+		for i, n := range selected {
+			if i >= len(summaries) || pytestCounts("pytest", summaries[i][0])["passed"] < n {
+				covered = false
+			}
+		}
+		if covered {
+			delete(v.Runs, key)
+		}
+		if len(nodes) > 0 && counts["passed"] > 0 && len(counts) == 1 {
+			for k, r := range v.Runs {
+				if r.Cwd != cwd || r.Signature != signature || len(r.FailedNodeIDs) == 0 {
+					continue
+				}
+				complete := true
+				for _, id := range r.FailedNodeIDs {
+					complete = complete && slices.Contains(nodes, id)
+				}
+				if complete {
+					delete(v.Runs, k)
+				}
+			}
+		}
 	}
 	if b, err := json.Marshal(v); err == nil {
 		base.MarkOverview(root, failedTestsMark(session), string(b))
@@ -1195,7 +1489,26 @@ func failedTestStopNote(root string, in base.HookInput) string {
 		r := v.Runs[commandKey]
 		key := fmt.Sprintf("stopfail:%x:%d", sha1.Sum([]byte(commandKey)), r.At.UnixNano())
 		if len(lines) < 3 && base.InjectOnce(in.SessionID, key) {
-			lines = append(lines, fmt.Sprintf("- %s 下 `%s`: %s", r.Cwd, r.Command, r.Summary))
+			line := fmt.Sprintf(stopFailedTestsRun, r.Cwd, r.Command, r.Summary)
+			if r.Signature != "" && len(r.FailedNodeIDs) > 0 {
+				var shown []string
+				size := 0
+				for _, id := range r.FailedNodeIDs {
+					quoted := strconv.Quote(id)
+					if len(shown) == 8 || size+len(quoted) > 2048 {
+						break
+					}
+					shown = append(shown, quoted)
+					size += len(quoted)
+				}
+				line += fmt.Sprintf(stopFailedNodesNote, len(r.FailedNodeIDs), len(shown), strings.Join(shown, ", "))
+				if len(shown) < len(r.FailedNodeIDs) {
+					line += stopFailedNodesMore
+				}
+			} else {
+				line += stopFailedWholeNote
+			}
+			lines = append(lines, line)
 		}
 	}
 	if len(lines) == 0 {
