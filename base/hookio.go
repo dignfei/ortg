@@ -141,10 +141,25 @@ func Host() string {
 // configured with: config.toml's model_context_window (Codex caps it at the
 // model's max_context_window) or else the model's context_window from
 // models_cache.json, times the share Codex really uses
-// (effective_context_window_percent). 0 when it cannot be read: Codex does not
-// tell the MCP server its window.
+// (effective_context_window_percent). Linux also checks the nearest ancestor's
+// CODEX_HOME when Codex filters that variable from the MCP environment; an
+// explicit value here wins. 0 when the configuration cannot be read.
 func CodexContextWindow() int {
 	home := os.Getenv("CODEX_HOME")
+	if home == "" {
+		for _, pid := range Ancestors() {
+			b, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/environ")
+			for _, entry := range bytes.Split(b, []byte{0}) {
+				if v, ok := bytes.CutPrefix(entry, []byte("CODEX_HOME=")); ok && len(v) > 0 {
+					home = string(v)
+					break
+				}
+			}
+			if home != "" {
+				break
+			}
+		}
+	}
 	if home == "" {
 		h, err := os.UserHomeDir()
 		if err != nil {

@@ -34,7 +34,7 @@ const rulesBlock = `## ORTG 纲要规则
 // is capped by tool_output_token_limit in config.toml. A reply arrived whole
 // when its last line is the closing line every ortg_overview reply ends with
 // (all start with "以上") and no "tokens truncated" marker sits in between.
-const codexBudgetRule = `Codex 宿主补充：本宿主用 functions.exec 包装 MCP 调用，工具结果超过预算会被从中间截掉、只留首尾——不报错，被截掉的文件你根本不知道存在。故调用 ortg_overview 时，外层命令第一行必须是 // @exec: {"max_output_tokens": 500000}；它只抬高这一次工具结果的预算，不是模型输出上限，也不改纲要内容。ortg_overview 的每种回复（模块或文件的纲要、模块清单、短回复）最后一行都是以"以上"开头的收尾句，正文里也不会有 "tokens truncated" 字样；最后一行不是这样，或中间出现 "…N tokens truncated…"，就是被截断了：照此重发一次并传 force=true（本会话已计为发过，不传只会拿到短回复）。重发仍被截断，多半是 ~/.codex/config.toml 没设 tool_output_token_limit = 500000（不设时 Codex 存进对话的工具结果只留约 1.2 万 token，@exec 抬不过它）或 [mcp_servers.ortg] 没设 env = { ORTG_AGENT = "codex" }：告诉用户按 ortg 的 README 补上后重启 Codex，在此之前按模块分次取。不要拿半份纲要开工，也不要用 Grep/Read 去补缺失的部分。`
+const codexBudgetRule = `Codex 宿主补充：本宿主用 functions.exec 包装 MCP 调用，工具结果超过预算会被从中间截掉、只留首尾——不报错，被截掉的文件你根本不知道存在。故调用 ortg_overview 时，外层命令第一行必须是 // @exec: {"max_output_tokens": 500000}；它只抬高这一次工具结果的预算，不是模型输出上限，也不改纲要内容。ortg_overview 的每种回复（模块或文件的纲要、模块清单、短回复）最后一行都是以"以上"开头的收尾句，正文里也不会有 "tokens truncated" 字样；最后一行不是这样，或中间出现 "…N tokens truncated…"，就是被截断了：照此重发一次并传 force=true（本会话已计为发过，不传只会拿到短回复）。重发仍被截断，多半是 ~/.codex/config.toml 没设 tool_output_token_limit = 500000（不设时 Codex 存进对话的工具结果只留约 1.2 万 token，@exec 抬不过它）或 [mcp_servers.ortg] 没设 env = { ORTG_AGENT = "codex" }：告诉用户按 ortg 的 README 补上后重启 Codex，在此之前按模块分次取。自定义 CODEX_HOME 要在 MCP 配置设 env_vars = ["CODEX_HOME"]；Linux 未转交时 ORTG 只沿当前进程祖先链找该变量，再回退 ~/.codex。不要拿半份纲要开工，也不要用 Grep/Read 去补缺失的部分。`
 
 // The ortg_overview replies. Each ends with its own closing line that starts
 // with "以上" — codexBudgetRule tells Codex that a reply whose last line does

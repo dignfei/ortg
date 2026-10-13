@@ -67,6 +67,46 @@ func TestCodexContextWindow(t *testing.T) {
 	}
 }
 
+// MCP environments may omit CODEX_HOME although their host has it. Use real
+// parent processes: /proc/environ describes the environment at process start.
+func TestCodexContextWindowParent(t *testing.T) {
+	if os.Getenv("ORTG_TEST_WINDOW_HELPER") == "1" {
+		if explicit := os.Getenv("ORTG_TEST_WINDOW_EXPLICIT"); explicit != "" {
+			os.Setenv("CODEX_HOME", explicit)
+		}
+		os.Stdout.WriteString(strconv.Itoa(CodexContextWindow()))
+		os.Exit(0)
+	}
+	if _, err := os.Stat("/proc/self/environ"); err != nil {
+		t.Skip("no /proc")
+	}
+	profile, explicit := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(profile, "config.toml"), []byte("model = 'm1'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profile, "models_cache.json"), []byte(`{"models":[{"slug":"m1","context_window":272000,"max_context_window":872000,"effective_context_window_percent":95}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(explicit, "config.toml"), []byte("model_context_window = 300000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name, override string
+		want           int
+	}{
+		{"filtered home", "", 258400},
+		{"explicit home wins", explicit, 300000},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cmd := exec.Command("sh", "-c", `unset CODEX_HOME; "$0" -test.run=^TestCodexContextWindowParent$`, os.Args[0])
+			cmd.Env = append(os.Environ(), "CODEX_HOME="+profile, "ORTG_TEST_WINDOW_HELPER=1", "ORTG_TEST_WINDOW_EXPLICIT="+c.override)
+			if out, err := cmd.CombinedOutput(); err != nil || string(out) != strconv.Itoa(c.want) {
+				t.Fatalf("window = %q, error %v; want %d", out, err, c.want)
+			}
+		})
+	}
+}
+
 func TestHostDetectionWithCodexCompatibilityVariables(t *testing.T) {
 	keys := []string{"ORTG_AGENT", "PLUGIN_ROOT", "PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA"}
 	tests := []struct {
