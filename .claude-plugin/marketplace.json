@@ -6,7 +6,7 @@
       "name": "ortg",
       "source": "./",
       "description": "单文件纲要引擎，hook 与 MCP 由本清单声明，要求 ortg 二进制在 PATH。",
-      "version": "0.5.37"
+      "version": "0.5.38"
     }
   ]
 }

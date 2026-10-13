@@ -24,7 +24,7 @@ import (
 	"ortg/migrate"
 )
 
-const version = "0.5.37"
+const version = "0.5.38"
 
 var (
 	excludeDirs  = []string{".git", "build"}
