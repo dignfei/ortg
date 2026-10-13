@@ -141,14 +141,15 @@ func runMCP(args []string) error {
 		// a field the call lacks arriving as "".
 		{Name: "ortg_gate", Hidden: true,
 			Props: map[string]base.Prop{"tool": {Type: "string"}, "path": {Type: "string"}, "dir": {Type: "string"},
-				"command": {Type: "string"}, "agent": {Type: "string"}},
+				"command": {Type: "string"}, "agent": {Type: "string"}, "use": {Type: "string"}},
 			Handler: func(a base.Args) (string, error) {
 				tool, _ := a.String("tool")
 				p, _ := a.String("path")
 				dir, _ := a.String("dir")
 				cmd, _ := a.String("command")
 				agent, _ := a.String("agent")
-				return Gate(tool, p, dir, cmd, agent)
+				use, _ := a.String("use")
+				return gateHook(tool, p, dir, cmd, agent, use)
 			}},
 		{Name: "ortg_review", Description: toolDescription("ortg_review"),
 			Props: map[string]base.Prop{"rulings": {Type: "array", Description: "对上一次核对给了正文的每条契约写一行「契约键：裁决」（需求是否讲到这个场景、与守护测试一致还是相反、按哪条证据裁决）；缺了裁决计划不收敛"}},

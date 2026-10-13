@@ -411,3 +411,13 @@ func TestReadHookInputAgent(t *testing.T) {
 		t.Fatalf("no agent_id: %q", in.AgentID)
 	}
 }
+
+// Claude Code names the tool use in _meta; nothing else names one.
+func TestToolUseID(t *testing.T) {
+	if got := ToolUseID(map[string]any{"claudecode/toolUseId": "toolu_1", "progressToken": 2}); got != "toolu_1" {
+		t.Fatalf("got %q", got)
+	}
+	if got := ToolUseID(map[string]any{"threadId": "th"}); got != "" {
+		t.Fatalf("got %q", got)
+	}
+}

@@ -486,6 +486,14 @@ func CallSession(meta map[string]any) (ids []string, fromEnv bool) {
 	return nil, false
 }
 
+// ToolUseID is the tool use an MCP call answers, as Claude Code names it in
+// the call's _meta; the PreToolUse hook that ran before the call names the
+// same id as tool_use_id. "" when the host names none.
+func ToolUseID(meta map[string]any) string {
+	s, _ := meta["claudecode/toolUseId"].(string)
+	return s
+}
+
 // Ancestors lists the processes above this one, nearest first, leaving out
 // itself and pid 1; nil without /proc. A hook's ancestors include the host
 // process, which is also the parent of the MCP server it started.

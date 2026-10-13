@@ -557,11 +557,58 @@ func useCallSession(a base.Args) {
 	meta, _ := a["_meta"].(map[string]any)
 	delete(a, "_meta")
 	callSession.ids, callSession.fromEnv = base.CallSession(meta)
+	if use := base.ToolUseID(meta); use != "" {
+		pendingMu.Lock()
+		p, ok := pendingUses[use]
+		delete(pendingUses, use)
+		pendingMu.Unlock()
+		if ok && time.Since(p.at) <= pendingUseAge {
+			// A subagent's call: its context, which its hooks name agent_id.
+			callSession.ids, callSession.fromEnv = []string{p.agent}, false
+		}
+	}
 }
 
 // staleMarkAge is how long per-session and per-process marks are kept: a
 // session idle longer than this gets its outline whole again.
 const staleMarkAge = 7 * 24 * time.Hour
+
+// Claude Code's MCP calls name no subagent, though a subagent's context is
+// its own: the gate hook therefore runs on ortg's own tools as well and
+// passes the tool use's id with the subagent's agent_id; the call that
+// follows carries the same id in its _meta (base.ToolUseID) and is taken
+// for that subagent's context (useCallSession). Notes left by calls that
+// never came expire.
+var (
+	pendingMu   sync.Mutex
+	pendingUses = map[string]pendingUse{}
+)
+
+type pendingUse struct {
+	agent string
+	at    time.Time
+}
+
+const pendingUseAge = 10 * time.Minute
+
+// gateHook answers the gate hook: ortg's own tools are not gated, only
+// noted for the call that follows; everything else goes to Gate.
+func gateHook(tool, path, dir, command, agent, use string) (string, error) {
+	if strings.HasPrefix(tool, "mcp__") && strings.Contains(tool, "__ortg_") {
+		if agent != "" && use != "" {
+			pendingMu.Lock()
+			for k, p := range pendingUses {
+				if time.Since(p.at) > pendingUseAge {
+					delete(pendingUses, k)
+				}
+			}
+			pendingUses[use] = pendingUse{agent, time.Now()}
+			pendingMu.Unlock()
+		}
+		return "", nil
+	}
+	return Gate(tool, path, dir, command, agent)
+}
 
 // sessionKey turns a session id into a mark kind's suffix.
 func sessionKey(id string) string {

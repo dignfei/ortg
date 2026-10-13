@@ -35,7 +35,7 @@
         ]
       },
       {
-        "matcher": "Read|Grep|Glob|Bash|Edit|Write|MultiEdit",
+        "matcher": "Read|Grep|Glob|Bash|Edit|Write|MultiEdit|mcp__plugin_ortg_ortg__.*",
         "hooks": [
           {
             "type": "mcp_tool",
@@ -46,7 +46,8 @@
               "path": "${tool_input.file_path}",
               "dir": "${tool_input.path}",
               "command": "${tool_input.command}",
-              "agent": "${agent_id}"
+              "agent": "${agent_id}",
+              "use": "${tool_use_id}"
             },
             "timeout": 5
           }

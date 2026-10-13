@@ -2422,6 +2422,79 @@ func TestMCPSessionFromMeta(t *testing.T) {
 	}
 }
 
+// Claude Code: a subagent's MCP calls carry only the tool use's id; the gate
+// hook, run on ortg's own tools too, ties that id to the subagent's
+// agent_id first. The subagent's context is its own: it gets its own copy,
+// its compaction is its own, and ortg's tools are never gated.
+func TestClaudeSubagentSession(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-1")
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "a.go"), []byte("package a"), 0o644)
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	Update("a.go", "a.go[7 L ST T]: Role:存储 | Uses:- | API:Save | Constraints:-")
+	t.Cleanup(func() { callSession.ids, callSession.fromEnv = nil, false })
+	whole := "Role:存储"
+	n := 0
+	// call is one tool call: the gate hook first, then the call itself.
+	call := func(agent string) string {
+		n++
+		use := fmt.Sprintf("toolu_%d", n)
+		if got, _ := gateHook("mcp__plugin_ortg_ortg__ortg_overview", "", "", "", agent, use); got != "" {
+			t.Fatalf("ortg's own tools are never gated: %q", got)
+		}
+		useCallSession(base.Args{"_meta": map[string]any{"claudecode/toolUseId": use, "progressToken": 1}})
+		out, _ := Overview("", false)
+		return out
+	}
+	if out := call("agent-1"); !strings.Contains(out, whole) {
+		t.Fatalf("the subagent gets its own copy:\n%s", out)
+	}
+	if out := call(""); !strings.Contains(out, whole) {
+		t.Fatalf("the session has fetched nothing yet:\n%s", out)
+	}
+	if out := call(""); strings.Contains(out, whole) {
+		t.Fatalf("the session already holds it:\n%s", out)
+	}
+	if out := call("agent-1"); strings.Contains(out, whole) {
+		t.Fatalf("the subagent already holds it:\n%s", out)
+	}
+	time.Sleep(10 * time.Millisecond)
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: "claude-1", AgentID: "agent-1"})
+	if out := call(""); strings.Contains(out, whole) {
+		t.Fatalf("the subagent's compaction is not the session's:\n%s", out)
+	}
+	if out := call("agent-1"); !strings.Contains(out, whole) || !strings.Contains(out, "被压缩") {
+		t.Fatalf("the subagent's own compaction resends to it:\n%s", out)
+	}
+	// A call no gate note precedes is the session's.
+	useCallSession(base.Args{"_meta": map[string]any{"claudecode/toolUseId": "toolu_unseen"}})
+	if out, _ := Overview("", false); strings.Contains(out, whole) {
+		t.Fatalf("an un-noted call is the session's:\n%s", out)
+	}
+
+	// The same through the real server, whose gate tool takes "use".
+	gate := func(agent, use string) map[string]any {
+		return map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_gate",
+			"arguments": map[string]any{"tool": "mcp__plugin_ortg_ortg__ortg_overview", "agent": agent, "use": use}}}
+	}
+	overview := func(use string) map[string]any {
+		return map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_overview", "arguments": map[string]any{},
+			"_meta": map[string]any{"claudecode/toolUseId": use, "progressToken": 1}}}
+	}
+	r := nativeMCP(t, root, gate("agent-9", "u1"), overview("u1"), gate("", "u2"), overview("u2"), gate("agent-9", "u3"), overview("u3"))
+	text := func(i int) string { return r[i].Result.Content[0].Text }
+	if text(0) != "" || text(2) != "" || text(4) != "" {
+		t.Fatalf("ortg's own tools pass the gate: %q %q %q", text(0), text(2), text(4))
+	}
+	if !strings.Contains(text(1), whole) || !strings.Contains(text(3), whole) || strings.Contains(text(5), whole) {
+		t.Fatalf("subagent and session each get one copy:\n%s\n%s\n%s", text(1), text(3), text(5))
+	}
+}
+
 // The cache outlives the MCP process: a host resuming the conversation in a
 // new process (claude -p --resume) starts a new server whose context still
 // holds the outline, so nothing is sent twice and the gate stays open; a

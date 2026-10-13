@@ -116,5 +116,19 @@ func TestManifestsAgree(t *testing.T) {
 	if len(gates) != 1 || gates[0].ev != "PreToolUse" || gates[0].h["type"] != "mcp_tool" ||
 		gates[0].h["server"] != "plugin:ortg:ortg" || gates[0].h["tool"] != "ortg_gate" {
 		t.Errorf("hooks/hooks.json must carry exactly the ortg_gate mcp_tool hook on PreToolUse, got %v", gates)
+	} else {
+		// Claude Code names no subagent in an MCP call: the gate runs on
+		// ortg's own tools too, passing the tool use's id with agent_id, so
+		// the call that follows is taken for the subagent's context.
+		in, _ := gates[0].h["input"].(map[string]any)
+		m := regexp.MustCompile("^(?:" + gates[0].matcher + ")$")
+		for _, tool := range []string{"mcp__plugin_ortg_ortg__ortg_overview", "mcp__plugin_ortg_ortg__ortg_review", "Read", "Bash"} {
+			if !m.MatchString(tool) {
+				t.Errorf("the Claude gate must match %s: %q", tool, gates[0].matcher)
+			}
+		}
+		if in["use"] != "${tool_use_id}" || in["agent"] != "${agent_id}" {
+			t.Errorf("the Claude gate must pass use=${tool_use_id} and agent=${agent_id}: %v", in)
+		}
 	}
 }
