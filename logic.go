@@ -1283,13 +1283,14 @@ func stopNote(root string, in base.HookInput) string {
 // node results can close known failures; without that proof the original
 // command and scope must pass. Other runners and missing results stay unknown.
 type failedTestRun struct {
-	Command       string
-	Cwd           string
-	Summary       string
-	Selected      []int
-	Signature     string
-	FailedNodeIDs []string
-	At            time.Time
+	Command          string
+	Cwd              string
+	Summary          string
+	Selected         []int
+	CollectionErrors bool
+	Signature        string
+	FailedNodeIDs    []string
+	At               time.Time
 }
 
 type failedTestRuns struct {
@@ -1508,10 +1509,8 @@ func pytestResultNodes(output string, start, end int, counts map[string]int, fai
 		return nil
 	}
 	part := output[start:end]
-	for _, marker := range []string{"output truncated", "tokens truncated", "truncated output", "output omitted"} {
-		if strings.Contains(strings.ToLower(output), marker) {
-			return nil
-		}
+	if pytestOutputTruncated(output) {
+		return nil
 	}
 	if !failed {
 		return pytestVerboseNodes(part, counts, false)
@@ -1555,6 +1554,61 @@ func pytestResultNodes(output string, start, end int, counts map[string]int, fai
 	return nodes
 }
 
+// Collection failures have no node proof. Only verbosity may change in a
+// literal single-command retry; unknown options and wrappers stay same-command.
+func pytestCollectionCommand(cmd string, depth int) string {
+	if depth > 3 || strings.ContainsAny(cmd, "$`\\{}~[]#") || detachedCommand(cmd) {
+		return ""
+	}
+	segs := shellSegments(cmd)
+	if len(segs) != 1 || segs[0].piped || segs[0].bg {
+		return ""
+	}
+	w := append([]string(nil), segs[0].words...)
+	i := 0
+	for i < len(w) && envAssignRe.MatchString(w[i]) {
+		i++
+	}
+	if i >= len(w) {
+		return ""
+	}
+	verb := filepath.Base(w[i])
+	if shellInterpreters[verb] {
+		if len(w) != i+3 {
+			return ""
+		}
+		script, ok := shellScriptArg(w[i+1:])
+		if !ok {
+			return ""
+		}
+		normalized := pytestCollectionCommand(script, depth+1)
+		if normalized == "" {
+			return ""
+		}
+		w[i+2] = normalized
+	} else {
+		i++
+		if pythonRe.MatchString(verb) && len(w) >= i+2 && w[i] == "-m" && w[i+1] == "pytest" {
+			i += 2
+		} else if verb != "pytest" && verb != "py.test" {
+			return ""
+		}
+		args := append([]string(nil), w[:i]...)
+		for _, a := range w[i:] {
+			if a == "--quiet" || a == "--verbose" || len(a) > 1 && a[0] == '-' && strings.Trim(a[1:], "qv") == "" {
+				continue
+			}
+			if a == "" || strings.HasPrefix(a, "-") || strings.HasPrefix(a, "@") || strings.ContainsAny(a, "<>*?") {
+				return "" // never interpret an option's value as verbosity
+			}
+			args = append(args, a)
+		}
+		w = args
+	}
+	b, _ := json.Marshal(w)
+	return string(b)
+}
+
 func recordTestResult(root, session, cwd, cmd, output string) {
 	if session == "" {
 		return
@@ -1585,12 +1639,16 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	if invocations == 0 {
 		return
 	}
-	summaries := testSummaryRe.FindAllStringSubmatch(output, -1)
+	summaries := pytestSummaries(output)
 	if len(summaries) == 0 {
 		return
 	}
-	matches := testSummaryRe.FindAllStringIndex(output, -1)
-	terminal := strings.Trim(output[matches[len(matches)-1][1]:], "= \t\r\n") == ""
+	last := summaries[len(summaries)-1]
+	terminal := last.complete && strings.TrimSpace(output[last.end:]) == "" && !pytestOutputTruncated(output)
+	start := 0
+	if len(summaries) > 1 {
+		start = summaries[len(summaries)-2].end
+	}
 	// One static, foreground command has one outer result. Earlier summaries
 	// can be output captured from tests; compound or dynamic commands cannot
 	// safely assign their summaries this way. A missing tail stays unknown.
@@ -1604,18 +1662,25 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	}
 	counts := map[string]int{}
 	var failures []string
+	collectionErrors := false
 	for _, s := range summaries {
-		c := pytestCounts("pytest", s[0])
+		c := s.counts
+		collectionErrors = collectionErrors || s.collectionErrors
 		for k, n := range c {
 			counts[k] += n
 		}
 		if c["failed"]+c["error"]+c["errors"] > 0 {
-			failures = append(failures, s[1])
+			failures = append(failures, s.text)
 		}
 	}
 	if len(failures) == 0 {
 		if !terminal || len(summaries) != invocations || counts["passed"] == 0 {
 			return
+		}
+		for _, s := range summaries {
+			if !s.complete {
+				return
+			}
 		}
 		for k, n := range counts {
 			if n > 0 && k != "passed" && k != "deselected" && k != "warning" && k != "warnings" {
@@ -1631,13 +1696,9 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	if v.Session != session || v.Runs == nil {
 		v = failedTestRuns{Session: session, Runs: map[string]failedTestRun{}}
 	}
-	start := 0
-	if len(matches) > 1 {
-		start = matches[len(matches)-2][1]
-	}
 	var nodes []string
-	if signature != "" && (len(failures) > 0 || verbose) {
-		nodes = pytestResultNodes(output, start, matches[len(matches)-1][0], counts, len(failures) > 0)
+	if signature != "" && !collectionErrors && (len(failures) > 0 || verbose) {
+		nodes = pytestResultNodes(output, start, last.start, counts, len(failures) > 0)
 	}
 	selected := append([]int(nil), v.Runs[key].Selected...)
 	if singleResult && len(selected) > 1 {
@@ -1650,7 +1711,10 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 			if i >= len(selected) {
 				selected = append(selected, 0)
 			}
-			c := pytestCounts("pytest", s[0])
+			if s.collectionErrors {
+				continue // collection errors do not reveal the selected test count
+			}
+			c := s.counts
 			n := 0
 			for _, k := range []string{"passed", "failed", "error", "errors", "skipped", "xfailed", "xpassed"} {
 				n += c[k]
@@ -1658,8 +1722,9 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 			selected[i] = max(selected[i], n)
 		}
 		old, exists := v.Runs[key]
+		collectionErrors = collectionErrors || old.CollectionErrors
 		if exists {
-			if old.Signature == "" || old.Signature != signature || len(old.FailedNodeIDs) == 0 || len(nodes) == 0 {
+			if collectionErrors || old.Signature == "" || old.Signature != signature || len(old.FailedNodeIDs) == 0 || len(nodes) == 0 {
 				nodes = nil // never upgrade an earlier unknown failure to a partial proof
 			} else {
 				nodes = append(nodes, old.FailedNodeIDs...)
@@ -1673,23 +1738,30 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 		if len(nodes) == 0 {
 			signature = ""
 		}
-		v.Runs[key] = failedTestRun{Command: cmd, Cwd: cwd, Summary: strings.Join(failures, "; "), Selected: selected, Signature: signature, FailedNodeIDs: nodes, At: time.Now()}
+		v.Runs[key] = failedTestRun{Command: cmd, Cwd: cwd, Summary: strings.Join(failures, "; "), Selected: selected, CollectionErrors: collectionErrors, Signature: signature, FailedNodeIDs: nodes, At: time.Now()}
 	} else {
 		covered := len(selected) == 0 || len(selected) == len(summaries)
 		if old := v.Runs[key]; old.Signature != "" && old.Signature != signature {
 			covered = false
 		}
 		for i, n := range selected {
-			if i >= len(summaries) || pytestCounts("pytest", summaries[i][0])["passed"] < n {
+			if i >= len(summaries) || summaries[i].counts["passed"] < n {
 				covered = false
 			}
 		}
 		if covered {
 			delete(v.Runs, key)
 		}
+		if equivalent := pytestCollectionCommand(cmd, 0); singleResult && equivalent != "" {
+			for k, r := range v.Runs {
+				if r.CollectionErrors && r.Cwd == cwd && len(r.Selected) <= 1 && pytestCollectionCommand(r.Command, 0) == equivalent && (len(r.Selected) == 0 || counts["passed"] >= r.Selected[0]) {
+					delete(v.Runs, k)
+				}
+			}
+		}
 		if len(nodes) > 0 && counts["passed"] > 0 && len(counts) == 1 {
 			for k, r := range v.Runs {
-				if r.Cwd != cwd || r.Signature != signature || len(r.FailedNodeIDs) == 0 {
+				if r.CollectionErrors || r.Cwd != cwd || r.Signature != signature || len(r.FailedNodeIDs) == 0 {
 					continue
 				}
 				complete := true
@@ -5179,9 +5251,65 @@ func shellNote(x *base.Index, in base.HookInput, cwd string) string {
 }
 
 var (
-	testSummaryRe = regexp.MustCompile(`(?m)^[=\s]*((?:\d+ [a-z]+(?:, )?)+) in [\d.]+s`)
+	testSummaryRe = regexp.MustCompile(`(?m)^[=! \t]*((?:\d+ [a-z]+(?:, \d+ [a-z]+)*)|Interrupted: \d+ errors? during collection)( in [\d.]+s(?: \([^\r\n]*\))?)?[=! \t]*\r?$`)
 	testCountRe   = regexp.MustCompile(`(\d+) ([a-z]+)`)
 )
+
+type pytestSummary struct {
+	text                       string
+	counts                     map[string]int
+	start, end                 int
+	collectionErrors, complete bool
+}
+
+func pytestSummaries(output string) []pytestSummary {
+	var summaries []pytestSummary
+	for _, m := range testSummaryRe.FindAllStringSubmatchIndex(output, -1) {
+		body := output[m[2]:m[3]]
+		counts := map[string]int{}
+		for _, c := range testCountRe.FindAllStringSubmatch(body, -1) {
+			n, _ := strconv.Atoi(c[1])
+			counts[c[2]] += n
+		}
+		collection := strings.HasPrefix(body, "Interrupted: ")
+		// Bare untimed counts can be a cut-off prefix of a longer summary.
+		// Balanced decorations or a complete duration provide its ending.
+		ending := m[3]
+		if m[4] >= 0 {
+			ending = m[5]
+		}
+		decorated := strings.Contains(output[m[0]:m[2]], "=")
+		complete := collection || m[4] >= 0 && !decorated || decorated && strings.Contains(output[ending:m[1]], "=")
+		s := pytestSummary{body, counts, m[0], m[1], collection, complete}
+		errorOnly := counts["error"]+counts["errors"] > 0
+		for k, n := range counts {
+			if n > 0 && k != "error" && k != "errors" && k != "skipped" && k != "deselected" && k != "warning" && k != "warnings" {
+				errorOnly = false
+			}
+		}
+		if len(summaries) > 0 && !collection && m[4] >= 0 && errorOnly {
+			prev := &summaries[len(summaries)-1]
+			if prev.collectionErrors && counts["error"]+counts["errors"] == prev.counts["error"]+prev.counts["errors"] && strings.TrimSpace(output[prev.end:s.start]) == "" {
+				// Pytest prints the same abort twice at normal verbosity.
+				prev.end = s.end
+				prev.counts = counts
+				continue
+			}
+		}
+		summaries = append(summaries, s)
+	}
+	return summaries
+}
+
+func pytestOutputTruncated(output string) bool {
+	output = strings.ToLower(output)
+	for _, marker := range []string{"output truncated", "tokens truncated", "truncated output", "output omitted"} {
+		if strings.Contains(output, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // pytestCounts returns the counts of a pytest-style run's printed summary
 // (the last one), keyed by outcome word; nil when the command is no pytest
@@ -5190,16 +5318,11 @@ func pytestCounts(cmd, output string) map[string]int {
 	if !strings.Contains(cmd, "pytest") || output == "" {
 		return nil
 	}
-	ms := testSummaryRe.FindAllStringSubmatch(output, -1)
+	ms := pytestSummaries(output)
 	if len(ms) == 0 {
 		return nil
 	}
-	counts := map[string]int{}
-	for _, c := range testCountRe.FindAllStringSubmatch(ms[len(ms)-1][1], -1) {
-		n, _ := strconv.Atoi(c[1])
-		counts[c[2]] += n
-	}
-	return counts
+	return ms[len(ms)-1].counts
 }
 
 // allSkipped returns how many tests a test run's printed summary skipped

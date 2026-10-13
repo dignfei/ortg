@@ -4150,6 +4150,117 @@ func TestFailedTestsRemainUntilSameCommandPasses(t *testing.T) {
 	}
 }
 
+func TestFailedTestsCollectionSummaries(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root := t.TempDir()
+	const command = "pytest -q cases/test_collect.py -q"
+	const interrupted = "!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!!\n"
+	for _, tt := range []struct {
+		name, command, output string
+		selected              []int
+		retries               []string
+		complete              string
+		failed                bool
+	}{
+		{"double quiet collection", command, "=== short test summary info ===\nERROR cases/test_collect.py - AttributeError\nERROR cases/test_collect.py - AttributeError\n" + interrupted, []int{0}, []string{"", ".. [100%]\n", "=== 1 passed ===\n[output truncated]", "[output omitted]\n=== 1 passed ===", "=== 2 skipped ===", "'1 passed'", "1 passed", "=== 1 passed, ===", "=== 1 passed in 1.", "=== 1 passed in 0.1s", "=== 1 error ==="}, "=== 1 passed ===", true},
+		{"decorated collection", command, "=== Interrupted: 1 error during collection ===\r\n", []int{0}, nil, "1 passed in 0.01s", true},
+		{"collection with timing", command, interrupted + "=== 2 errors in 0.1s ===\n", []int{0}, nil, "1 passed in 0.01s", true},
+		{"collection with timing and metadata", command, interrupted + "=== 1 skipped, 2 errors, 1 warning in 0.1s ===\n", []int{0}, nil, "1 passed in 0.01s", true},
+		{"caught inner collection outer pass", command, "=== test session starts ===\ncollected 1 item\n--- Captured stdout call ---\n" + interrupted + "=== 1 passed in 0.2s ===\n", nil, nil, "", false},
+		{"compound collection then pass", "pytest -q A -q; pytest -q B", interrupted + "=== 3 passed in 0.2s ===\n", []int{0, 3}, []string{"=== 3 passed ===", "=== 1 passed ===\n=== 2 passed ==="}, "=== 1 passed ===\n=== 3 passed ===", true},
+		{"compound timed collection then pass", "pytest A; pytest B", interrupted + "=== 2 errors in 0.1s ===\n=== 3 passed in 0.2s ===\n", []int{0, 3}, []string{"=== 3 passed ==="}, "=== 1 passed ===\n=== 3 passed ===", true},
+		{"compound collection metadata then pass", "pytest A; pytest B", interrupted + "=== 2 errors, 1 warning in 0.1s ===\n=== 3 passed in 0.2s ===\n", []int{0, 3}, nil, "=== 1 passed ===\n=== 3 passed ===", true},
+		{"untimed legacy count protected", command, "=== 100 failed ===\n", []int{100}, []string{"=== 82 passed ===", "=== 1 passed, 99 deselected ==="}, "=== 100 passed ===", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			session := tt.name
+			recordTestResult(root, session, root, tt.command, tt.output)
+			key := root + "\x00" + tt.command
+			runs := loadFailedTests(root, session).Runs
+			if (len(runs) == 1) != tt.failed {
+				t.Fatalf("initial result: %#v", runs)
+			}
+			if !tt.failed {
+				return
+			}
+			if got := runs[key]; got.Command != tt.command || got.Cwd != root || !slices.Equal(got.Selected, tt.selected) || got.CollectionErrors != strings.Contains(tt.output, "Interrupted: ") || got.Signature != "" || len(got.FailedNodeIDs) != 0 {
+				t.Fatalf("original scope must survive without guessed node proof: %+v", got)
+			}
+			recordTestResult(root, session, root, tt.command+" -k selected", "=== 100 passed ===")
+			recordTestResult(root, session, filepath.Join(root, "other"), tt.command, "=== 100 passed ===")
+			for _, output := range tt.retries {
+				recordTestResult(root, session, root, tt.command, output)
+				if got := loadFailedTests(root, session).Runs; len(got) != 1 || got[key].CollectionErrors != runs[key].CollectionErrors {
+					t.Fatalf("partial/unknown result cleared the original scope: %q", output)
+				}
+			}
+			recordTestResult(root, session, root, tt.command, tt.complete)
+			if got := loadFailedTests(root, session).Runs; len(got) != 0 {
+				t.Fatalf("same-command complete pass must cover scope: %#v", got)
+			}
+		})
+	}
+	const history = "collection history"
+	recordTestResult(root, history, root, command, "=== 100 failed in 0.1s ===")
+	recordTestResult(root, history, root, command, interrupted)
+	recordTestResult(root, history, root, command, "=== 1 failed, 81 passed in 0.1s ===")
+	if got := loadFailedTests(root, history).Runs[root+"\x00"+command]; !got.CollectionErrors || !slices.Equal(got.Selected, []int{100}) || len(got.FailedNodeIDs) != 0 {
+		t.Fatalf("collection flag and older known scope must survive: %+v", got)
+	}
+	recordTestResult(root, history, root, command, "=== 82 passed in 0.1s ===")
+	if len(loadFailedTests(root, history).Runs) != 1 {
+		t.Fatal("collection flag must not erase the older scope threshold")
+	}
+	recordTestResult(root, history, root, command, "=== 100 passed in 0.1s ===")
+	if len(loadFailedTests(root, history).Runs) != 0 {
+		t.Fatal("same-command full pass must discharge collection history")
+	}
+	for _, output := range []string{"=== 2 errors in 65.00s (0:01:05) ===", "=== 2 errors in 90000.00s (1 day, 1:00:00) ===", interrupted} {
+		if got := pytestCounts(command, output); got["errors"] != 2 || allSkipped(command, output) != 0 {
+			t.Fatalf("shared summary counts: %q: %#v", output, got)
+		}
+	}
+	for _, original := range []string{command, "python -m " + command, "/bin/bash -lc 'python -m " + command + "'", "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 " + command} {
+		session := original
+		rerun := strings.Replace(original, "-q", "-v", 1)
+		recordTestResult(root, session, root, original, interrupted)
+		for _, retry := range []struct{ cwd, command, output string }{
+			{root, original, ". [100%]\n"},
+			{root, rerun, ". [100%]\n"},
+			{root, strings.Replace(rerun, "test_collect.py", "test_other.py", 1), "1 passed in 0.01s"},
+			{root, strings.Replace(rerun, "pytest ", "pytest -k selected ", 1), "1 passed in 0.01s"},
+			{root, strings.Replace(rerun, "pytest ", "pytest -o addopts= ", 1), "1 passed in 0.01s"},
+			{root, rerun + "; pytest cases/test_collect.py", "100 passed in 0.01s\n1 passed in 0.01s"},
+			{root, rerun + " | cat", "100 passed in 0.01s"},
+			{filepath.Join(root, "other"), rerun, "1 passed in 0.01s"},
+			{root, "python3 -m pytest -v cases/test_collect.py", "1 passed in 0.01s"},
+			{root, "PYTEST_DISABLE_PLUGIN_AUTOLOAD=0 pytest -v cases/test_collect.py", "1 passed in 0.01s"},
+			{root, rerun, "1 passed in 0.01s\n[output omitted]"},
+		} {
+			recordTestResult(root, session, retry.cwd, retry.command, retry.output)
+			if len(loadFailedTests(root, session).Runs) != 1 {
+				t.Fatalf("verbosity retry lost selection, cwd, environment or terminal proof: %+v", retry)
+			}
+		}
+		recordTestResult(root, session, root, original, "100 failed in 0.01s")
+		recordTestResult(root, session, root, rerun, "82 passed in 0.01s")
+		if len(loadFailedTests(root, session).Runs) != 1 {
+			t.Fatal("verbosity retry must preserve an older known scope")
+		}
+		recordTestResult(root, session, root, rerun, "100 passed in 0.01s")
+		if len(loadFailedTests(root, session).Runs) != 0 {
+			t.Fatal("only verbosity changed: complete same-selection pass must cover collection failure")
+		}
+	}
+	for _, pair := range [][2]string{{`pytest -qq '{A,B}'`, `pytest -q {A,B}`}, {`pytest -qq '~/cases'`, `pytest -q ~/cases`}, {`pytest -qq "\a"`, `pytest -q a`}, {`pytest -qq '#cases'`, `pytest -q #cases`}, {`pytest -qq '[ab].py'`, `pytest -q [ab].py`}} {
+		recordTestResult(root, pair[0], root, pair[0], interrupted)
+		recordTestResult(root, pair[0], root, pair[1], "1 passed in 0.01s")
+		if len(loadFailedTests(root, pair[0]).Runs) != 1 {
+			t.Fatalf("shell expansion/quoting cannot prove the same selection: %q", pair)
+		}
+	}
+}
+
 func TestFailedTestsNestedSummaries(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	root := t.TempDir()

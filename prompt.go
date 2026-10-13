@@ -398,7 +398,7 @@ const stopFailedTestsNote = "ortg: 本会话仍有 %d 条 pytest 运行的失败
 const stopFailedTestsRun = "- %s 下 `%s`: %s"
 const stopFailedNodesNote = "\n  已保存全部 %d 个真实失败节点（显示 %d 个）：%s。可在同会话、目录、解释器和配置下用 -v 只复测全部这些节点；输出须保留相同的运行配置头、逐节点实际 PASSED 与数量一致的纯 passed 终端摘要，不接受 skipped/xfailed/xpassed。也可按原命令完整范围复测。"
 const stopFailedNodesMore = "清单有省略，须从原真实 short test summary 取齐其余节点；只复测显示的部分不能结案。"
-const stopFailedWholeNote = "\n  缺少完整节点或运行配置证据：仍须同工作目录、同原命令完整通过，测试数量不得缩小，不能用局部通过结案。后续新失败运行用 -v 保留解释器与运行配置头、实际逐节点结果和完整 short test summary，才可能建立节点证据；旧记录不能事后补猜。"
+const stopFailedWholeNote = "\n  缺少完整节点或运行配置证据：仍须同工作目录、同原命令完整通过，测试数量不得缩小，不能用局部通过结案。收集中断的 error 数不代表选中的用例数，不能用局部节点通过覆盖；静态单条原命令可仅调整 -q/-v 以保留完整 passed 终端摘要，其余参数、环境和选择须相同，进度行不证明通过。后续新失败运行用 -v 保留解释器与运行配置头、实际逐节点结果和完整 short test summary，才可能建立节点证据；旧记录不能事后补猜。"
 
 // depBumpNote (%s the moved versions, "manifest：name old → new", with
 // depChangeMore %d for the rest) follows an edit that moved an existing
