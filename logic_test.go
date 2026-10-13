@@ -3617,6 +3617,92 @@ func TestTestRunKindWrapped(t *testing.T) {
 // started after the record) and code changes are uncommitted — never for
 // another session, never while a Stop hook already kept the turn going,
 // never without a session, and not once the run is over.
+func TestFailedTestsRemainUntilSameCommandPasses(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root, _ := gitRepo(t, map[string]string{"a.py": "x = 1\n"})
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(root, "a.py"), []byte("x = 2\n"), 0o644)
+	const session = "fail-check"
+	const cmd = "python -m pytest -q tests"
+	post := func(command, output string) {
+		HookReply("post", base.HookInput{Cwd: root, SessionID: session, ToolName: "Bash", Command: command, ToolOutput: output})
+	}
+	stop := func(s string, active bool) string {
+		return HookReply("stop", base.HookInput{Cwd: root, SessionID: s, StopHookActive: active})
+	}
+	post(cmd, "=== 55 failed, 20 passed, 4 errors in 1.2s ===")
+	// A narrower success cannot clear the earlier failure, even across a
+	// context reset or a tool call from another session.
+	post(cmd+" -k selected", "=== 20 passed in 0.2s ===")
+	HookReply("post", base.HookInput{Cwd: root, SessionID: "another", ToolName: "Bash", Command: cmd, ToolOutput: "=== 80 passed in 1.2s ==="})
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: session})
+	for _, c := range []struct {
+		s      string
+		active bool
+	}{{"another", false}, {"", false}, {session, true}} {
+		if got := stop(c.s, c.active); got != "" {
+			t.Fatalf("unexpected stop for %+v: %q", c, got)
+		}
+	}
+	if got := stop(session, false); !strings.Contains(got, cmd) || !strings.Contains(got, "55 failed") || !strings.Contains(got, "4 errors") {
+		t.Fatalf("the actual failed command and summary must survive: %q", got)
+	}
+	if got := stop(session, false); got != "" {
+		t.Fatalf("a failure is reminded once: %q", got)
+	}
+	// Missing/truncated output, all skips and skipped formerly failing tests
+	// are not a complete successful rerun.
+	for _, output := range []string{"", "interrupted", "=== 80 skipped in 0.2s ===", "=== 79 passed, 1 skipped in 0.2s ===", "=== 1 passed in 0.2s ===", "=== 1 passed, 79 deselected in 0.2s ===", "=== 80 passed, 1 rerun in 0.2s ==="} {
+		post(cmd, output)
+		if len(loadFailedTests(root, session).Runs) != 1 {
+			t.Fatalf("unknown/skipped result cleared failure: %q", output)
+		}
+	}
+	post(cmd, "=== 80 passed in 1.2s ===")
+	if len(loadFailedTests(root, session).Runs) != 0 || stop(session, false) != "" {
+		t.Fatal("a complete passing rerun must clear the failed command")
+	}
+	// A combined shell call must preserve an earlier failure even when the
+	// last invocation passes; merely reading a saved log is not a test run.
+	const combined = "pytest tests; pytest tests -k selected"
+	post(combined, "=== 3 failed in 0.2s ===\n=== 20 passed in 0.3s ===")
+	if len(loadFailedTests(root, session).Runs) != 1 {
+		t.Fatal("the later narrow result hid the earlier failure")
+	}
+	post("cat pytest.log", "=== 3 failed in 0.2s ===")
+	post("cd /elsewhere && pytest", "=== 3 failed in 0.2s ===")
+	post(combined, "=== 20 passed in 0.3s ===")
+	if len(loadFailedTests(root, session).Runs) != 1 {
+		t.Fatal("a log read or missing summary must not change the record")
+	}
+	post(combined, "=== 1 passed in 0.2s ===\n=== 100 passed in 0.3s ===")
+	if len(loadFailedTests(root, session).Runs) != 1 {
+		t.Fatal("a later invocation's larger count must not hide an earlier invocation's reduced scope")
+	}
+	post(combined, "=== 80 passed in 0.2s ===\n=== 20 passed in 0.3s ===")
+	if len(loadFailedTests(root, session).Runs) != 0 {
+		t.Fatal("both successful summaries should discharge the combined run")
+	}
+	for _, dir := range []string{"a", "b"} {
+		os.MkdirAll(filepath.Join(root, dir), 0o755)
+	}
+	postAt := func(dir, output string) {
+		HookReply("post", base.HookInput{Cwd: filepath.Join(root, dir), SessionID: session, ToolName: "Bash", Command: "pytest", ToolOutput: output})
+	}
+	postAt("a", "=== 80 failed in 1.2s ===")
+	postAt("b", "=== 80 passed in 1.2s ===")
+	if len(loadFailedTests(root, session).Runs) != 1 {
+		t.Fatal("the same command in another directory cleared a failure")
+	}
+	postAt("a", "=== 80 passed in 1.2s ===")
+	if len(loadFailedTests(root, session).Runs) != 0 {
+		t.Fatal("the original working directory's successful run should clear its failure")
+	}
+}
+
 func TestStopWhileBackgroundRun(t *testing.T) {
 	if _, err := os.Stat("/proc/self/cmdline"); err != nil {
 		t.Skip("no /proc")

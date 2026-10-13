@@ -647,6 +647,13 @@ func (x *Index) CheckEntry(rel, line string) Check {
 		c.Errors = append(c.Errors, err.Error())
 		return c
 	}
+	for _, field := range []struct{ name, value string }{
+		{"Role", e.Role}, {"Uses", e.Uses}, {"API", e.API}, {"Constraints", e.Constraints},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			c.Errors = append(c.Errors, field.name+" 字段不能为空，无内容写 -")
+		}
+	}
 	if strings.TrimSuffix(e.Name, "/") != path.Base(rel) { // "vendored/" names a directory
 		c.Errors = append(c.Errors, fmt.Sprintf("文件名 %s 与路径 %s 不一致", e.Name, rel))
 	}

@@ -6,8 +6,39 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
+
+func TestCheckEntryRequiresExplicitFields(t *testing.T) {
+	x := NewMemIndex(t.TempDir(), testHeader)
+	valid := "a.go[5 L ST T]: Role:职责 | Uses:- | API:- | Constraints:-"
+	for _, field := range []string{"Role", "Uses", "API", "Constraints"} {
+		value := "-"
+		if field == "Role" {
+			value = "职责"
+		}
+		for _, blank := range []string{"", "  ", "\u3000"} {
+			t.Run(fmt.Sprintf("%s_%q", field, blank), func(t *testing.T) {
+				line := strings.Replace(valid, field+":"+value, field+":"+blank, 1)
+				got := x.CheckEntry("a.go", line)
+				want := field + " 字段不能为空，无内容写 -"
+				if !reflect.DeepEqual(got.Errors, []string{want}) {
+					t.Fatalf("errors: %v; want %q", got.Errors, want)
+				}
+			})
+		}
+	}
+	for _, line := range []string{valid, strings.Replace(valid, "Role:职责", "Role:-", 1), valid + " | Keys:unit:money(消费方)"} {
+		if got := x.CheckEntry("a.go", line); len(got.Errors) != 0 {
+			t.Fatalf("explicit fields must be accepted: %+v", got)
+		}
+	}
+	line := strings.Replace(valid, "Constraints:-", "Constraints: | Keys:unit:money(消费方)", 1)
+	if got := x.CheckEntry("a.go", line); !reflect.DeepEqual(got.Errors, []string{"Constraints 字段不能为空，无内容写 -"}) {
+		t.Fatalf("Keys must not conceal an empty Constraints field: %+v", got)
+	}
+}
 
 // A row the scan stopped enumerating but whose file is still on disk survives
 // only when it carries knowledge. A bare skeleton row is leftover noise and

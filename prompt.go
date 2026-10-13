@@ -361,6 +361,8 @@ const gatedFailuresNote = "ortg: 这次运行去掉了按依赖版本整类跳�
 // uncommitted.
 const stopBgRunNote = "ortg: 你放到后台或脱离会话启动的整包测试（%s）还在运行，代码改动也还没提交。非交互运行时回合一结束会话就退出，等候的通知不会到来，测试还可能被一并终止。在本回合里用前台阻塞的方式等它跑完（例如循环检查它的日志里是否出现结束标记，给足超时），读完结果、处理好失败，再按任务要求提交或收尾。若这是交互会话、确实要先把控制交还给用户，说明测试仍在后台运行即可。"
 
+const stopFailedTestsNote = "ortg: 本会话仍有 %d 条 pytest 运行的失败没有被同工作目录、同命令且测试数量未缩小的完整通过结果覆盖，代码改动尚未提交：\n%s\n局部通过、纲要对齐或没有新的报错摘要都不能证明这些失败已修复。按原失败命令重跑最终持久源码；沿可见堆栈核实阻断目标功能的缺失符号与协作入口，阻断的纳入计划并修复。确与任务无关、环境阻断或当前无法修复的，按证据明确报告仍未通过及原因，不当成验收成功。本提醒对每次记录的失败只拦一次，不能代替实际测试。"
+
 // depBumpNote (%s the moved versions, "manifest：name old → new", with
 // depChangeMore %d for the rest) follows an edit that moved an existing
 // dependency's version.

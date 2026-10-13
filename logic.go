@@ -24,7 +24,7 @@ import (
 	"ortg/migrate"
 )
 
-const version = "0.5.34"
+const version = "0.5.35"
 
 var (
 	excludeDirs  = []string{".git", "build"}
@@ -1001,6 +1001,173 @@ func stopNote(root string, in base.HookInput) string {
 		return ""
 	}
 	return fmt.Sprintf(stopBgRunNote, strings.Join(b.Words, " "))
+}
+
+// Failed pytest runs survive compaction and process restarts. A narrower run
+// cannot discharge a failure: only the same command with a complete passing
+// summary clears its record. Other runners and missing summaries stay unknown.
+type failedTestRun struct {
+	Command  string
+	Cwd      string
+	Summary  string
+	Selected []int
+	At       time.Time
+}
+
+type failedTestRuns struct {
+	Session string
+	Runs    map[string]failedTestRun
+}
+
+func failedTestsMark(session string) string {
+	return fmt.Sprintf("failed-tests-%x", sha1.Sum([]byte(session)))
+}
+
+func loadFailedTests(root, session string) failedTestRuns {
+	var v failedTestRuns
+	_, data := base.OverviewMark(root, failedTestsMark(session))
+	_ = json.Unmarshal([]byte(data), &v)
+	return v
+}
+
+func recordTestResult(root, session, cwd, cmd, output string) {
+	if session == "" {
+		return
+	}
+	if cwd == "" {
+		cwd = root
+	} else if !filepath.IsAbs(cwd) {
+		cwd = filepath.Join(root, cwd)
+	}
+	cwd = filepath.Clean(cwd)
+	invocations := 0
+	dir := cwd
+	for _, seg := range expandedSegments(cmd, 0) {
+		w := unwrapCommand(dropRedirects(seg.words))
+		if len(w) == 0 {
+			continue
+		}
+		verb := filepath.Base(w[0])
+		if verb == "cd" || verb == "pushd" {
+			dir = cdTarget(dir, w[1:])
+			continue
+		}
+		if _, inside := base.Rel(root, dir); dir != "" && inside && (verb == "pytest" || verb == "py.test") {
+			invocations++
+		}
+	}
+	if invocations == 0 {
+		return
+	}
+	summaries := testSummaryRe.FindAllStringSubmatch(output, -1)
+	if len(summaries) == 0 {
+		return
+	}
+	counts := map[string]int{}
+	var failures []string
+	for _, s := range summaries {
+		c := pytestCounts("pytest", s[0])
+		for k, n := range c {
+			counts[k] += n
+		}
+		if c["failed"]+c["error"]+c["errors"] > 0 {
+			failures = append(failures, s[1])
+		}
+	}
+	if len(failures) == 0 {
+		if len(summaries) != invocations || counts["passed"] == 0 {
+			return
+		}
+		for k, n := range counts {
+			if n > 0 && k != "passed" && k != "deselected" && k != "warning" && k != "warnings" {
+				return
+			}
+		}
+	}
+	cmd = strings.TrimSpace(cmd)
+	key := cwd + "\x00" + cmd
+	overviewMu.Lock()
+	defer overviewMu.Unlock()
+	v := loadFailedTests(root, session)
+	if v.Session != session || v.Runs == nil {
+		v = failedTestRuns{Session: session, Runs: map[string]failedTestRun{}}
+	}
+	if len(failures) > 0 {
+		selected := append([]int(nil), v.Runs[key].Selected...)
+		for i, s := range summaries {
+			if i >= len(selected) {
+				selected = append(selected, 0)
+			}
+			c := pytestCounts("pytest", s[0])
+			n := 0
+			for _, k := range []string{"passed", "failed", "error", "errors", "skipped", "xfailed", "xpassed"} {
+				n += c[k]
+			}
+			selected[i] = max(selected[i], n)
+		}
+		v.Runs[key] = failedTestRun{Command: cmd, Cwd: cwd, Summary: strings.Join(failures, "; "), Selected: selected, At: time.Now()}
+	} else {
+		selected := v.Runs[key].Selected
+		if len(selected) > 0 && len(selected) != len(summaries) {
+			return
+		}
+		for i, n := range selected {
+			if pytestCounts("pytest", summaries[i][0])["passed"] < n {
+				return
+			}
+		}
+		delete(v.Runs, key)
+	}
+	if b, err := json.Marshal(v); err == nil {
+		base.MarkOverview(root, failedTestsMark(session), string(b))
+	}
+}
+
+func failedTestStopNote(root string, in base.HookInput) string {
+	if in.StopHookActive || in.SessionID == "" {
+		return ""
+	}
+	overviewMu.Lock()
+	v := loadFailedTests(root, in.SessionID)
+	overviewMu.Unlock()
+	if v.Session != in.SessionID || len(v.Runs) == 0 {
+		return ""
+	}
+	x, err := base.Open(root)
+	if err != nil {
+		return ""
+	}
+	changed, ok := x.ChangedFiles()
+	if !ok {
+		return ""
+	}
+	codeChanged := false
+	for p := range changed {
+		if codeFile(p) && !x.Excluded(p, reconcileOpts) {
+			codeChanged = true
+			break
+		}
+	}
+	if !codeChanged {
+		return ""
+	}
+	commands := make([]string, 0, len(v.Runs))
+	for cmd := range v.Runs {
+		commands = append(commands, cmd)
+	}
+	sort.Strings(commands)
+	var lines []string
+	for _, commandKey := range commands {
+		r := v.Runs[commandKey]
+		key := fmt.Sprintf("stopfail:%x:%d", sha1.Sum([]byte(commandKey)), r.At.UnixNano())
+		if len(lines) < 3 && base.InjectOnce(in.SessionID, key) {
+			lines = append(lines, fmt.Sprintf("- %s 下 `%s`: %s", r.Cwd, r.Command, r.Summary))
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(stopFailedTestsNote, len(v.Runs), strings.Join(lines, "\n"))
 }
 
 // editsInPlace reports whether a shell command edits file in place with
@@ -3937,7 +4104,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 	}
 	root := base.FindRepoRoot(start)
 	if event == "stop" {
-		return stopNote(root, in), "" // runs every turn: no table unless a run is alive
+		return strings.TrimSpace(stopNote(root, in) + "\n" + failedTestStopNote(root, in)), ""
 	}
 	open := base.Open // the other events only read: an old table stays as it is
 	if event == "session" {
@@ -4029,7 +4196,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		// Edit|Write matchers, which is exactly how outlines stay missing or go
 		// stale unnoticed. Fall back to the command text and the table itself.
 		if event == "post" {
-			return shellNote(x, in.SessionID, in.Command, in.ToolOutput, in.Background), ""
+			return shellNote(x, in.SessionID, start, in.Command, in.ToolOutput, in.Background), ""
 		}
 		return "", ""
 	}
@@ -4156,7 +4323,8 @@ func fileHookReply(event string, in base.HookInput, x *base.Index, rel string) s
 // the survivors are fingerprinted. Each file is named once per session so an
 // unrelated shell command does not repeat the same nag, and the SessionStart
 // report stays the backstop for anything the model lets slide.
-func shellNote(x *base.Index, session, cmd, output string, background bool) string {
+func shellNote(x *base.Index, session, cwd, cmd, output string, background bool) string {
+	recordTestResult(x.Root(), session, cwd, cmd, output)
 	if words, _ := scanTestRun(cmd, x.Root()); words != nil && (background || detachedCommand(cmd)) {
 		recordBgRun(x.Root(), session, words)
 	}
