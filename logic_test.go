@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -3759,6 +3760,80 @@ func TestFailedTestsRemainUntilSameCommandPasses(t *testing.T) {
 	postAt("a", "=== 80 passed in 1.2s ===")
 	if len(loadFailedTests(root, session).Runs) != 0 {
 		t.Fatal("the original working directory's successful run should clear its failure")
+	}
+}
+
+func TestFailedTestsNestedSummaries(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root := t.TempDir()
+	const nested = "=== 1 failed in 0.02s ===\n=== 82 passed in 1.23s ===\n"
+	for _, tt := range []struct {
+		command string
+		failed  bool
+	}{
+		{"python -m pytest -q tests", false},
+		{"timeout 600 uv run python -m pytest -q tests", false},
+		{"bash -lc 'python -m pytest -q tests'", false},
+		{"pytest A; pytest B", true},
+		{"for d in A B; do pytest $d; done", true},
+		{"pytest A || cat old.log", true},
+		{"pytest A | tail", true},
+		{"pytest $TARGET", true},
+		{"pytest A &", true},
+		{"bash -c 'pytest A' &", true},
+		{"nohup bash -c 'pytest A' &", true},
+	} {
+		t.Run(tt.command, func(t *testing.T) {
+			recordTestResult(root, tt.command, root, tt.command, nested)
+			runs := loadFailedTests(root, tt.command).Runs
+			if (len(runs) != 0) != tt.failed {
+				t.Fatalf("nested/compound result: %#v", runs)
+			}
+		})
+	}
+}
+
+func TestFailedTestsNestedRerunCoverage(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root := t.TempDir()
+	const cmd = "python -m pytest -q tests"
+	const session = "nested-rerun"
+	recordTestResult(root, session, root, cmd, "=== 100 failed in 0.02s ===\n=== 1 failed, 81 passed in 1.23s ===\n")
+	key := root + "\x00" + cmd
+	if got := loadFailedTests(root, session).Runs[key]; len(got.Selected) != 1 || got.Selected[0] != 82 || strings.Contains(got.Summary, "100 failed") {
+		t.Fatalf("only the outer run sets failure coverage: %+v", got)
+	}
+	for _, output := range []string{
+		"", "interrupted", "=== 82 passed in 1.23s ===\n[output truncated]",
+		"82 passed in 1.23s\ntruncated: 82 passed in 1.23s ===",
+		"=== 82 passed in 1.23s ===\n=== 1 failed in 1.",
+		"=== 81 passed, 1 skipped in 1.23s ===", "=== 81 passed in 1.23s ===",
+	} {
+		recordTestResult(root, session, root, cmd, output)
+		if len(loadFailedTests(root, session).Runs) != 1 {
+			t.Fatalf("unknown/truncated/skipped/narrower output cleared a failure: %q", output)
+		}
+	}
+	recordTestResult(root, session, root, cmd, "=== 1 failed in 0.02s ===\n=== 82 passed in 1.23s ===\n")
+	if got := loadFailedTests(root, session).Runs; len(got) != 0 {
+		t.Fatalf("a complete outer pass must cover the actual outer failure: %#v", got)
+	}
+	// Versions before this fix stored captured summaries as extra slots. A
+	// single rerun must cover their largest scope, including older failures.
+	for _, selected := range [][]int{{1, 82}, {100, 82}} {
+		v := failedTestRuns{Session: session, Runs: map[string]failedTestRun{
+			key: {Command: cmd, Cwd: root, Summary: "1 failed", Selected: selected},
+		}}
+		data, _ := json.Marshal(v)
+		base.MarkOverview(root, failedTestsMark(session), string(data))
+		recordTestResult(root, session, root, cmd, "=== 82 passed in 1.23s ===")
+		if got := loadFailedTests(root, session).Runs; (len(got) != 0) != (selected[0] > 82) {
+			t.Fatalf("legacy scopes %v: %#v", selected, got)
+		}
+		recordTestResult(root, session, root, cmd, "=== 100 passed in 1.23s ===")
+		if got := loadFailedTests(root, session).Runs; len(got) != 0 {
+			t.Fatalf("a full rerun must discharge legacy scopes %v: %#v", selected, got)
+		}
 	}
 }
 

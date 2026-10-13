@@ -1060,7 +1060,8 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	cwd = filepath.Clean(cwd)
 	invocations := 0
 	dir := cwd
-	for _, seg := range expandedSegments(cmd, 0) {
+	segments := expandedSegments(cmd, 0)
+	for _, seg := range segments {
 		w := unwrapCommand(dropRedirects(seg.words))
 		if len(w) == 0 {
 			continue
@@ -1081,6 +1082,15 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	if len(summaries) == 0 {
 		return
 	}
+	matches := testSummaryRe.FindAllStringIndex(output, -1)
+	terminal := strings.Trim(output[matches[len(matches)-1][1]:], "= \t\r\n") == ""
+	// One static, foreground command has one outer result. Earlier summaries
+	// can be output captured from tests; compound or dynamic commands cannot
+	// safely assign their summaries this way. A missing tail stays unknown.
+	singleResult := len(segments) == 1 && !segments[0].piped && !detachedCommand(cmd) && !strings.ContainsAny(cmd, "$`") && terminal
+	if singleResult {
+		summaries = summaries[len(summaries)-1:]
+	}
 	counts := map[string]int{}
 	var failures []string
 	for _, s := range summaries {
@@ -1093,7 +1103,7 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 		}
 	}
 	if len(failures) == 0 {
-		if len(summaries) != invocations || counts["passed"] == 0 {
+		if !terminal || len(summaries) != invocations || counts["passed"] == 0 {
 			return
 		}
 		for k, n := range counts {
@@ -1110,8 +1120,13 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	if v.Session != session || v.Runs == nil {
 		v = failedTestRuns{Session: session, Runs: map[string]failedTestRun{}}
 	}
+	selected := append([]int(nil), v.Runs[key].Selected...)
+	if singleResult && len(selected) > 1 {
+		// Older records counted captured summaries as invocations. Keep the
+		// largest observed scope when a known single command is rerun.
+		selected = []int{slices.Max(selected)}
+	}
 	if len(failures) > 0 {
-		selected := append([]int(nil), v.Runs[key].Selected...)
 		for i, s := range summaries {
 			if i >= len(selected) {
 				selected = append(selected, 0)
@@ -1125,7 +1140,6 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 		}
 		v.Runs[key] = failedTestRun{Command: cmd, Cwd: cwd, Summary: strings.Join(failures, "; "), Selected: selected, At: time.Now()}
 	} else {
-		selected := v.Runs[key].Selected
 		if len(selected) > 0 && len(selected) != len(summaries) {
 			return
 		}
