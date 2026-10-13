@@ -2333,6 +2333,35 @@ func TestOverviewResetPerSession(t *testing.T) {
 		t.Fatalf("a new server for the same thread keeps its cache:\n%s", out)
 	}
 
+	// A Codex subagent: its calls name its own thread; its hooks name the
+	// parent's session and its thread as agent_id. Its compaction is its
+	// own, and the parent's is not its.
+	codexSub := map[string]any{"threadId": "sub-1", "sessionId": "thread-a", "progressToken": 1}
+	as(codexSub)
+	if out, _ := Overview("", false); !strings.Contains(out, whole) {
+		t.Fatalf("a subagent gets its own copy:\n%s", out)
+	}
+	tick()
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: "thread-a", AgentID: "sub-1"})
+	as(codexA)
+	if out, _ := Overview("", false); strings.Contains(out, whole) {
+		t.Fatalf("a subagent's compaction must not resend the parent's outline:\n%s", out)
+	}
+	as(codexSub)
+	if out, _ := Overview("", false); !strings.Contains(out, whole) || !strings.Contains(out, "被压缩") {
+		t.Fatalf("the subagent's own compaction resends to it:\n%s", out)
+	}
+	tick()
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: "thread-a"})
+	as(codexSub)
+	if out, _ := Overview("", false); strings.Contains(out, whole) {
+		t.Fatalf("the parent's compaction is not the subagent's:\n%s", out)
+	}
+	as(codexA)
+	if out, _ := Overview("", false); !strings.Contains(out, whole) {
+		t.Fatalf("the parent's compaction resends to the parent:\n%s", out)
+	}
+
 	// Claude Code: the session comes from the environment; a /clear starts
 	// a new session id in the same process, whose hook is a child of the
 	// host — the parent of the MCP server.
@@ -2340,6 +2369,12 @@ func TestOverviewResetPerSession(t *testing.T) {
 	as(nil)
 	if out, _ := Overview("", false); !strings.Contains(out, whole) {
 		t.Fatalf("the Claude session gets the outline:\n%s", out)
+	}
+	tick()
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: "claude-1", AgentID: "agent-x"})
+	as(nil)
+	if out, _ := Overview("", false); strings.Contains(out, whole) {
+		t.Fatalf("a Claude subagent's compaction leaves the session's outline alone:\n%s", out)
 	}
 	tick()
 	HookReply("session", base.HookInput{Cwd: root, SessionID: "claude-2", Source: "clear"})

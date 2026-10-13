@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,7 +26,11 @@ type HookInput struct {
 	Cwd       string
 	Source    string
 	SessionID string
-	Model     string // only Claude Code's interactive SessionStart carries it
+	// AgentID is set when a subagent's thread fired the hook. Codex then
+	// still gives the parent's session_id: agent_id is the subagent's own
+	// thread, the id its MCP calls carry.
+	AgentID string
+	Model   string // only Claude Code's interactive SessionStart carries it
 	// ToolOutput is what a PostToolUse payload says the tool printed, with
 	// terminal color codes removed and at most its last toolOutputMax bytes.
 	// A host may already have cut a long output (Claude Code keeps its head
@@ -311,6 +314,7 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 		Cwd       string          `json:"cwd"`
 		Source    string          `json:"source"`
 		SessionID string          `json:"session_id"`
+		AgentID   string          `json:"agent_id"`
 		Model     string          `json:"model"`
 		Response  json.RawMessage `json:"tool_response"`
 		StopHook  bool            `json:"stop_hook_active"`
@@ -326,6 +330,9 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 	}
 	in.Event, in.ToolName, in.Cwd, in.Source, in.SessionID = m.Event, m.ToolName, m.Cwd, m.Source, filepath.Base(m.SessionID)
 	in.Model = m.Model
+	if m.AgentID != "" {
+		in.AgentID = filepath.Base(m.AgentID)
+	}
 	in.ToolOutput = toolOutput(m.Response)
 	in.FilePath = m.Input.FilePath
 	if in.FilePath == "" {
@@ -455,30 +462,23 @@ func PruneOverviewMarks(root string, prefixes []string, age time.Duration) {
 	}
 }
 
-// CallSession names the session an MCP tool call belongs to. Codex puts the
+// CallSession names the context an MCP tool call belongs to. Codex puts the
 // thread in every call's _meta — the model's calls and those its mcp_tool
 // hooks make alike — and one Codex process may serve many threads through a
 // single MCP server, so the call is the only place to learn it. The thread
-// id comes first (it owns the context and keys what was sent); the session
-// id follows when it differs, since a hook may name either. Claude Code's
-// _meta names no session, but it starts an MCP server per session with
+// owns the context: a subagent's calls carry its own thread id, the
+// agent_id of its hooks, while their session id is the parent's, so the
+// session id stands in only when no thread is named. Claude Code's _meta
+// names no session, but it starts an MCP server per session with
 // CLAUDE_CODE_SESSION_ID in the environment: fromEnv reports that id, which
 // a /clear may leave stale (a new session in the same process). nil when
 // neither says.
 func CallSession(meta map[string]any) (ids []string, fromEnv bool) {
-	add := func(v any) {
-		if s, _ := v.(string); s != "" && !slices.Contains(ids, s) {
-			ids = append(ids, s)
+	turn, _ := meta["x-codex-turn-metadata"].(map[string]any)
+	for _, v := range []any{meta["threadId"], turn["thread_id"], meta["sessionId"], turn["session_id"]} {
+		if s, _ := v.(string); s != "" {
+			return []string{s}, false
 		}
-	}
-	add(meta["threadId"])
-	if t, ok := meta["x-codex-turn-metadata"].(map[string]any); ok {
-		add(t["thread_id"])
-		add(t["session_id"])
-	}
-	add(meta["sessionId"])
-	if len(ids) > 0 {
-		return ids, false
 	}
 	if s := os.Getenv("CLAUDE_CODE_SESSION_ID"); s != "" {
 		return []string{s}, true

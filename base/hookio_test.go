@@ -335,15 +335,19 @@ func TestToolOutputStripsColor(t *testing.T) {
 	}
 }
 
-// Codex names the thread in the call's _meta (thread first, then a differing
-// session id, without repeats); Claude Code names none there, so the
-// environment's session id answers, marked as such.
+// Codex names the thread in the call's _meta: a subagent's thread, not the
+// parent session also named there; the session id stands in only without a
+// thread. Claude Code names none there, so the environment's session id
+// answers, marked as such.
 func TestCallSession(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-1")
 	codex := map[string]any{"threadId": "th", "sessionId": "root", "progressToken": 1,
 		"x-codex-turn-metadata": map[string]any{"thread_id": "th", "session_id": "root"}}
-	if ids, env := CallSession(codex); !reflect.DeepEqual(ids, []string{"th", "root"}) || env {
-		t.Fatalf("codex meta: %v %v", ids, env)
+	if ids, env := CallSession(codex); !reflect.DeepEqual(ids, []string{"th"}) || env {
+		t.Fatalf("codex meta: the thread alone: %v %v", ids, env)
+	}
+	if ids, _ := CallSession(map[string]any{"sessionId": "root"}); !reflect.DeepEqual(ids, []string{"root"}) {
+		t.Fatalf("no thread: the session stands in: %v", ids)
 	}
 	if ids, env := CallSession(map[string]any{"threadId": "th", "progressToken": 1}); !reflect.DeepEqual(ids, []string{"th"}) || env {
 		t.Fatalf("a hook's call carries the thread alone: %v %v", ids, env)
@@ -394,5 +398,16 @@ func TestPruneOverviewMarks(t *testing.T) {
 	}
 	if gone(root, "reset-snew") || gone(root, "reset") || gone(root, "start") || gone(other, "reset-sold") {
 		t.Fatal("recent marks, other kinds and other roots' marks must stay")
+	}
+}
+
+// A subagent's hook names the parent's session and its own thread apart.
+func TestReadHookInputAgent(t *testing.T) {
+	in := ReadHookInput(strings.NewReader(`{"hook_event_name":"PostCompact","session_id":"parent","agent_id":"sub/../t2"}`), time.Second)
+	if in.SessionID != "parent" || in.AgentID != "t2" {
+		t.Fatalf("session %q agent %q", in.SessionID, in.AgentID)
+	}
+	if in := ReadHookInput(strings.NewReader(`{"session_id":"s"}`), time.Second); in.AgentID != "" {
+		t.Fatalf("no agent_id: %q", in.AgentID)
 	}
 }

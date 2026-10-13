@@ -540,7 +540,8 @@ var (
 
 // callSession is the session the MCP call being served belongs to, set by
 // useCallSession before every tool runs (the server handles one call at a
-// time). ids[0] keys the cache; every id names reset marks meant for it.
+// time). ids holds the one id of the call's context (its thread for Codex):
+// it keys the cache and names the reset marks meant for it.
 // fromEnv: the id came from the environment (Claude Code), where a /clear
 // may have started a new session in the same process, so the reset marks of
 // that process count too. Empty outside the MCP server or when the host
@@ -567,14 +568,20 @@ func sessionKey(id string) string {
 	return fmt.Sprintf("%x", sha1.Sum([]byte(id)))[:16]
 }
 
-// markReset records that session's context lost what was sent (source is
-// the hook's: compact or clear). The plain mark serves servers that cannot
-// tell sessions apart; the per-session one the servers that can; the
-// per-process ones a Claude Code server whose session id a /clear replaced
-// — the host process is the parent of its MCP server and an ancestor of
-// this hook.
-func markReset(root, session, source string) {
+// markReset records that the hook's context lost what was sent (source is
+// the hook's: compact or clear). That context is the subagent's when agent
+// is set — Codex names the parent in session then — and the session's
+// otherwise. The plain mark serves servers that cannot tell contexts apart;
+// the per-context one the servers that can; the per-process ones a Claude
+// Code server whose session id a /clear replaced — the host process is the
+// parent of its MCP server and an ancestor of this hook. A subagent's
+// compaction leaves the session's context alone, so it marks no process.
+func markReset(root, session, agent, source string) {
 	base.MarkOverview(root, "reset", source)
+	if agent != "" {
+		base.MarkOverview(root, "reset-s"+sessionKey(agent), source)
+		return
+	}
 	if session != "" {
 		base.MarkOverview(root, "reset-s"+sessionKey(session), source)
 	}
@@ -4718,7 +4725,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			// The running MCP server still counts the outline as read; the
 			// context that held it is gone, so let the next overview serve it
 			// — to this session only.
-			markReset(root, in.SessionID, in.Source)
+			markReset(root, in.SessionID, in.AgentID, in.Source)
 		case "resume":
 			// The context is the old one: a new MCP server may load the cache
 			// the old server saved.
@@ -4761,7 +4768,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		// Silent: Codex rejects context output on PostCompact ("invalid
 		// PostCompact hook JSON output"), and the SessionStart(compact) that
 		// follows already restates the rules and asks for ortg_overview.
-		markReset(root, in.SessionID, "compact")
+		markReset(root, in.SessionID, in.AgentID, "compact")
 		return "", ""
 	case "prompt":
 		// The host does not reliably render a resume-time SessionStart message,
