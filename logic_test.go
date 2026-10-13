@@ -2602,6 +2602,9 @@ func TestRulingsGateConvergence(t *testing.T) {
 	if !strings.Contains(first, "- 【limit】达限仍出上下文") || !strings.Contains(first, "- 【k11】") {
 		t.Fatalf("every key of a file that is no hub is quoted in full, \"=\" or not:\n%s", first)
 	}
+	if strings.Contains(first, "已收敛") || strings.Contains(first, "还缺这些契约的裁决") {
+		t.Fatalf("an all-\"=\" plan with contracts to rule on is not settled at once, nor asked for rulings it has not seen:\n%s", first)
+	}
 	second, _ := Review("limit：需求没讲窗口，按 b 保持")
 	if strings.Contains(second, "已收敛") || !strings.Contains(second, "还缺这些契约的裁决") || !strings.Contains(second, "k11") {
 		t.Fatalf("a missing ruling keeps the plan open:\n%s", second)
@@ -2985,6 +2988,62 @@ func TestRemovedTestedNames(t *testing.T) {
 // Later reviews of one plan send only what changed: unchanged targets are
 // named, contracts already quoted get a short line, and the conflict text
 // and the checklist go out once; a converged plan's successor starts over.
+// A plan with nothing to fix converges at its first review: every target
+// "=", or changed outlines the review finds nothing to add to. One that
+// leaves a dependent out still needs a fix and two
+// reviews in a row of the same plan.
+func TestReviewConvergesAtOnce(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root := t.TempDir()
+	for _, p := range []string{"a.go", "b.go", "c.go", "d.go"} {
+		os.WriteFile(filepath.Join(root, p), []byte("package a"), 0o644)
+	}
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	Update("a.go", "a.go[7 L ST T]: Role:a | Uses:- | API:Save | Constraints:-")
+	Update("b.go", "b.go[7 L CL T]: Role:b | Uses:a.go | API:- | Constraints:-")
+	Update("c.go", "c.go[7 L CL T]: Role:c | Uses:- | API:- | Constraints:-")
+	Update("d.go", "d.go[7 L CL T]: Role:d | Uses:- | API:- | Constraints:-")
+	Overview("", false)
+	gate := func(p string) string { got, _ := Gate("Edit", filepath.Join(root, p), "", "", ""); return got }
+
+	// All "=": the outlines stay, so there is nothing to weigh.
+	TargetItems([]string{"a.go =", "b.go ="})
+	rv, _ := Review()
+	if !strings.Contains(rv, reviewQuickSame) || !strings.Contains(rv, "一次核对即已收敛") || strings.Contains(rv, "再调用一次 ortg_review") {
+		t.Fatalf("an all-\"=\" plan converges at its first review:\n%s", rv)
+	}
+	if got := gate("a.go") + gate("b.go"); got != "" {
+		t.Fatalf("a plan converged at once unlocks its files: %q", got)
+	}
+	Update("a.go", "a.go[7 L ST T]: Role:a | Uses:- | API:Save | Constraints:-")
+	Update("b.go", "b.go[7 L CL T]: Role:b | Uses:a.go | API:- | Constraints:-")
+
+	// Changed outlines with no dependent, contract or bad target left.
+	TargetItems([]string{"c.go c.go[7 L CL T]: Role:c2 | Uses:- | API:- | Constraints:-", "d.go ="})
+	rv, _ = Review()
+	if !strings.Contains(rv, reviewQuickClean) || !strings.Contains(rv, "一次核对即已收敛") {
+		t.Fatalf("a plan the review finds nothing to fix in converges at once:\n%s", rv)
+	}
+	if got := gate("c.go") + gate("d.go"); got != "" {
+		t.Fatalf("its files are unlocked: %q", got)
+	}
+	Update("c.go", "c.go[7 L CL T]: Role:c2 | Uses:- | API:- | Constraints:-")
+	Update("d.go", "d.go[7 L CL T]: Role:d | Uses:- | API:- | Constraints:-")
+
+	// A changed outline with a dependent left out of the plan needs two.
+	TargetItems([]string{"a.go a.go[7 L ST T]: Role:a | Uses:- | API:Store | Constraints:-", "c.go ="})
+	rv, _ = Review()
+	if strings.Contains(rv, "已收敛") || !strings.Contains(rv, "b.go（Uses 依赖 a.go）") || !strings.Contains(rv, "再调用一次 ortg_review") {
+		t.Fatalf("a dependent left out keeps the first review open:\n%s", rv)
+	}
+	if rv, _ = Review(); !strings.Contains(rv, "已收敛") || strings.Contains(rv, "一次核对即已收敛") {
+		t.Fatalf("the second review of the same plan converges the usual way:\n%s", rv)
+	}
+}
+
 func TestReviewDelta(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	root := t.TempDir()

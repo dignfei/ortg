@@ -24,7 +24,7 @@ import (
 	"ortg/migrate"
 )
 
-const version = "0.5.36"
+const version = "0.5.37"
 
 var (
 	excludeDirs  = []string{".git", "build"}
@@ -2612,8 +2612,17 @@ func Review(rulings ...string) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, reviewHead, n, len(paths))
 	affected := map[string][]string{}
+	// What a first look needs to settle a plan: every target leaves its
+	// outline as it is ("="), or the review finds nothing to add or weigh.
+	allSame, bad := true, false
 	for _, p := range paths {
 		r, _ := x.Row(p)
+		if r.TargetDelete || !r.Exists || r.Target != r.Outline {
+			allSame = false
+		}
+		if r.Target != "" && len(x.CheckEntry(p, r.Target).Errors) > 0 {
+			bad = true
+		}
 		as := fmt.Sprintf("%s\x00%t\x00%t\x00%s", r.Target, r.TargetDelete, r.Exists, r.Outline)
 		if prev, ok := pl.Targets[p]; ok && prev == as {
 			fmt.Fprintf(&b, reviewUnchanged, p)
@@ -2694,7 +2703,8 @@ func Review(rulings ...string) (string, error) {
 	if k := len(cs) - len(freshCs); k > 0 {
 		fmt.Fprintf(&b, reviewContractsSeen, k)
 	}
-	if moves := takenOverKeys(x, set); len(moves) > 0 {
+	moves := takenOverKeys(x, set)
+	if len(moves) > 0 {
 		b.WriteString(fmt.Sprintf(reviewMigration, strings.Join(moves, "；")))
 	}
 	if (len(kc) > 0 || len(cs) > 0) && !pl.Conflict {
@@ -2706,6 +2716,21 @@ func Review(rulings ...string) (string, error) {
 		b.WriteString(reviewChecklist)
 	}
 	given, missing := matchRulings(bound, rulings)
+	// A plan with something to fix or weigh converges only once two reviews
+	// in a row see it unchanged; one with nothing to fix converges at once:
+	// all "=" (the code changes, no outline does), or nothing found — no bad
+	// target, no dependent left out, no contract or same-name guard to weigh,
+	// no duty taken over — with every ruling given.
+	quick := ""
+	if !converged && !bad && len(missing) == 0 {
+		switch {
+		case allSame:
+			quick = reviewQuickSame
+		case len(affected) == 0 && len(kc) == 0 && len(cs) == 0 && len(moves) == 0:
+			quick = reviewQuickClean
+		}
+		converged = quick != ""
+	}
 	if converged && len(missing) > 0 {
 		converged = false
 		fmt.Fprintf(&b, reviewRulingsMissing, strings.Join(missing, "、"))
@@ -2721,7 +2746,11 @@ func Review(rulings ...string) (string, error) {
 			delete(c.solo, p)
 		}
 		c.plan = planSeen{} // the next plan is reviewed from scratch
-		fmt.Fprintf(&b, reviewConverged, len(paths))
+		if quick != "" {
+			fmt.Fprintf(&b, reviewConvergedFirst, quick, len(paths))
+		} else {
+			fmt.Fprintf(&b, reviewConverged, len(paths))
+		}
 	} else {
 		b.WriteString(reviewAgain)
 	}
