@@ -427,6 +427,12 @@ func Overview(module string, force bool) (string, error) {
 	headerFresh := force || c.header != header
 	var b strings.Builder
 	b.WriteString(first)
+	if c.lost != "" && headerFresh {
+		// The whole outline goes out again: say why, so a repeat in the
+		// transcript is not taken for waste.
+		b.WriteString(fmt.Sprintf(overviewResent, c.lost) + "\n\n")
+		c.lost = ""
+	}
 	if note != "" {
 		b.WriteString("# " + note + "\n\n")
 	}
@@ -513,22 +519,104 @@ func gateOverview(x *base.Index) string {
 
 // The outline is the largest thing ORTG sends, and whatever it sends stays in
 // the model's context until a compaction or a clear. overviewSent remembers,
-// per repository root, which entries this MCP process has handed over and in
-// which version, so every fetch sends only what the context lacks or what has
-// changed since. The cache is dropped when the session hook's reset mark
-// (compact/clear) is newer than the cache. It is also saved under the temp
-// dir on every change: a host that resumes the conversation in a new process
+// per repository root and session, which entries this MCP process has handed
+// over and in which version, so every fetch sends only what that session's
+// context lacks or what has changed since. The session comes with each call
+// (callSession): one Codex process serves many threads through one MCP
+// server, and several sessions work in one repository at once, so neither
+// the process nor the root may stand for a context. The cache is dropped
+// when a reset mark of its own session (compact/clear) is newer than the
+// cache — another session's compaction must not make this one resend the
+// whole outline or refuse its reads. It is also saved under the temp dir on
+// every change: a host that resumes the conversation in a new process
 // (claude -p --resume) starts a new MCP server whose context still holds what
-// the old one sent, so the new one loads the saved cache — unless a start mark
-// (a session that did not resume) or a reset mark is newer. The gate (ortg_gate) reads the same cache: it runs
-// in this process too, as a hook the host calls over the MCP connection, so
-// what was sent here is what this conversation holds — no session id needed.
+// the old one sent, so the new one loads the saved cache of that session. The
+// gate (ortg_gate) reads the same cache: the host calls it over the same MCP
+// connection, naming the same session.
 var (
 	overviewMu   sync.Mutex
 	overviewSent = map[string]*sentCache{}
 )
 
+// callSession is the session the MCP call being served belongs to, set by
+// useCallSession before every tool runs (the server handles one call at a
+// time). ids[0] keys the cache; every id names reset marks meant for it.
+// fromEnv: the id came from the environment (Claude Code), where a /clear
+// may have started a new session in the same process, so the reset marks of
+// that process count too. Empty outside the MCP server or when the host
+// names no session: then the marks of the whole repository count.
+var callSession struct {
+	ids     []string
+	fromEnv bool
+}
+
+// useCallSession takes the call's session from its _meta (or the
+// environment) and removes the _meta, which no handler declares.
+func useCallSession(a base.Args) {
+	meta, _ := a["_meta"].(map[string]any)
+	delete(a, "_meta")
+	callSession.ids, callSession.fromEnv = base.CallSession(meta)
+}
+
+// staleMarkAge is how long per-session and per-process marks are kept: a
+// session idle longer than this gets its outline whole again.
+const staleMarkAge = 7 * 24 * time.Hour
+
+// sessionKey turns a session id into a mark kind's suffix.
+func sessionKey(id string) string {
+	return fmt.Sprintf("%x", sha1.Sum([]byte(id)))[:16]
+}
+
+// markReset records that session's context lost what was sent (source is
+// the hook's: compact or clear). The plain mark serves servers that cannot
+// tell sessions apart; the per-session one the servers that can; the
+// per-process ones a Claude Code server whose session id a /clear replaced
+// — the host process is the parent of its MCP server and an ancestor of
+// this hook.
+func markReset(root, session, source string) {
+	base.MarkOverview(root, "reset", source)
+	if session != "" {
+		base.MarkOverview(root, "reset-s"+sessionKey(session), source)
+	}
+	for _, p := range base.Ancestors() {
+		base.MarkOverview(root, "reset-p"+strconv.Itoa(p), source)
+	}
+}
+
+// lastReset is when the context of the current call's session last lost
+// what was sent, and the hook's source then.
+func lastReset(root string) (time.Time, string) {
+	kinds := []string{"reset"}
+	if ids := callSession.ids; len(ids) > 0 {
+		kinds = nil
+		for _, id := range ids {
+			kinds = append(kinds, "reset-s"+sessionKey(id))
+		}
+		if callSession.fromEnv {
+			kinds = append(kinds, "reset-p"+strconv.Itoa(os.Getppid()))
+		}
+	}
+	var at time.Time
+	var src string
+	for _, k := range kinds {
+		if t, d := base.OverviewMark(root, k); t.After(at) {
+			at, src = t, d
+		}
+	}
+	return at, src
+}
+
+// sentMark is the mark kind a session's cache is saved under.
+func sentMark(sid string) string {
+	if sid == "" {
+		return "sent"
+	}
+	return "sent-s" + sessionKey(sid)
+}
+
 type sentCache struct {
+	sid    string            // the session it belongs to; "" when unknown
+	lost   string            // why an outline once sent is gone; "" if not
 	born   time.Time         // compared with the reset mark
 	header string            // header last sent; "" = nothing loaded yet
 	rows   map[string]string // path -> rowPrint at send time
@@ -560,24 +648,38 @@ type planSeen struct {
 	Checklist bool
 }
 
-// sentFor returns root's cache, starting over when the reset mark is newer:
-// the context lost what was sent, and the gate re-arms with it. Callers hold
-// overviewMu.
+// sentFor returns the cache of root and the current call's session,
+// starting over when that session's reset mark is newer: the context lost
+// what was sent, and the gate re-arms with it. Callers hold overviewMu.
 func sentFor(root string) *sentCache {
-	c := overviewSent[root]
-	resetAt, _ := base.OverviewMark(root, "reset")
+	sid := ""
+	if len(callSession.ids) > 0 {
+		sid = callSession.ids[0]
+	}
+	key := root + "\x00" + sid
+	c := overviewSent[key]
+	resetAt, src := lastReset(root)
 	if c == nil {
-		c = loadSent(root, resetAt)
+		c = loadSent(root, sid)
 	}
 	if c == nil || !c.born.After(resetAt) {
-		c = &sentCache{born: time.Now(), rows: map[string]string{}, nagged: map[string]bool{}, planned: map[string]bool{}, solo: map[string]bool{}}
+		n := &sentCache{sid: sid, born: time.Now(), rows: map[string]string{}, nagged: map[string]bool{}, planned: map[string]bool{}, solo: map[string]bool{}}
+		if c != nil && c.header != "" {
+			what := resetCompact
+			if src == "clear" {
+				what = resetClear
+			}
+			n.lost = fmt.Sprintf(resetWhy, resetAt.Format("15:04:05"), what)
+		}
+		c = n
 	}
-	overviewSent[root] = c
+	overviewSent[key] = c
 	return c
 }
 
 // sentFile is sentCache as saved between processes.
 type sentFile struct {
+	Lost       string
 	Born       time.Time
 	Header     string
 	Rows       map[string]string
@@ -590,20 +692,22 @@ type sentFile struct {
 	Plan       planSeen
 }
 
-// saveSent writes root's cache to its "sent" mark. Callers hold overviewMu.
+// saveSent writes the cache to its session's "sent" mark. Callers hold
+// overviewMu.
 func saveSent(root string, c *sentCache) {
-	b, err := json.Marshal(sentFile{c.born, c.header, c.rows, c.denied, c.nagged, c.reviews, c.lastReview, c.planned, c.solo, c.plan})
+	b, err := json.Marshal(sentFile{c.lost, c.born, c.header, c.rows, c.denied, c.nagged, c.reviews, c.lastReview, c.planned, c.solo, c.plan})
 	if err != nil {
 		return
 	}
-	base.MarkOverview(root, "sent", string(b))
+	base.MarkOverview(root, sentMark(c.sid), string(b))
 }
 
-// loadSent returns the saved cache when it still describes this context: it
-// was born after the last reset and after the last session start that did
-// not resume; nil otherwise.
-func loadSent(root string, resetAt time.Time) *sentCache {
-	_, data := base.OverviewMark(root, "sent")
+// loadSent returns the cache a former server saved for the session (sentFor
+// still checks it against the session's resets). Without a session the one
+// cache of the root may be another conversation's: it counts only when born
+// after the last session start that did not resume.
+func loadSent(root, sid string) *sentCache {
+	_, data := base.OverviewMark(root, sentMark(sid))
 	if data == "" {
 		return nil
 	}
@@ -611,11 +715,10 @@ func loadSent(root string, resetAt time.Time) *sentCache {
 	if json.Unmarshal([]byte(data), &f) != nil {
 		return nil
 	}
-	startAt, _ := base.OverviewMark(root, "start")
-	if !f.Born.After(resetAt) || !f.Born.After(startAt) {
+	if startAt, _ := base.OverviewMark(root, "start"); sid == "" && !f.Born.After(startAt) {
 		return nil
 	}
-	c := &sentCache{born: f.Born, header: f.Header, rows: f.Rows, denied: f.Denied, nagged: f.Nagged,
+	c := &sentCache{sid: sid, lost: f.Lost, born: f.Born, header: f.Header, rows: f.Rows, denied: f.Denied, nagged: f.Nagged,
 		reviews: f.Reviews, lastReview: f.LastReview, planned: f.Planned, solo: f.Solo, plan: f.Plan}
 	if c.rows == nil {
 		c.rows = map[string]string{}
@@ -753,6 +856,9 @@ func gateCall(x *base.Index, tool, path, dir, command string) string {
 	if c.header == "" {
 		if !c.denied {
 			c.denied = true
+			if c.lost != "" {
+				return base.PreToolDecision(gateDeny+fmt.Sprintf(gateDenyLost, c.lost), true)
+			}
 			return base.PreToolDecision(gateDeny, true)
 		}
 		if c.nagged[targets[0]] {
@@ -4610,8 +4716,9 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		switch in.Source {
 		case "compact", "clear":
 			// The running MCP server still counts the outline as read; the
-			// context that held it is gone, so let the next overview serve it.
-			base.MarkOverview(root, "reset", "")
+			// context that held it is gone, so let the next overview serve it
+			// — to this session only.
+			markReset(root, in.SessionID, in.Source)
 		case "resume":
 			// The context is the old one: a new MCP server may load the cache
 			// the old server saved.
@@ -4619,6 +4726,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			// A new conversation: a saved cache describes another context.
 			// Servers already running keep theirs — another session's.
 			base.MarkOverview(root, "start", "")
+			base.PruneOverviewMarks(root, []string{"reset-s", "reset-p", "sent-s"}, staleMarkAge)
 		}
 		if in.Source != "resume" { // resume keeps the context; startup/clear/compact lose it
 			base.ResetInjected(in.SessionID)
@@ -4653,7 +4761,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		// Silent: Codex rejects context output on PostCompact ("invalid
 		// PostCompact hook JSON output"), and the SessionStart(compact) that
 		// follows already restates the rules and asks for ortg_overview.
-		base.MarkOverview(root, "reset", "")
+		markReset(root, in.SessionID, "compact")
 		return "", ""
 	case "prompt":
 		// The host does not reliably render a resume-time SessionStart message,

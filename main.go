@@ -259,5 +259,14 @@ func runMCP(args []string) error {
 				return Header(h, id, ifl, kf, od, of, ds, modes...)
 			}},
 	}
+	// Every call first says whose it is: what was sent, and the gate's
+	// state, are kept per session.
+	for i := range tools {
+		h := tools[i].Handler
+		tools[i].Handler = func(a base.Args) (string, error) {
+			useCallSession(a)
+			return h(a)
+		}
+	}
 	return base.Serve(os.Stdin, os.Stdout, "ortg", version, tools)
 }

@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"ortg/base"
 )
@@ -46,6 +45,16 @@ type updateMCPReply struct {
 	Error json.RawMessage `json:"error"`
 }
 
+// testMCPSession is the session the MCP child processes name.
+const testMCPSession = "ortg-test-session"
+
+// useTestMCPSession makes this process serve testMCPSession too, so the
+// cache a test seeds here is the one its MCP children load.
+func useTestMCPSession(t *testing.T) {
+	callSession.ids, callSession.fromEnv = []string{testMCPSession}, true
+	t.Cleanup(func() { callSession.ids, callSession.fromEnv = nil, false })
+}
+
 func nativeMCP(t *testing.T, root string, requests ...map[string]any) []updateMCPReply {
 	t.Helper()
 	var in bytes.Buffer
@@ -64,7 +73,9 @@ func nativeMCP(t *testing.T, root string, requests ...map[string]any) []updateMC
 		cmd = exec.Command("sh", "-c", `ulimit -f "$1"; shift; exec "$@"`, "ortg-mcp-test", limit, bin, "-test.run=^TestUpdateMCPProcess$")
 	}
 	cmd.Dir, cmd.Stdin = root, &in
-	cmd.Env = append(os.Environ(), "ORTG_UPDATE_MCP_CHILD=1")
+	// The child names one fixed session, inside Claude Code or not, so the
+	// cache it saves is found under the same mark (testMCPSession).
+	cmd.Env = append(os.Environ(), "ORTG_UPDATE_MCP_CHILD=1", "CLAUDE_CODE_SESSION_ID="+testMCPSession)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -208,6 +219,7 @@ func TestUpdateMCPRejectsEmptyAndDuplicateInputs(t *testing.T) {
 }
 
 func TestUpdateMCPAtomicRollback(t *testing.T) {
+	useTestMCPSession(t)
 	root := updateRepo(t, "a.go", "b.go", "observed.go")
 	if _, err := scanWithHeader(); err != nil {
 		t.Fatal(err)
@@ -233,7 +245,10 @@ func TestUpdateMCPAtomicRollback(t *testing.T) {
 	overviewMu.Unlock()
 	before, _ := os.ReadFile(filepath.Join(root, base.TableName))
 	bakBefore, _ := os.ReadFile(filepath.Join(root, base.TableName+".bak"))
-	_, sentBefore := base.OverviewMark(root, "sent")
+	_, sentBefore := base.OverviewMark(root, sentMark(testMCPSession))
+	if sentBefore == "" {
+		t.Fatal("the seeded cache must be saved under the session the MCP child names")
+	}
 	for _, bad := range []struct{ item, path, reason string }{
 		{"b.go b.go[7 L ST T]: Role: | Uses:- | API:- | Constraints:-", "b.go", "Role"},
 		{"b.go b.go[7 L ST T]: Role:乙 | Uses:no/such.go | API:- | Constraints:-", "b.go", "no/such.go"},
@@ -247,7 +262,7 @@ func TestUpdateMCPAtomicRollback(t *testing.T) {
 		}
 		after, _ := os.ReadFile(filepath.Join(root, base.TableName))
 		bakAfter, _ := os.ReadFile(filepath.Join(root, base.TableName+".bak"))
-		_, sentAfter := base.OverviewMark(root, "sent")
+		_, sentAfter := base.OverviewMark(root, sentMark(testMCPSession))
 		if !bytes.Equal(before, after) || !bytes.Equal(bakBefore, bakAfter) || sentBefore != sentAfter {
 			t.Fatalf("failed %q changed table, backup or sent cache", bad.item)
 		}
@@ -307,6 +322,7 @@ func TestUpdateMCPDocumentGateAndBatchStages(t *testing.T) {
 }
 
 func TestUpdateMCPDirectoryTargetsAndSentCache(t *testing.T) {
+	useTestMCPSession(t)
 	root := updateRepo(t, "a.go", "b.go", "vendored/x.go", "excluded/y.go")
 	if _, err := scanWithHeader(); err != nil {
 		t.Fatal(err)
@@ -347,7 +363,7 @@ func TestUpdateMCPDirectoryTargetsAndSentCache(t *testing.T) {
 			t.Fatalf("committed targets must clear for every item: %+v", row)
 		}
 	}
-	if c := loadSent(root, time.Time{}); c == nil || c.solo["a.go"] || c.solo["b.go"] || !c.planned["a.go"] {
+	if c := loadSent(root, testMCPSession); c == nil || c.solo["a.go"] || c.solo["b.go"] || !c.planned["a.go"] {
 		t.Fatalf("successful batch must clear solo entries and retain the reviewed plan: %+v", c)
 	}
 	if got := x.Dependents("vendored/x.go"); len(got) != 1 || got[0] != "a.go" {
@@ -434,6 +450,7 @@ func TestUpdateMCPNewAPIRollback(t *testing.T) {
 }
 
 func TestUpdateMCPDiskSaveFailure(t *testing.T) {
+	useTestMCPSession(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX file-size limit unavailable")
 	}
@@ -468,7 +485,10 @@ func TestUpdateMCPDiskSaveFailure(t *testing.T) {
 	if err != nil || bytes.Equal(bakBefore, before) {
 		t.Fatalf("fixture must distinguish the old backup from the pre-batch table: %v", err)
 	}
-	_, sentBefore := base.OverviewMark(root, "sent")
+	_, sentBefore := base.OverviewMark(root, sentMark(testMCPSession))
+	if sentBefore == "" {
+		t.Fatal("the seeded cache must be saved under the session the MCP child names")
+	}
 	// POSIX shells count these blocks as 512 or 1024 bytes. The old table
 	// fits either limit, but the submitted 20000-byte outline cannot fit.
 	// This makes AtomicWrite's real Write fail after save has written .bak.
@@ -486,7 +506,7 @@ func TestUpdateMCPDiskSaveFailure(t *testing.T) {
 	if err != nil || !bytes.Equal(before, bakAfter) || bytes.Equal(bakBefore, bakAfter) {
 		t.Fatalf("failed save may update .bak to the complete pre-batch table: %v", err)
 	}
-	_, sentAfter := base.OverviewMark(root, "sent")
+	_, sentAfter := base.OverviewMark(root, sentMark(testMCPSession))
 	if sentAfter != sentBefore {
 		t.Fatal("failed save must not change the persisted sent/solo cache")
 	}

@@ -2259,6 +2259,134 @@ func TestTargetItems(t *testing.T) {
 	}
 }
 
+// What was sent, and the gate, belong to a session, not to the repository
+// or the server process. Codex serves many threads through one MCP server
+// and names the thread in each call's _meta; Claude Code runs a server per
+// session and names it in the environment, where a /clear leaves the id
+// stale. Another session's compaction must neither make this one resend the
+// whole outline nor refuse its next read; its own compaction does both, and
+// the resend says when and why.
+func TestOverviewResetPerSession(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "a.go"), []byte("package a"), 0o644)
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	Update("a.go", "a.go[7 L ST T]: Role:存储 | Uses:- | API:Save | Constraints:-")
+	t.Cleanup(func() { callSession.ids, callSession.fromEnv = nil, false })
+	as := func(meta map[string]any) { useCallSession(base.Args{"_meta": meta}) }
+	codexA := map[string]any{"threadId": "thread-a", "progressToken": 1}
+	codexB := map[string]any{"threadId": "thread-b", "progressToken": 1}
+	whole := "Role:存储"
+	read := func() string { got, _ := Gate("Read", filepath.Join(root, "a.go"), "", "", ""); return got }
+	tick := func() { time.Sleep(10 * time.Millisecond) }
+
+	as(codexA)
+	if out, _ := Overview("", false); !strings.Contains(out, whole) || strings.Contains(out, "重发整份纲要的原因") {
+		t.Fatalf("thread a gets the outline once, with no resend note:\n%s", out)
+	}
+	// Thread b shares the server but not the context.
+	as(codexB)
+	if got := read(); !strings.Contains(got, "permissionDecision") {
+		t.Fatalf("thread b has loaded nothing yet: %q", got)
+	}
+	if out, _ := Overview("", false); !strings.Contains(out, whole) {
+		t.Fatalf("thread b gets its own copy:\n%s", out)
+	}
+	// Thread b compacts: thread a keeps its outline.
+	tick()
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: "thread-b"})
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "thread-b", Source: "compact"})
+	as(codexA)
+	if got := read(); got != "" {
+		t.Fatalf("another thread's compaction must not refuse a read: %q", got)
+	}
+	if out, _ := Overview("", false); strings.Contains(out, whole) || !strings.Contains(out, "都已发给你") {
+		t.Fatalf("another thread's compaction must not resend the outline:\n%s", out)
+	}
+	// Thread a compacts: refused once, then the outline again, saying why.
+	tick()
+	HookReply("compact", base.HookInput{Cwd: root, SessionID: "thread-a"})
+	as(codexA)
+	if got := read(); !strings.Contains(got, "permissionDecision") || !strings.Contains(got, "被压缩") {
+		t.Fatalf("its own compaction re-arms the gate and says so: %q", got)
+	}
+	out, _ := Overview("", false)
+	if !strings.Contains(out, whole) || !strings.Contains(out, "重发整份纲要的原因") || !strings.Contains(out, "被压缩") {
+		t.Fatalf("its own compaction resends the outline with the reason:\n%s", out)
+	}
+	if out, _ := Overview("", false); strings.Contains(out, whole) || strings.Contains(out, "重发整份纲要的原因") {
+		t.Fatalf("the reason is given once:\n%s", out)
+	}
+	// A new server for thread a (a resumed thread) loads what it was sent,
+	// even after another conversation started in the repository.
+	tick()
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "thread-c", Source: "startup"})
+	overviewMu.Lock()
+	overviewSent = map[string]*sentCache{}
+	overviewMu.Unlock()
+	as(codexA)
+	if out, _ := Overview("", false); strings.Contains(out, whole) {
+		t.Fatalf("a new server for the same thread keeps its cache:\n%s", out)
+	}
+
+	// Claude Code: the session comes from the environment; a /clear starts
+	// a new session id in the same process, whose hook is a child of the
+	// host — the parent of the MCP server.
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-1")
+	as(nil)
+	if out, _ := Overview("", false); !strings.Contains(out, whole) {
+		t.Fatalf("the Claude session gets the outline:\n%s", out)
+	}
+	tick()
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "claude-2", Source: "clear"})
+	as(nil)
+	if out, _ := Overview("", false); !strings.Contains(out, whole) || !strings.Contains(out, "被清空") {
+		t.Fatalf("a /clear under a new session id still resends, saying so:\n%s", out)
+	}
+	// That clear came from the Claude host process: a Codex thread, though
+	// its hooks share a host process, does not take it for its own.
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	as(codexA)
+	if out, _ := Overview("", false); strings.Contains(out, whole) {
+		t.Fatalf("a Codex thread ignores another session's clear:\n%s", out)
+	}
+}
+
+// Through the real server: the thread named in a call's _meta, the model's
+// calls and the gate's alike, decides whose outline was sent.
+func TestMCPSessionFromMeta(t *testing.T) {
+	root := updateRepo(t, "a.go")
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	Update("a.go", updateLine("a.go", "存储"))
+	call := func(name, thread string, args map[string]any) map[string]any {
+		return map[string]any{"method": "tools/call", "params": map[string]any{"name": name, "arguments": args,
+			"_meta": map[string]any{"threadId": thread, "progressToken": 1}}}
+	}
+	gate := map[string]any{"tool": "Read", "path": filepath.Join(root, "a.go")}
+	r := nativeMCP(t, root,
+		call("ortg_overview", "thread-a", map[string]any{}),
+		call("ortg_gate", "thread-a", gate),
+		call("ortg_gate", "thread-b", gate),
+		call("ortg_overview", "thread-b", map[string]any{}),
+		call("ortg_overview", "thread-a", map[string]any{}))
+	text := func(i int) string { return r[i].Result.Content[0].Text }
+	if !strings.Contains(text(0), "Role:存储") || text(1) != "" {
+		t.Fatalf("thread a loads the outline and may read: %q / %q", text(0), text(1))
+	}
+	if !strings.Contains(text(2), "permissionDecision") || !strings.Contains(text(3), "Role:存储") {
+		t.Fatalf("thread b has loaded nothing until it fetches: %q / %q", text(2), text(3))
+	}
+	if strings.Contains(text(4), "Role:存储") {
+		t.Fatalf("thread a already holds it: %q", text(4))
+	}
+}
+
 // The cache outlives the MCP process: a host resuming the conversation in a
 // new process (claude -p --resume) starts a new server whose context still
 // holds the outline, so nothing is sent twice and the gate stays open; a

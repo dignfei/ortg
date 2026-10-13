@@ -166,8 +166,9 @@ func Serve(in io.Reader, out io.Writer, name, version string, tools []Tool) erro
 			result(map[string]any{"tools": list})
 		case "tools/call":
 			var p struct {
-				Name      string `json:"name"`
-				Arguments Args   `json:"arguments"`
+				Name      string         `json:"name"`
+				Arguments Args           `json:"arguments"`
+				Meta      map[string]any `json:"_meta"`
 			}
 			if err := json.Unmarshal(req.Params, &p); err != nil {
 				errResp(req.ID, -32602, "invalid params")
@@ -178,7 +179,7 @@ func Serve(in io.Reader, out io.Writer, name, version string, tools []Tool) erro
 				errResp(req.ID, -32602, "unknown tool "+p.Name)
 				continue
 			}
-			text, err := callTool(t, p.Arguments)
+			text, err := callTool(t, p.Arguments, p.Meta)
 			resp := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}}
 			if err != nil {
 				resp["content"] = []map[string]any{{"type": "text", "text": err.Error()}}
@@ -192,7 +193,11 @@ func Serve(in io.Reader, out io.Writer, name, version string, tools []Tool) erro
 	return sc.Err()
 }
 
-func callTool(t Tool, args Args) (text string, err error) {
+// callTool checks args against the tool's Props, then hands the call's
+// _meta (where the host says which session the call belongs to) to the
+// handler under the reserved key "_meta" — after the check, so an argument
+// of that name is still refused as unknown.
+func callTool(t Tool, args Args, meta map[string]any) (text string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("internal error: %v", r)
@@ -215,6 +220,9 @@ func callTool(t Tool, args Args) (text string, err error) {
 		if v, ok := args[k]; !ok || v == nil || v == "" {
 			return "", fmt.Errorf("缺少参数 %s", k)
 		}
+	}
+	if meta != nil {
+		args["_meta"] = meta
 	}
 	return t.Handler(args)
 }

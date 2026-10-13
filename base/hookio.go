@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -409,9 +410,9 @@ func PreToolDecision(text string, deny bool) string {
 }
 
 // Overview marks are per-repository files the hooks leave for the MCP server,
-// which outlives compactions and clears and is never told the session id.
-// The only kind so far, "reset", is the moment the context lost what was sent
-// (compact or clear). The mtime is the moment; the content is optional data.
+// which outlives compactions and clears; the kind names what happened and,
+// for per-session or per-process marks, whose (the caller builds the kind).
+// The mtime is the moment; the content is optional data.
 func overviewMarkFile(root, kind string) string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("ortg-overview-%s-%x", kind, sha1.Sum([]byte(root))))
 }
@@ -437,6 +438,70 @@ func OverviewMark(root, kind string) (time.Time, string) {
 	}
 	b, _ := os.ReadFile(f)
 	return fi.ModTime(), string(b)
+}
+
+// PruneOverviewMarks removes root's marks whose kind starts with one of
+// prefixes and that were last written longer ago than age: per-session and
+// per-process marks would otherwise pile up in the temp dir.
+func PruneOverviewMarks(root string, prefixes []string, age time.Duration) {
+	cut := time.Now().Add(-age)
+	for _, pre := range prefixes {
+		fs, _ := filepath.Glob(filepath.Join(os.TempDir(), fmt.Sprintf("ortg-overview-%s*-%x", pre, sha1.Sum([]byte(root)))))
+		for _, f := range fs {
+			if fi, err := os.Stat(f); err == nil && fi.ModTime().Before(cut) {
+				_ = os.Remove(f)
+			}
+		}
+	}
+}
+
+// CallSession names the session an MCP tool call belongs to. Codex puts the
+// thread in every call's _meta — the model's calls and those its mcp_tool
+// hooks make alike — and one Codex process may serve many threads through a
+// single MCP server, so the call is the only place to learn it. The thread
+// id comes first (it owns the context and keys what was sent); the session
+// id follows when it differs, since a hook may name either. Claude Code's
+// _meta names no session, but it starts an MCP server per session with
+// CLAUDE_CODE_SESSION_ID in the environment: fromEnv reports that id, which
+// a /clear may leave stale (a new session in the same process). nil when
+// neither says.
+func CallSession(meta map[string]any) (ids []string, fromEnv bool) {
+	add := func(v any) {
+		if s, _ := v.(string); s != "" && !slices.Contains(ids, s) {
+			ids = append(ids, s)
+		}
+	}
+	add(meta["threadId"])
+	if t, ok := meta["x-codex-turn-metadata"].(map[string]any); ok {
+		add(t["thread_id"])
+		add(t["session_id"])
+	}
+	add(meta["sessionId"])
+	if len(ids) > 0 {
+		return ids, false
+	}
+	if s := os.Getenv("CLAUDE_CODE_SESSION_ID"); s != "" {
+		return []string{s}, true
+	}
+	return nil, false
+}
+
+// Ancestors lists the processes above this one, nearest first, leaving out
+// itself and pid 1; nil without /proc. A hook's ancestors include the host
+// process, which is also the parent of the MCP server it started.
+func Ancestors() []int {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	var out []int
+	seen := map[string]bool{}
+	for pid := procParent(strconv.Itoa(os.Getpid())); pid != "" && pid != "0" && pid != "1" && !seen[pid]; pid = procParent(pid) {
+		seen[pid] = true
+		if n, err := strconv.Atoi(pid); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // ProcessAlive reports whether a process runs words — a command (argv[k]'s

@@ -334,3 +334,65 @@ func TestToolOutputStripsColor(t *testing.T) {
 		t.Fatalf("colors stripped: %q", got)
 	}
 }
+
+// Codex names the thread in the call's _meta (thread first, then a differing
+// session id, without repeats); Claude Code names none there, so the
+// environment's session id answers, marked as such.
+func TestCallSession(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "claude-1")
+	codex := map[string]any{"threadId": "th", "sessionId": "root", "progressToken": 1,
+		"x-codex-turn-metadata": map[string]any{"thread_id": "th", "session_id": "root"}}
+	if ids, env := CallSession(codex); !reflect.DeepEqual(ids, []string{"th", "root"}) || env {
+		t.Fatalf("codex meta: %v %v", ids, env)
+	}
+	if ids, env := CallSession(map[string]any{"threadId": "th", "progressToken": 1}); !reflect.DeepEqual(ids, []string{"th"}) || env {
+		t.Fatalf("a hook's call carries the thread alone: %v %v", ids, env)
+	}
+	for _, m := range []map[string]any{nil, {"claudecode/toolUseId": "toolu_1", "progressToken": 2}} {
+		if ids, env := CallSession(m); !reflect.DeepEqual(ids, []string{"claude-1"}) || !env {
+			t.Fatalf("no session in %v: the environment answers: %v %v", m, ids, env)
+		}
+	}
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	if ids, _ := CallSession(nil); ids != nil {
+		t.Fatalf("nothing names a session: %v", ids)
+	}
+}
+
+// A hook's ancestors start at its parent and never list itself or pid 1.
+func TestAncestors(t *testing.T) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("no /proc")
+	}
+	a := Ancestors()
+	if len(a) == 0 || a[0] != os.Getppid() {
+		t.Fatalf("ancestors must start at the parent %d: %v", os.Getppid(), a)
+	}
+	for _, p := range a {
+		if p == os.Getpid() || p == 1 {
+			t.Fatalf("ancestors list %d: %v", p, a)
+		}
+	}
+}
+
+// Only marks of the given prefixes, of this root, older than the age go.
+func TestPruneOverviewMarks(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root, other := "/repo/a", "/repo/b"
+	for _, k := range []string{"reset-sold", "reset-snew", "sent-sold", "reset", "start"} {
+		MarkOverview(root, k, "")
+	}
+	MarkOverview(other, "reset-sold", "")
+	old := time.Now().Add(-10 * 24 * time.Hour)
+	for _, f := range []string{overviewMarkFile(root, "reset-sold"), overviewMarkFile(root, "sent-sold"), overviewMarkFile(root, "reset"), overviewMarkFile(root, "start"), overviewMarkFile(other, "reset-sold")} {
+		os.Chtimes(f, old, old)
+	}
+	PruneOverviewMarks(root, []string{"reset-s", "sent-s"}, 7*24*time.Hour)
+	gone := func(r, k string) bool { at, _ := OverviewMark(r, k); return at.IsZero() }
+	if !gone(root, "reset-sold") || !gone(root, "sent-sold") {
+		t.Fatal("old per-session marks of the root must go")
+	}
+	if gone(root, "reset-snew") || gone(root, "reset") || gone(root, "start") || gone(other, "reset-sold") {
+		t.Fatal("recent marks, other kinds and other roots' marks must stay")
+	}
+}

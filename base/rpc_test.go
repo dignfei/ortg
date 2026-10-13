@@ -106,3 +106,36 @@ func TestHiddenTool(t *testing.T) {
 		t.Fatalf("hidden tool must still be callable: %s", lines[1])
 	}
 }
+
+// A call's _meta reaches the handler under "_meta" (the host names the
+// session there); an argument of that name is refused like any unknown one,
+// and a call without _meta brings no such key.
+func TestCallMeta(t *testing.T) {
+	in := strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"who","arguments":{},"_meta":{"threadId":"t1","progressToken":1}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"who","arguments":{"_meta":{"threadId":"forged"}}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"who"}}`,
+	}, "\n") + "\n")
+	var out bytes.Buffer
+	tools := []Tool{{Name: "who", Handler: func(a Args) (string, error) {
+		m, ok := a["_meta"].(map[string]any)
+		if !ok {
+			return "no meta", nil
+		}
+		return "thread " + m["threadId"].(string), nil
+	}}}
+	Serve(in, &out, "t", "0", tools)
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want 3 replies: %s", out.String())
+	}
+	if !strings.Contains(lines[0], "thread t1") {
+		t.Fatalf("the call's _meta must reach the handler: %s", lines[0])
+	}
+	if !strings.Contains(lines[1], "isError") || !strings.Contains(lines[1], "_meta") || strings.Contains(lines[1], "forged") {
+		t.Fatalf("_meta as an argument must be refused: %s", lines[1])
+	}
+	if !strings.Contains(lines[2], "no meta") {
+		t.Fatalf("a call without _meta carries none: %s", lines[2])
+	}
+}
