@@ -58,6 +58,7 @@ const resumeNote = "ortg: 会话已恢复——之前注入的 ORTG 规则与已
 
 const sessionReportNote = "第一次回复用户时，先用一句话报告上面的对账结果（对齐/过期/无纲要各多少），再谈正事。"
 const sessionFetchNote = "开工前先调用 ortg_overview（不带参数）取纲要（超过整份预算时先给纲要头与模块清单，再按问题取相关模块）。"
+const sessionCountsReport = "## 对账报告\n%s · 已清除 %d\n此处只列计数；完整路径清单用 ortg_status 按需查看。"
 
 // overviewModulesHead opens the module list of a bare call on an outline
 // over the whole budget: its size (overviewSizeBoth under Claude Code, the

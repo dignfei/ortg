@@ -223,6 +223,19 @@ func (s summary) report() string {
 	return b.String()
 }
 
+// sessionReport keeps Codex's fixed-size hook channel independent of the
+// inventory. MCP still carries the complete report and outline on demand.
+func (s summary) sessionReport() string {
+	if base.Host() != "codex" {
+		return s.report()
+	}
+	report := fmt.Sprintf(sessionCountsReport, s.oneLine(), s.purged)
+	if s.needsDecision() {
+		report += "\n\n" + decisionText
+	}
+	return report
+}
+
 // ---- repository access ----
 
 func repoRoot() string {
@@ -5018,7 +5031,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 				// no "fetch first", no "report first" again — only the report
 				// when files wait on the user's call.
 				if r.s.needsDecision() {
-					return resumeNote + "\n\n" + r.s.report(), "ortg 对账：" + r.s.oneLine()
+					return resumeNote + "\n\n" + r.s.sessionReport(), "ortg 对账：" + r.s.oneLine()
 				}
 				return resumeNote, "ortg 对账：" + r.s.oneLine()
 			}
@@ -5026,7 +5039,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			if x.GraphRefused() {
 				graph = fmt.Sprintf(graphRefusedNote, x.Root())
 			}
-			return rulesText() + "\n\n" + r.s.report() + "\n" + graph + sessionFetchNote + sessionReportNote,
+			return rulesText() + "\n\n" + r.s.sessionReport() + "\n" + graph + sessionFetchNote + sessionReportNote,
 				"ortg 对账：" + r.s.oneLine()
 		case <-time.After(4 * time.Second):
 			if resumed {

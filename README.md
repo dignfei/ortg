@@ -71,6 +71,8 @@ tool_output_token_limit = 500000
 
 Codex 把工具结果存进对话时另有上限，默认约 1.2 万 token（模型的 truncation_policy × 1.2），超出就从中间截掉、只留首尾，`@exec` 的 `max_output_tokens` 抬不过它；不加 `tool_output_token_limit`，稍大的纲要就被截成半份；`model_context_window` 把上下文调到模型允许的最大值（Codex 会截到模型的 max_context_window，gpt-6-astra 是 87.2 万 token），装得下整份纲要。`env` 让 MCP 进程知道自己跑在 Codex 下（Codex 不给 MCP 进程设 `PLUGIN_*` 变量），纲要大小才按 Codex 的 token 计。`tool_output_token_limit` 对所有工具生效，但 `exec_command` 等工具各有自己的单次默认上限，普通输出不会因此变大。
 
+Codex 的会话 hook 保留完整规则，对账只列各状态计数，不展开文件路径；恢复且有待处置文件时也只附计数。完整路径清单仍由 `ortg_status` 返回，纲要仍由 `ortg_overview` 按原预算和模块规则交付。这样避免大库存撑大启动 hook，不改变工具的输出限制、文件范围或已发纲要的记录。
+
 自定义 CODEX_HOME 时，env_vars 将实际配置目录转交给 MCP，避免宿主过滤环境后读错默认配置。Linux 上未转交时，ORTG 只沿当前进程祖先链取最近非空 CODEX_HOME；MCP 自身的显式值优先，无 /proc 或找不到时仍回退用户 ~/.codex。模型窗口上限与有效百分比的计算保持不变。
 
 插件清单声明了 hook 和 MCP，不改用户其他配置。不要再把 hook 抄进任何 `settings.json`，也不要用 `claude mcp add` 单独注册 ortg：宿主不去重，多一份注册就是每条钩子跑两遍、两套同名工具。仓库里没有 `ortg.tsv` 时插件对该目录零动作。
