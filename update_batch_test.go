@@ -33,6 +33,7 @@ type updateMCPReply struct {
 		Content []struct{ Text string } `json:"content"`
 		Tools   []struct {
 			Name        string
+			Description string `json:"description"`
 			InputSchema struct {
 				Required   []string
 				Properties map[string]struct {
