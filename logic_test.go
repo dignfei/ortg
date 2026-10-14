@@ -2568,12 +2568,12 @@ func TestDisciplineOncePerContext(t *testing.T) {
 		return HookReply("post", base.HookInput{ToolName: "Edit", FilePath: a, Cwd: root, SessionID: session, AgentID: agent, TranscriptPath: tr})
 	}
 	full := func(out string) bool {
-		return strings.Count(out, "纲要行纪律：") == 1 && strings.Count(out, "任务依赖闭环：") == 1 && strings.Count(out, "多入口契约：") == 1
+		return strings.Count(out, "纲要行纪律：") == 1 && strings.Count(out, "任务依赖闭环：") == 1 && strings.Count(out, "多入口契约：") == 1 && strings.Count(out, "逐项对照该集合") == 1 && strings.Contains(out, "未执行项保留未验证")
 	}
 	if out := edit("s1", ""); !full(out) || strings.Contains(out, disciplineSeen) {
 		t.Fatalf("the first edit carries the discipline once, nothing doubled:\n%s", out)
 	}
-	if out := edit("s1", ""); strings.Contains(out, "纲要行纪律：") || strings.Contains(out, "任务依赖闭环：") || !strings.Contains(out, disciplineSeen) || !strings.Contains(out, "已改动") {
+	if out := edit("s1", ""); strings.Contains(out, "纲要行纪律：") || strings.Contains(out, "任务依赖闭环：") || strings.Contains(out, "逐项对照该集合") || !strings.Contains(out, disciplineSeen) || !strings.Contains(out, "已改动") {
 		t.Fatalf("later edits point back to it:\n%s", out)
 	}
 	if out := edit("s1", "sub-1"); !full(out) {
