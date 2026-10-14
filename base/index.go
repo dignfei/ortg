@@ -345,16 +345,42 @@ func (x *Index) MentionedPaths(cmd string) []string {
 	return out
 }
 
-// UsesItems splits an outline line's Uses field into its items: separated
-// by commas or enumeration commas outside parentheses, each item's
-// parenthetical note — "util.rs(Sink, Sunk)" — cut off; "-" and an
-// unparsable line give none.
-func UsesItems(line string) []string {
+// UsesItems splits an outline's Uses at commas outside parentheses and strips
+// only trailing annotations. Index.UsesItems additionally preserves known paths.
+func UsesItems(line string) []string { return usesItems(line, nil) }
+
+// UsesItems preserves a repository path's literal parentheses before trying
+// annotation suffixes. Known ignored/deleted paths stay literal so the caller's
+// ResolvesUses check can reject them rather than accept a different dependency.
+func (x *Index) UsesItems(line string) []string {
+	return usesItems(line, func(item string) bool {
+		if x.t.get(item) != nil {
+			return true
+		}
+		_, err := os.Stat(filepath.Join(x.root, filepath.FromSlash(item)))
+		return err == nil
+	})
+}
+
+func usesItems(line string, present func(string) bool) []string {
 	e, err := parseEntry(line)
 	if err != nil {
 		return nil
 	}
-	return splitItems(e.Uses)
+	var out []string
+	for _, item := range fieldItems(e.Uses, true) {
+		for present == nil || !present(item) {
+			trimmed := trimNote(item)
+			if trimmed == item {
+				break
+			}
+			item = trimmed
+		}
+		if item != "" && item != "-" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // KeysOf returns the contract keys an outline line declares in its optional
@@ -464,7 +490,7 @@ func (x *Index) Dependents(rel string) []string {
 		if r.Ignored || r.Deleted || r.Path == rel || r.Outline == "" {
 			continue
 		}
-		for _, it := range UsesItems(r.Outline) {
+		for _, it := range x.UsesItems(r.Outline) {
 			dir := strings.HasSuffix(it, "/")
 			it = strings.TrimSuffix(it, "/")
 			if it == rel || (dir && strings.HasPrefix(rel, it+"/")) || (seen[base] == 1 && it == base) {

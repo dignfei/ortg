@@ -20,7 +20,7 @@ type entry struct {
 	TagOK          bool
 }
 
-var entryRe = regexp.MustCompile(`^([^\[\s]+)\[([A-Za-z0-9 ]*)\]: Role:(.*?) \| Uses:(.*?) \| API:(.*?) \| Constraints:(.*)$`)
+var entryRe = regexp.MustCompile(`^([^\[\t\r\n]+)\[([A-Za-z0-9 ]*)\]: Role:(.*?) \| Uses:(.*?) \| API:(.*?) \| Constraints:(.*)$`)
 
 func parseEntry(line string) (entry, error) {
 	m := entryRe.FindStringSubmatch(strings.TrimRight(line, "\r"))
@@ -42,6 +42,11 @@ const keysLabel = " | Keys:"
 // outside parentheses, dropping each item's parenthetical note; "-" and empty
 // items are skipped.
 func splitItems(field string) []string {
+	return fieldItems(field, false)
+}
+
+// fieldItems optionally retains parentheses while still shielding their commas.
+func fieldItems(field string, literal bool) []string {
 	var out []string
 	var cur strings.Builder
 	depth := 0
@@ -54,19 +59,47 @@ func splitItems(field string) []string {
 	for _, c := range field {
 		switch {
 		case c == '(' || c == '（':
+			if literal {
+				cur.WriteRune(c)
+			}
 			depth++
 		case c == ')' || c == '）':
+			if literal {
+				cur.WriteRune(c)
+			}
 			if depth > 0 {
 				depth--
 			}
 		case depth == 0 && (c == ',' || c == '，' || c == '、'):
 			flush()
-		case depth == 0:
+		case literal || depth == 0:
 			cur.WriteRune(c)
 		}
 	}
 	flush()
 	return out
+}
+
+// trimNote removes one balanced trailing annotation, retaining parentheses
+// followed by path characters. Callers can resolve each candidate before
+// removing another annotation, so a literal name like "a(note)" survives.
+func trimNote(item string) string {
+	if !strings.HasSuffix(item, ")") && !strings.HasSuffix(item, "）") {
+		return item
+	}
+	runes, depth := []rune(item), 0
+	for i := len(runes) - 1; i >= 0; i-- {
+		switch runes[i] {
+		case ')', '）':
+			depth++
+		case '(', '（':
+			depth--
+		}
+		if depth == 0 {
+			return strings.TrimSpace(string(runes[:i]))
+		}
+	}
+	return item
 }
 
 // contractPrefix opens a line of the header's contract table:

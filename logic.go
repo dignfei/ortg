@@ -3992,7 +3992,7 @@ func checkOrError(x *base.Index, rel, line string) (string, error) {
 // changed the package).
 func checkUses(x *base.Index, line string) error {
 	var bad []string
-	for _, it := range base.UsesItems(line) {
+	for _, it := range x.UsesItems(line) {
 		if !x.ResolvesUses(it) {
 			bad = append(bad, it)
 		}
@@ -4356,6 +4356,35 @@ func Update(rel, line string) (string, error) {
 	return updateOutlines([][2]string{{rel, line}})
 }
 
+// splitOutlineItem separates a path from its repeated basename and outline
+// tag, rather than treating the first space inside a path as its delimiter.
+var outlineItemTagRe = regexp.MustCompile(`\[[A-Za-z0-9 ]*\]: Role:`)
+
+func splitOutlineItem(item string) (string, string) {
+	it := strings.TrimSpace(item)
+	for _, tag := range outlineItemTagRe.FindAllStringIndex(it, -1) {
+		for i := tag[0] - 1; i >= 0; i-- {
+			if it[i] != ' ' && it[i] != '\t' {
+				continue
+			}
+			rel, name := strings.TrimSpace(it[:i]), strings.TrimSpace(it[i+1:tag[0]])
+			if strings.TrimSuffix(name, "/") == filepath.Base(filepath.FromSlash(strings.TrimRight(rel, "/"))) {
+				return rel, strings.TrimSpace(it[i+1:])
+			}
+		}
+	}
+	if i := strings.LastIndexAny(it, " \t"); i >= 0 {
+		if rest := strings.TrimSpace(it[i+1:]); rest == "=" || rest == "删除" {
+			return strings.TrimSpace(it[:i]), rest
+		}
+	}
+	// Keep legacy malformed-item handling and its error messages.
+	if i := strings.IndexAny(it, " \t"); i >= 0 {
+		return it[:i], strings.TrimSpace(it[i+1:])
+	}
+	return it, ""
+}
+
 // UpdateItems submits complete current outlines in one atomic transaction.
 // Each item is "path outline"; unlike targets, neither "=" nor deletion is accepted.
 func UpdateItems(items []string) (string, error) {
@@ -4364,12 +4393,11 @@ func UpdateItems(items []string) (string, error) {
 	}
 	entries := make([][2]string, 0, len(items))
 	for _, item := range items {
-		it := strings.TrimSpace(item)
-		i := strings.IndexAny(it, " \t")
-		if i <= 0 || strings.TrimSpace(it[i+1:]) == "" {
+		rel, line := splitOutlineItem(item)
+		if rel == "" || line == "" {
 			return "", fmt.Errorf(updateBadItem, item)
 		}
-		entries = append(entries, [2]string{it[:i], strings.TrimSpace(it[i+1:])})
+		entries = append(entries, [2]string{rel, line})
 	}
 	return updateOutlines(entries)
 }
@@ -4637,10 +4665,7 @@ func TargetItems(items []string) (string, error) {
 	failed := 0
 	for _, it := range items {
 		it = strings.TrimSpace(it)
-		path, rest := it, ""
-		if i := strings.IndexAny(it, " \t"); i >= 0 {
-			path, rest = it[:i], strings.TrimSpace(it[i+1:])
-		}
+		path, rest := splitOutlineItem(it)
 		var msg string
 		var err error
 		switch {

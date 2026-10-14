@@ -188,3 +188,47 @@ func TestUsesItems(t *testing.T) {
 		t.Fatalf("- names nothing: %v", n)
 	}
 }
+
+func TestUsesPathsPreserveLiteralParentheses(t *testing.T) {
+	root := t.TempDir()
+	x := NewMemIndex(root, testHeader)
+	literal := "folder（中文）/a (data).go"
+	trailing := "a(note)"
+	planned := "new folder（draft）/future (plan)"
+	for _, p := range []string{literal, trailing, "a", planned} {
+		if err := x.SetTarget(p, filepath.Base(p)+"[5 L ST T]: Role:planned fixture | Uses:- | API:- | Constraints:-"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir := "folder (shared)（公共）"
+	if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := "consumer.go[5 L ST T]: Role:fixture | Uses:" + literal + "（Sink(nested), Sunk）," + trailing + "(consumer)," + planned + "," + dir + "/（使用） | API:- | Constraints:- | Keys:unit:money(消费, 提供)"
+	want := []string{literal, trailing, planned, dir + "/"}
+	if got := x.UsesItems(line); !reflect.DeepEqual(got, want) {
+		t.Fatalf("literal and planned paths: %v, want %v", got, want)
+	}
+	if got := KeysOf(line); !reflect.DeepEqual(got, []string{"unit:money"}) {
+		t.Fatalf("Keys role parsing changed: %v", got)
+	}
+	if err := x.SetOutline("consumer.go", line); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{literal, trailing, planned, dir + "/nested.go"} {
+		if got := x.Dependents(p); !reflect.DeepEqual(got, []string{"consumer.go"}) {
+			t.Fatalf("dependency edge lost for %s: %v", p, got)
+		}
+	}
+	if got := x.Dependents("a"); len(got) != 0 {
+		t.Fatalf("literal filename must not become another dependency: %v", got)
+	}
+	pure := "consumer.go[5 L ST T]: Role:fixture | Uses:" + literal + "（Sink(nested), Sunk） | API:- | Constraints:-"
+	if got := UsesItems(pure); !reflect.DeepEqual(got, []string{literal}) {
+		t.Fatalf("path-internal parentheses were stripped: %v", got)
+	}
+	x.t.get(trailing).Ignored = true
+	if got := x.UsesItems(line)[1]; got != trailing || x.ResolvesUses(got) {
+		t.Fatalf("an ignored literal must be refused, not silently rebound: %q", got)
+	}
+}
