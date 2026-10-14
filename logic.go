@@ -236,6 +236,69 @@ func (s summary) sessionReport() string {
 	return report
 }
 
+// Task hints follow entries this context has received, within this request's
+// scope. Reuse fresh reconciliation facts; no recursion or extra file reads.
+func taskDependencyHints(x *base.Index, c *sentCache, roots []base.Row, s summary) string {
+	if x.Config().Mode != "task" {
+		return ""
+	}
+	scope, pending := map[string]bool{}, map[string]state{}
+	for _, r := range roots {
+		scope[r.Path] = true
+	}
+	for _, st := range []state{stSkeleton, stStale} {
+		for _, p := range s.byState[st] {
+			pending[p] = st
+		}
+	}
+	owners := map[string][]string{}
+	live := map[string]bool{}
+	key := func(owner, dep string) string {
+		return "uses-pending:" + owner + "\x00" + dep + "\x00" + stateNames[pending[dep]]
+	}
+	for _, r := range x.Rows() {
+		if r.Outline == "" || c.rows[r.Path] != rowPrint(r) || r.Ignored || r.Deleted || !r.Exists || x.Excluded(r.Path, reconcileOpts) || x.Observed(r.Path, reconcileOpts) {
+			continue
+		}
+		for _, dep := range x.UsesItems(r.Outline) {
+			if _, ok := pending[dep]; !ok || strings.HasSuffix(dep, "/") {
+				continue
+			}
+			live[key(r.Path, dep)] = true
+			if scope[r.Path] && !c.nagged[key(r.Path, dep)] {
+				owners[dep] = append(owners[dep], r.Path)
+			}
+		}
+	}
+	for k := range c.nagged {
+		if strings.HasPrefix(k, "uses-pending:") && !live[k] {
+			delete(c.nagged, k)
+		}
+	}
+	deps := make([]string, 0, len(owners))
+	for dep := range owners {
+		deps = append(deps, dep)
+	}
+	sort.Strings(deps)
+	var b strings.Builder
+	for i, dep := range deps {
+		if i == 25 {
+			fmt.Fprintf(&b, taskDependenciesMore, len(deps)-i)
+			break
+		}
+		if b.Len() == 0 {
+			b.WriteString(taskDependenciesHead)
+		}
+		sort.Strings(owners[dep])
+		owners[dep] = slices.Compact(owners[dep])
+		for _, owner := range owners[dep] {
+			c.nagged[key(owner, dep)] = true
+		}
+		fmt.Fprintf(&b, taskDependencyLine, owners[dep][0], dep, stateNames[pending[dep]])
+	}
+	return b.String()
+}
+
 // ---- repository access ----
 
 func repoRoot() string {
@@ -479,7 +542,7 @@ func Overview(module string, force bool) (string, error) {
 		return b.String(), nil
 	}
 	if len(fresh) == 0 && !headerFresh {
-		return first + fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.report() + "\n" + overviewShortFooter, nil
+		return first + fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.report() + "\n" + taskDependencyHints(x, c, cand, s) + overviewShortFooter, nil
 	}
 	sub := opts
 	set := make(map[string]bool, len(fresh))
@@ -505,6 +568,7 @@ func Overview(module string, force bool) (string, error) {
 		b.WriteString(gateOverview(x))
 	}
 	b.WriteString("\n" + s.report())
+	b.WriteString("\n" + taskDependencyHints(x, c, cand, s))
 	if skipped := len(cand) - len(fresh); skipped > 0 {
 		b.WriteString("\n" + fmt.Sprintf(overviewIncrementNote, len(fresh), skipped))
 	}
@@ -3930,7 +3994,11 @@ func Status() (string, error) {
 		st := classify(f)
 		s.byState[st] = append(s.byState[st], f.Path)
 	}
-	return s.report(), nil
+	overviewMu.Lock()
+	defer overviewMu.Unlock()
+	c := sentFor(x.Root())
+	defer saveSent(x.Root(), c)
+	return s.report() + "\n" + taskDependencyHints(x, c, x.Rows(), s), nil
 }
 
 // sQuota is the S-field rune budget per C importance level, and the only place
