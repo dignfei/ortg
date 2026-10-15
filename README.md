@@ -52,22 +52,30 @@ codex plugin marketplace add "$PWD"
 codex plugin add ortg@ortg
 ```
 
-之后第一次启动 `codex` 会提示 "Hooks need review"，选"Trust all and continue"，否则 hook 不会运行。信任绑定在 hooks 文件的内容上（Codex 用的是 `hooks/codex.json`：命令式 hook 与 Claude 相同，另有一条按 Codex 的 MCP 名 `ortg` 写的纲要闸门）：以后插件更新改了它（比如新增一条 hook），第一次启动还会再问一次，照样选信任。Codex 的改文件工具是 `apply_patch`，一次可改多个文件：hook 会从补丁头里取出每个文件，逐个注入改动前的纲要、改动后催提交；补丁删掉的文件会被要求用 `ortg_target` 标记删除。MCP 仍要在 `~/.codex/config.toml` 加上：
+之后第一次启动 `codex` 会提示 "Hooks need review"，选"Trust all and continue"，否则 hook 不会运行。信任绑定在 hooks 文件的内容上（Codex 用的是 `hooks/codex.json`：命令式 hook 与 Claude 相同，另有一条按 Codex 的 MCP 名 `ortg` 写的纲要闸门）：以后插件更新改了它（比如新增一条 hook），第一次启动还会再问一次，照样选信任。Codex 的改文件工具是 `apply_patch`，一次可改多个文件：hook 会从补丁头里取出每个文件，逐个注入改动前的纲要、改动后催提交；补丁删掉的文件会被要求用 `ortg_target` 标记删除。
+
+手动注册本地 stdio MCP 时，在 `~/.codex/config.toml` 合并以下配置。仅在信任本地 `ortg` 时补上服务器的默认审批设置；顶层两行必须放在任何 `[表]` 之前：
 
 ```toml
+model_context_window = 1000000
+tool_output_token_limit = 500000
+
 [mcp_servers.ortg]
 command = "ortg"
 args = ["mcp"]
 env = { ORTG_AGENT = "codex" }
 env_vars = ["CODEX_HOME"]
+default_tools_approval_mode = "approve"
 ```
 
-并在同一文件开头（任何 `[表]` 之前）加两行：
+Codex 0.159.3 会[默认发现插件根的 `.mcp.json`](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/core-plugins/src/loader.rs#L1109)。使用已安装的 `ortg@ortg` 所提供的 `ortg` MCP 服务器时，审批覆盖应放在同一配置文件的以下位置；它只覆盖插件服务器的策略，不注册服务器，不要为此重复添加 stdio 实例：
 
 ```toml
-model_context_window = 1000000
-tool_output_token_limit = 500000
+[plugins."ortg@ortg".mcp_servers.ortg]
+default_tools_approval_mode = "approve"
 ```
+
+已有配置只补缺项，保留已有服务器、逐工具审批及其他明确权限策略，不要整块覆盖。`"approve"` 设置的只是受信任 ORTG 服务器的默认工具审批，不需要改全局 `approval_policy = "never"`、已有命名 `offline` 权限配置或 shell 网络限制。信任 hooks 与批准 MCP 工具是两件事：在 Codex 0.159.3 中，默认 MCP 审批可能使 `never` 模式下的非交互调用在工具执行前失败。两个配置位置由该版本的[官方配置 schema](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/core/config.schema.json)支持，`approve` 的普通审批行为见[工具调用实现](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/core/src/mcp_tool_call.rs#L2476)。
 
 Codex 把工具结果存进对话时另有上限，默认约 1.2 万 token（模型的 truncation_policy × 1.2），超出就从中间截掉、只留首尾，`@exec` 的 `max_output_tokens` 抬不过它；不加 `tool_output_token_limit`，稍大的纲要就被截成半份；`model_context_window` 把上下文调到模型允许的最大值（Codex 会截到模型的 max_context_window，gpt-6-astra 是 87.2 万 token），装得下整份纲要。`env` 让 MCP 进程知道自己跑在 Codex 下（Codex 不给 MCP 进程设 `PLUGIN_*` 变量），纲要大小才按 Codex 的 token 计。`tool_output_token_limit` 对所有工具生效，但 `exec_command` 等工具各有自己的单次默认上限，普通输出不会因此变大。
 
@@ -77,7 +85,7 @@ Codex 的会话 hook 保留完整规则，对账只列各状态计数，不展�
 
 自定义 CODEX_HOME 时，env_vars 将实际配置目录转交给 MCP，避免宿主过滤环境后读错默认配置。Linux 上未转交时，ORTG 只沿当前进程祖先链取最近非空 CODEX_HOME；MCP 自身的显式值优先，无 /proc 或找不到时仍回退用户 ~/.codex。模型窗口上限与有效百分比的计算保持不变。
 
-插件清单声明了 hook 和 MCP，不改用户其他配置。不要再把 hook 抄进任何 `settings.json`，也不要用 `claude mcp add` 单独注册 ortg：宿主不去重，多一份注册就是每条钩子跑两遍、两套同名工具。仓库里没有 `ortg.tsv` 时插件对该目录零动作。
+插件接入不自动改用户配置；MCP 按所用宿主与接入方式配置。不要再把 hook 抄进任何 `settings.json`，也不要用 `claude mcp add` 单独注册 ortg：宿主不去重，多一份注册就是每条钩子跑两遍、两套同名工具。仓库里没有 `ortg.tsv` 时插件对该目录零动作。
 
 ## 初始化一个仓库
 

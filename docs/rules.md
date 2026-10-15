@@ -22,6 +22,28 @@
 
 持久化维护模式：`ortg_header mode=build` 保留全库初始化顺序，文档未齐时拒绝源码纲要，即使已有源码条目；`mode=task` 只解除全部文档前置，仍要求真实纲要头、合法字段和路径以及原目标复审。未覆盖文件不改角色、不补假行，状态仍报告无纲要。不传模式保留配置，空串恢复旧 `hasSourceOutline` 兼容行为。CLI 对应 `ortg header --mode build|task`。任务模式不发送全库阶段完成提示，也不声明语义初始化完成。
 
+## Codex 的本地 MCP 审批
+
+Codex 0.159.3 的[官方配置 schema](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/core/config.schema.json)支持服务器级 `default_tools_approval_mode`。仅在信任本地 ORTG 时，将以下审批项合并到对应的现有配置表；完整接入示例见 README。
+
+手动 stdio 服务器的配置位置：
+
+```toml
+[mcp_servers.ortg]
+default_tools_approval_mode = "approve"
+```
+
+插件提供的服务器使用插件安装标识与服务器名，不把审批项加到插件清单中：
+
+```toml
+[plugins."ortg@ortg".mcp_servers.ortg]
+default_tools_approval_mode = "approve"
+```
+
+本仓库根的 `.mcp.json` 可由 Codex 插件默认发现；插件审批表只覆盖策略，不定义或注册新服务器。只为实际启用的 ORTG 实例补缺项，保留已有服务器、逐工具审批及其他明确权限策略，不重复注册服务器，不改其他 MCP、全局 `approval_policy = "never"`、已有命名 `offline` 权限配置或 shell 网络限制。`model_context_window`、`tool_output_token_limit` 等顶层字段必须放在任何 TOML 表之前。
+
+信任 hooks 不等于批准 MCP 工具；默认审批在 `never` 的非交互调用中可能先于工具执行被拒绝。`approve` 仅跳过该服务器工具的普通审批，逐工具设置仍优先，也不绕过独立的宿主检查，见该版本的[工具调用实现](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/core/src/mcp_tool_call.rs#L2476)。ORTG 不自动修改用户配置。
+
 ## 七个 MCP 工具（另有一个只给钩子调的隐藏工具 ortg_gate，见下）
 
 | 工具 | 参数 | 返回 |
