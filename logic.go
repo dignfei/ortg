@@ -54,7 +54,7 @@ const maxFileSize = 4 << 20
 
 var reconcileOpts = base.ReconcileOptions{ExcludeDirs: excludeDirs, ExcludeFiles: excludeFiles, MaxSize: maxFileSize}
 
-var errNoTable = errors.New("仓库没有 ortg.tsv，请先调用 ortg_overview 建表")
+var errNoTable = errors.New(noTableReply)
 
 // ---- states ----
 
@@ -458,6 +458,32 @@ func moduleKey(r base.Row) string {
 		return "-"
 	}
 	return r.Module
+}
+
+// OverviewTool is ortg_overview as the model calls it: in a repository
+// without ortg.tsv ORTG is not enabled, and nothing is created or written
+// unless init asks for it (the user asked to create or align the outline);
+// otherwise Overview.
+func OverviewTool(module string, force, init bool) (string, error) {
+	if !init && !tableExists() {
+		return noTableReply, nil
+	}
+	return Overview(module, force)
+}
+
+// StatusTool is ortg_status as the model calls it: a report, never a new
+// table (the CLI's scan still creates one when the user runs it).
+func StatusTool() (string, error) {
+	if !tableExists() {
+		return noTableReply, nil
+	}
+	return Scan()
+}
+
+// tableExists reports whether the repository has ortg.tsv.
+func tableExists() bool {
+	_, err := os.Stat(filepath.Join(repoRoot(), base.TableName))
+	return err == nil
 }
 
 // Overview reconciles and sends the outline the context lacks: a bare call

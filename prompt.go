@@ -130,7 +130,7 @@ var headerTemplate = `#====项目纲要====
 const targetModeText = `高屋建瓴模式：本轮只改目标纲要、纲要头、忽略规则与目录描述，不改代码；请输出完整目标纲要而非差异。`
 
 var toolDescriptions = map[string]string{
-	"ortg_overview": "对账并返回纲要与对账报告。不带参数时整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回，超过时只返回纲要头与模块清单（不含条目正文）；再用 module（B 标签）取模块，module=\"*\" 取全部。同一会话只发上下文里还没有或已变动的条目，全都发过就只回对账报告；上下文压缩或清空后自动重发；确实看不到时传 force=true 重发。一次超过单次上限时照发正文（可能被截断），开头提醒把模块拆细。仓库无 ortg.tsv 时：根目录有 overview.txt 则先备份再整份导入建表，否则建空表；再首扫。开工先调用。" + " " + taskOutlineRule,
+	"ortg_overview": "对账并返回纲要与对账报告。不带参数时整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回，超过时只返回纲要头与模块清单（不含条目正文）；再用 module（B 标签）取模块，module=\"*\" 取全部。同一会话只发上下文里还没有或已变动的条目，全都发过就只回对账报告；上下文压缩或清空后自动重发；确实看不到时传 force=true 重发。一次超过单次上限时照发正文（可能被截断），开头提醒把模块拆细。本仓库启用了 ORTG（会话开始注入过 ORTG 纲要规则）时开工先调用。仓库没有 ortg.tsv 就是没启用 ORTG：不要调用 ortg 工具；只有用户明确要求创建（初始化）或对齐纲要时，才传 init=true 建表（根目录有 overview.txt 则先备份再整份导入，否则建空表；再首扫）。" + " " + taskOutlineRule,
 	"ortg_status":   "重新扫描并对账，只返回对账报告（无纲要/过期/观察变动/对齐各多少及路径），不返回纲要正文。被问到纲要是否对齐、有哪些文件要处理时用它——会话开始的报告只是当时的快照，不要引用。",
 	"ortg_update":   "提交当前文件纲要：用 path+outline 提交一个文件，或用 items 批量提交（每项为\"路径 完整纲要行\"，路径和文件名可含空格及括号，按纲要文件名与标签识别边界）。给了 items 就忽略 path/outline；空批、规范化后重复路径均拒绝。全批共用一个事务，任一项失败全部回滚并指出路径与原因；成功逐项报告，统一保存与刷新。每项仍校验格式、字典、Uses、Keys、API、角色与目录类型，前移指纹并清空目标纲要。全库初始化(build或旧兼容首次建设)按批前文档状态检查，不能同批补文档并首次提交源码；任务维护(task)只维护当前已读文件，未覆盖仍未知。全库建设成功后按批次最终状态提示阶段修订。批量只合并已阅读文件的完整当前纲要，不代替正文阅读与每文件改完立即提交；全库初始化仍按文档→修订→核心→修订→普通→最终修订流程。第三方库等不逐文件建纲要的目录，给目录本身写一行目录纲要：path 填目录，文件名以 / 结尾（vendored/[标签]: ...），B 标签填用到它的模块，它就随那个模块一起发送；目录本身放进 observe_dirs，其下文件就不再要求逐个写纲要。",
 	"ortg_review":   "核对改动计划（参数 rulings：对上一次核对给了正文的每条契约写一行「契约键：裁决」，缺了不收敛）：列出所有目标纲要（要改、新建、删除的文件）的现在→目标字段变化、不合格的目标行、Uses 依赖它们却还没有目标纲要的文件，并给出逐项核对清单。要改多个文件时，写完计划后调用；核对列出要补、要核实的地方时，补改后连续两次看到同一计划才解锁，计划全写 = 或核对没发现要补的地方时一次即解锁。只改一个文件不需要。只给自己核对用，不用给用户看。",
@@ -185,6 +185,10 @@ const headerDepNote = "ortg: %s 的 Uses（依赖）是新写的或变了。看�
 // after checking point by point that each of their conventions has a place in
 // the header or a source outline — the program cannot judge that coverage.
 const distillNote = "ortg: 本仓库的文件都有纲要了。若这是首次建纲要，还剩收尾一步：把还在认知档的文档放进观察档（ortg_header 的 observe_files、observe_dirs），纲要里不再重复同一内容。放之前逐份逐条核对：列出这份文档纲要 Constraints 里的每条约定、约束与设计决定，各自现在写在纲要头的哪一段，或哪个源码文件纲要的 Constraints 里；找不到落点的先补上（纲要头用 ortg_header，源码纲要用 ortg_update 重写整行），文档与代码不一致的记录也落到对应源码纲要里。全部有了落点再放进观察档——放进去后文档纲要不再发给模型，没落下的就丢了。测试同理：在观察档里的测试（含整个测试目录）只记指纹、不发给模型，逐个确认它们锁定的对外行为已按测试契约写进被测源码的纲要或纲要头，没写的补上。要留在纲要里的文档（如顶层 README）可以不放、不用核对。文档以后改了，对账会报「观察变动」，届时重读它、同步纲要头与源码纲要再 ortg_align。还在认知档的文档：%s。（子代理收到这段，转告主会话。）"
+
+// noTableReply answers the ortg MCP tools in a repository without ortg.tsv:
+// ORTG is not enabled there, and nothing is created unless the user asks.
+const noTableReply = "ortg: 本仓库没有 ortg.tsv，ORTG 未启用：不要再调用 ortg 工具，照常工作。只有用户明确要求创建（初始化）或对齐纲要时，才用 ortg_overview 传 init=true 建表。"
 
 const emptyTableNote = "已创建 ortg.tsv（空表）。若本仓库已有旧纲要文档（例如 ORTG v1 的 overview.txt 分卷，可能在被忽略的目录里），按下面的迁移步骤合写后用 ortg_target 的 document 参数整份导入。"
 

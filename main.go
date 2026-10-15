@@ -122,7 +122,8 @@ func runMCP(args []string) error {
 	tools := []base.Tool{
 		{Name: "ortg_overview", Description: toolDescription("ortg_overview"),
 			Props: map[string]base.Prop{"module": {Type: "string", Description: "只看这个模块(纲要行 B 标签)；\"*\" 取全部；留空按整份预算给整份或模块清单"},
-				"force": {Type: "boolean", Description: "本会话已发过的条目也重发；只在上下文里确实看不到它们时用"}},
+				"force": {Type: "boolean", Description: "本会话已发过的条目也重发；只在上下文里确实看不到它们时用"},
+				"init":  {Type: "boolean", Description: "仓库还没有 ortg.tsv 时建表；只在用户明确要求创建（初始化）或对齐纲要时传 true"}},
 			// Claude Code saves an MCP result above 50000 chars to a file and
 			// shows the model a 2KB preview unless the tool declares a larger
 			// threshold here (its ceiling is 500000); Codex keeps a result
@@ -134,7 +135,11 @@ func runMCP(args []string) error {
 				if err != nil {
 					return "", err
 				}
-				return Overview(m, f)
+				init, err := a.Bool("init")
+				if err != nil {
+					return "", err
+				}
+				return OverviewTool(m, f, init)
 			}},
 		// Called by the PreToolUse hook (type mcp_tool in hooks/hooks.json),
 		// never by the model: the host fills the arguments from the hook input,
@@ -162,7 +167,7 @@ func runMCP(args []string) error {
 			}},
 		{Name: "ortg_status", Description: toolDescription("ortg_status"),
 			Props:   map[string]base.Prop{},
-			Handler: func(a base.Args) (string, error) { return Scan() }},
+			Handler: func(a base.Args) (string, error) { return StatusTool() }},
 		{Name: "ortg_update", Description: toolDescription("ortg_update"),
 			Props: map[string]base.Prop{"path": {Type: "string", Description: "仓库相对路径"}, "outline": {Type: "string", Description: "完整纲要行"},
 				"items": {Type: "array", Description: updateItemsDescription}},

@@ -2646,6 +2646,43 @@ func TestResumeKeepsContext(t *testing.T) {
 	}
 }
 
+// A repository without ortg.tsv has no ORTG: the model's ortg tools create
+// and write nothing and do not urge it to create a table; only init=true
+// (the user asked to create or align the outline) builds one. The CLI's
+// scan, run by the user, still does.
+func TestNoTableNoORTG(t *testing.T) {
+	root := updateRepo(t, "a.go")
+	exists := func() bool { _, err := os.Stat(filepath.Join(root, base.TableName)); return err == nil }
+	if out, err := OverviewTool("", false, false); err != nil || out != noTableReply || exists() {
+		t.Fatalf("overview without init: %q %v table=%v", out, err, exists())
+	}
+	if out, err := StatusTool(); err != nil || out != noTableReply || exists() {
+		t.Fatalf("status: %q %v table=%v", out, err, exists())
+	}
+	if _, err := Update("a.go", "a.go[7 L S T]: Role:a | Uses:- | API:- | Constraints:-"); err == nil || err.Error() != noTableReply || exists() {
+		t.Fatalf("update: %v table=%v", err, exists())
+	}
+	if strings.Contains(noTableReply, "请先调用") {
+		t.Fatal("the reply must not urge creating a table")
+	}
+	// The same through the real server, which is what a host calls.
+	call := func(name string, args map[string]any) string {
+		return nativeMCP(t, root, map[string]any{"method": "tools/call", "params": map[string]any{"name": name, "arguments": args}})[0].Result.Content[0].Text
+	}
+	if out := call("ortg_overview", map[string]any{}); out != noTableReply || exists() {
+		t.Fatalf("MCP overview without init: %q table=%v", out, exists())
+	}
+	if out := call("ortg_status", map[string]any{}); out != noTableReply || exists() {
+		t.Fatalf("MCP status: %q table=%v", out, exists())
+	}
+	if out := call("ortg_overview", map[string]any{"init": true}); out == noTableReply || !exists() {
+		t.Fatalf("MCP overview with init builds the table: %q table=%v", out, exists())
+	}
+	if out := call("ortg_status", map[string]any{}); out == noTableReply {
+		t.Fatalf("with a table, status reports: %q", out)
+	}
+}
+
 // The cache outlives the MCP process: a host resuming the conversation in a
 // new process (claude -p --resume) starts a new server whose context still
 // holds the outline, so nothing is sent twice and the gate stays open; a
