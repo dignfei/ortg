@@ -2942,7 +2942,7 @@ segments:
 		}
 		if depth < 3 && shellInterpreters[verb] {
 			for i, a := range w[1:] {
-				if strings.HasPrefix(a, "-") && strings.ContainsRune(a, 'c') && i+2 < len(w) {
+				if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 'c') && i+2 < len(w) {
 					t, ws := shellTargetsIn("cd "+strconv.Quote(dir)+"; "+w[i+2], root, inRepo, mentioned, depth+1)
 					for _, p := range t {
 						add(p)
@@ -3117,7 +3117,7 @@ func pythonLiteralAccesses(src string) []pythonAccess {
 				continue
 			}
 			method, at = tokens[at+2].text, at+4
-		} else if method != "open" || i > 0 && tokens[i-1].text == "." && (i < 2 || tokens[i-2].text != "io" && tokens[i-2].text != "builtins") {
+		} else if method != "open" || tokens[at].text != ")" && tokens[at].text != "," || i > 0 && tokens[i-1].text == "." && (i < 2 || tokens[i-2].text != "io" && tokens[i-2].text != "builtins") {
 			continue
 		}
 		write := method == "write_text" || method == "write_bytes"
@@ -3128,11 +3128,27 @@ func pythonLiteralAccesses(src string) []pythonAccess {
 			if tokens[at].text == "," {
 				at++
 			}
-			if at+2 < len(tokens) && tokens[at].text == "mode" && tokens[at+1].text == "=" {
-				at += 2
-			}
 			if at < len(tokens) && tokens[at].literal && strings.ContainsAny(tokens[at].text, "wxa+") {
 				write = true
+			}
+			level := 0
+		mode:
+			for j := at; j < len(tokens); j++ {
+				if tokens[j].literal {
+					continue
+				}
+				switch tokens[j].text {
+				case "(", "[", "{":
+					level++
+				case ")", "]", "}":
+					if level == 0 {
+						break mode
+					}
+					level--
+				}
+				if level == 0 && j+2 < len(tokens) && tokens[j].text == "mode" && tokens[j+1].text == "=" && tokens[j+2].literal && strings.ContainsAny(tokens[j+2].text, "wxa+") {
+					write = true
+				}
 			}
 		}
 		out = append(out, pythonAccess{file, write})

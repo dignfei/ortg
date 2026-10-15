@@ -36,6 +36,7 @@ func TestShellLiteralAccess(t *testing.T) {
 		{"comment", "python - <<'PY'\n# open('nested/empty')\nprint('ok')\nPY", false},
 		{"docstring", "python - <<'PY'\n'''open('nested/empty')'''\nPY", false},
 		{"dynamic", "python - <<'PY'\np='nested/empty'\nprint(open(p).read())\nPY", false},
+		{"dynamic suffix", `python -c "suffix='.data'; open('nested/empty'+suffix).read()"`, false},
 		{"path construction", `python -c "from pathlib import Path; print(Path('nested/empty'))"`, false},
 		{"cat", "cat nested/empty", true},
 		{"bare after cd", "cd nested && cat empty", true},
@@ -48,6 +49,7 @@ func TestShellLiteralAccess(t *testing.T) {
 		{"data heredoc", "cat <<'PY'\nopen('nested/empty')\nPY", false},
 		{"wrapped print", `bash -lc 'python -c "print(\"empty\")"'`, false},
 		{"wrapped open", `bash -lc 'python -c "open(\"nested/empty\").read()"'`, true},
+		{"wrapped long option", `bash --norc -c 'python -c "open(\"nested/empty\").read()"'`, true},
 		{"heredoc pipe", "python - <<'PY' | cat\nprint(open('nested/empty').read())\nPY", true},
 	}
 	for i, tc := range cases {
@@ -77,7 +79,7 @@ func TestShellLiteralAccess(t *testing.T) {
 	if _, err := Overview("", false); err != nil {
 		t.Fatal(err)
 	}
-	for _, cmd := range []string{"sed -i s/a/b/ a.go", "echo hi > a.go", `python -c "from pathlib import Path; Path('a.go').write_text('package b')"`} {
+	for _, cmd := range []string{"sed -i s/a/b/ a.go", "echo hi > a.go", `python -c "from pathlib import Path; Path('a.go').write_text('package b')"`, `python -c "open('a.go', encoding='utf-8', mode='w').write('package b')"`, `bash -c 'printf x' > a.go`} {
 		_, writes := gateTargets(x, "Bash", "", "", cmd)
 		if !slices.Contains(writes, "a.go") {
 			t.Errorf("write lost for %q: %v", cmd, writes)
