@@ -121,3 +121,95 @@ func TestCodexSessionCountsDelivery(t *testing.T) {
 		}
 	}
 }
+
+func TestOverviewCountsKeepCompleteStatus(t *testing.T) {
+	defer func(c, x hostLimits) { claudeLimits, codexLimits = c, x }(claudeLimits, codexLimits)
+	claudeLimits.whole, codexLimits.whole = 10, 10
+	for _, host := range []string{"claude", "codex"} {
+		t.Run(host, func(t *testing.T) {
+			t.Setenv("ORTG_AGENT", host)
+			smallSizes := map[string]int{}
+			for _, count := range []int{1, 1024} {
+				t.Run(fmt.Sprint(count), func(t *testing.T) {
+					t.Setenv("TMPDIR", t.TempDir())
+					root := t.TempDir()
+					t.Chdir(root)
+					dir := "unrelated_long_inventory_directory"
+					if err := os.Mkdir(dir, 0o755); err != nil {
+						t.Fatal(err)
+					}
+					paths := make([]string, count)
+					for i := range paths {
+						paths[i] = fmt.Sprintf("%s/unread_%04d_long_filename.go", dir, i)
+						if err := os.WriteFile(paths[i], []byte("package sample"), 0o644); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := os.WriteFile("owned.go", []byte("package sample"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := scanWithHeader(); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := Header(testHeader, nil, nil, nil, nil, nil, nil, "task"); err != nil {
+						t.Fatal(err)
+					}
+					outline := "owned.go[5 L CL T]: Role:owned | Uses:- | API:- | Constraints:-"
+					if _, err := Update("owned.go", outline); err != nil {
+						t.Fatal(err)
+					}
+					get := func(branch, module string) string {
+						t.Helper()
+						out, err := Overview(module, false)
+						if err != nil {
+							t.Fatal(err)
+						}
+						_, report, ok := strings.Cut(out, "## 对账报告\n")
+						if !ok || !strings.Contains(report, fmt.Sprintf("无纲要 %d", count)) ||
+							!strings.Contains(report, "全库计数") || !strings.Contains(report, "ortg_status") ||
+							strings.Contains(out, "unread_") || strings.Contains(out, dir) {
+							t.Fatalf("%s must give global counts without unrelated paths:\n%s", branch, out)
+						}
+						if count == 1 {
+							smallSizes[branch] = len(report)
+						} else if baseline, ok := smallSizes[branch]; ok && len(report) > baseline+50 {
+							t.Fatalf("%s report grew with the inventory: %d -> %d", branch, baseline, len(report))
+						}
+						return out
+					}
+					if out := get("over budget", ""); !strings.HasSuffix(out, overviewModulesFooter) || strings.Contains(out, outline) {
+						t.Fatal("over-budget call must retain the header/module-list behavior")
+					}
+					if out := get("module", "CL"); !strings.Contains(out, outline) {
+						t.Fatal("module call lost its real outline")
+					}
+					if out := get("short", "CL"); !strings.HasSuffix(out, overviewShortFooter) || strings.Contains(out, outline) {
+						t.Fatal("repeat must retain the short reply")
+					}
+					status, err := Status()
+					if err != nil {
+						t.Fatal(err)
+					}
+					unknown, err := Overview("-", false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, p := range paths {
+						if !strings.Contains(status, p) || !strings.Contains(unknown, filepath.Base(p)) {
+							t.Fatalf("Status or later outline delivery lost %s", p)
+						}
+					}
+					x, err := base.Open(root)
+					if err != nil || len(x.Rows()) != count+1 {
+						t.Fatalf("inventory changed: %v", err)
+					}
+					for _, r := range x.Rows() {
+						if r.Ignored || r.Deleted || (r.Path == "owned.go" && r.Outline != outline) || (r.Path != "owned.go" && r.Outline != "") {
+							t.Fatalf("inventory or true outline changed: %+v", r)
+						}
+					}
+				})
+			}
+		})
+	}
+}

@@ -184,7 +184,7 @@ func stripBodyMarker(doc string) string {
 	return strings.Join(out, "\n")
 }
 
-// oneLine is the report squeezed into the line a human sees at session start.
+// oneLine is the report squeezed into counts for a compact summary.
 func (s summary) oneLine() string {
 	var parts []string
 	for _, st := range []state{stSkeleton, stStale, stPending, stPlanned, stTombstone, stObserveDrift} {
@@ -225,17 +225,21 @@ func (s summary) report() string {
 	return b.String()
 }
 
-// sessionReport keeps Codex's fixed-size hook channel independent of the
-// inventory. MCP still carries the complete report and outline on demand.
-func (s summary) sessionReport() string {
-	if base.Host() != "codex" {
-		return s.report()
-	}
+func (s summary) countsReport() string {
 	report := fmt.Sprintf(sessionCountsReport, s.oneLine(), s.purged)
 	if s.needsDecision() {
 		report += "\n\n" + decisionText
 	}
 	return report
+}
+
+// sessionReport keeps Codex's fixed-size hook channel independent of the
+// inventory. Status still carries the complete report on demand.
+func (s summary) sessionReport() string {
+	if base.Host() != "codex" {
+		return s.report()
+	}
+	return s.countsReport()
 }
 
 // Task hints follow entries this context has received, within this request's
@@ -597,11 +601,11 @@ func Overview(module string, force bool) (string, error) {
 		if headerFresh {
 			b.WriteString(gateOverview(x))
 		}
-		b.WriteString("\n" + s.report() + "\n" + overviewModulesFooter)
+		b.WriteString("\n" + s.countsReport() + "\n" + overviewModulesFooter)
 		return b.String(), nil
 	}
 	if len(fresh) == 0 && !headerFresh {
-		return first + fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.report() + "\n" + taskDependencyHints(x, c, cand, s) + overviewShortFooter, nil
+		return first + fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.countsReport() + "\n" + taskDependencyHints(x, c, cand, s) + overviewShortFooter, nil
 	}
 	sub := opts
 	set := make(map[string]bool, len(fresh))
@@ -626,7 +630,7 @@ func Overview(module string, force bool) (string, error) {
 	if headerFresh {
 		b.WriteString(gateOverview(x))
 	}
-	b.WriteString("\n" + s.report())
+	b.WriteString("\n" + s.countsReport())
 	b.WriteString("\n" + taskDependencyHints(x, c, cand, s))
 	if skipped := len(cand) - len(fresh); skipped > 0 {
 		b.WriteString("\n" + fmt.Sprintf(overviewIncrementNote, len(fresh), skipped))
