@@ -190,6 +190,12 @@ const distillNote = "ortg: 本仓库的文件都有纲要了。若这是首次�
 // ORTG is not enabled there, and nothing is created unless the user asks.
 const noTableReply = "ortg: 本仓库没有 ortg.tsv，ORTG 未启用：不要再调用 ortg 工具，照常工作。只有用户明确要求创建（初始化）或对齐纲要时，才用 ortg_overview 传 init=true 建表。"
 
+// disabledReply answers whatever still reaches ORTG in a repository with an
+// ortg.disable file: ORTG never runs there, whatever is asked. Normally
+// nothing does reach it — the MCP server exits before the handshake and the
+// hooks say nothing — so this covers a file created mid-session and the CLI.
+const disabledReply = "ortg: 本仓库有 ortg.disable，ORTG 已停用：不要调用 ortg 工具，照常工作。"
+
 const emptyTableNote = "已创建 ortg.tsv（空表）。若本仓库已有旧纲要文档（例如 ORTG v1 的 overview.txt 分卷，可能在被忽略的目录里），按下面的迁移步骤合写后用 ortg_target 的 document 参数整份导入。"
 
 const migrateHint = `overview.txt 不合本协议（%v），已建空表。旧文档已重命名为 %s。请这样迁移：

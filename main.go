@@ -119,6 +119,9 @@ func runHook(args []string) (err error) {
 }
 
 func runMCP(args []string) error {
+	if Disabled("") {
+		return nil // ortg.disable: no handshake, nothing reaches the model
+	}
 	tools := []base.Tool{
 		{Name: "ortg_overview", Description: toolDescription("ortg_overview"),
 			Props: map[string]base.Prop{"module": {Type: "string", Description: "只看这个模块(纲要行 B 标签)；\"*\" 取全部；留空按整份预算给整份或模块清单"},

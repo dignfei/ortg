@@ -56,6 +56,8 @@ var reconcileOpts = base.ReconcileOptions{ExcludeDirs: excludeDirs, ExcludeFiles
 
 var errNoTable = errors.New(noTableReply)
 
+var errDisabled = errors.New(disabledReply)
+
 // ---- states ----
 
 type state int
@@ -306,10 +308,35 @@ func repoRoot() string {
 	return base.FindRepoRoot(wd)
 }
 
+// disableName is the placeholder that turns ORTG off for a repository for
+// good: no hook output, no MCP server, no table created or written.
+const disableName = "ortg.disable"
+
+// Disabled reports whether the repository holding start (the working
+// directory when empty) has an ortg.disable at its root — where ortg.tsv is,
+// else the git root — or at the git top level.
+func Disabled(start string) bool {
+	if start == "" {
+		start, _ = os.Getwd()
+	}
+	has := func(dir string) bool {
+		_, err := os.Stat(filepath.Join(dir, disableName))
+		return err == nil
+	}
+	if has(base.FindRepoRoot(start)) {
+		return true
+	}
+	top, ok := base.GitRoot(start)
+	return ok && has(top)
+}
+
 // openTable opens root's table; one an older ORTG wrote is first upgraded in
 // place by migrate. Only entry points that may write call it: the read-only
 // hooks and the gate open the table directly and stay silent on an old one.
 func openTable(root string) (*base.Index, error) {
+	if Disabled(root) {
+		return nil, errDisabled
+	}
 	x, err := base.Open(root)
 	if errors.Is(err, base.ErrFormat) {
 		if up, merr := migrate.Table(filepath.Join(root, base.TableName)); merr == nil && up {
@@ -465,6 +492,9 @@ func moduleKey(r base.Row) string {
 // unless init asks for it (the user asked to create or align the outline);
 // otherwise Overview.
 func OverviewTool(module string, force, init bool) (string, error) {
+	if Disabled("") {
+		return disabledReply, nil
+	}
 	if !init && !tableExists() {
 		return noTableReply, nil
 	}
@@ -474,6 +504,9 @@ func OverviewTool(module string, force, init bool) (string, error) {
 // StatusTool is ortg_status as the model calls it: a report, never a new
 // table (the CLI's scan still creates one when the user runs it).
 func StatusTool() (string, error) {
+	if Disabled("") {
+		return disabledReply, nil
+	}
 	if !tableExists() {
 		return noTableReply, nil
 	}
@@ -1003,6 +1036,9 @@ func loadSent(root, sid string) *sentCache {
 // Observe-tier files hold no outline and are never gated. Subagents (agent
 // set) are left alone: their context is not the session's, and this cache is.
 func Gate(tool, path, dir, command, agent string) (string, error) {
+	if Disabled("") {
+		return "", nil
+	}
 	if agent != "" {
 		// A subagent's broad test run is still a fact about the work tree.
 		if tool == "Bash" {
@@ -5257,6 +5293,9 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 	start := in.Cwd
 	if start == "" {
 		start, _ = os.Getwd()
+	}
+	if Disabled(start) {
+		return "", "" // not even the Stop hook's notes: ORTG is off here
 	}
 	root := base.FindRepoRoot(start)
 	if event == "stop" {
