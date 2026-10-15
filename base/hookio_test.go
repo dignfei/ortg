@@ -422,6 +422,7 @@ func TestAncestors(t *testing.T) {
 // Only marks of the given prefixes, of this root, older than the age go.
 func TestPruneOverviewMarks(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("ORTG_STATE_DIR", t.TempDir())
 	root, other := "/repo/a", "/repo/b"
 	for _, k := range []string{"reset-sold", "reset-snew", "sent-sold", "reset", "start"} {
 		MarkOverview(root, k, "")
@@ -438,6 +439,44 @@ func TestPruneOverviewMarks(t *testing.T) {
 	}
 	if gone(root, "reset-snew") || gone(root, "reset") || gone(root, "start") || gone(other, "reset-sold") {
 		t.Fatal("recent marks, other kinds and other roots' marks must stay")
+	}
+}
+
+// Marks live in the state dir, so wiping the temp dir (a tmpfs on reboot)
+// keeps them; a mark an older binary left in the temp dir is still read and
+// pruned, and the later of the two copies counts.
+func TestOverviewMarksSurviveTempDir(t *testing.T) {
+	tmp, state := t.TempDir(), t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	t.Setenv("ORTG_STATE_DIR", filepath.Join(state, "ortg"))
+	root := "/repo/a"
+	MarkOverview(root, "sent-sx", "data")
+	if _, err := os.Stat(filepath.Join(state, "ortg", overviewMarkName(root, "sent-sx"))); err != nil {
+		t.Fatalf("mark not in the state dir: %v", err)
+	}
+	if fs, _ := filepath.Glob(filepath.Join(tmp, "ortg-overview-*")); len(fs) != 0 {
+		t.Fatalf("mark left in the temp dir: %v", fs)
+	}
+	t.Setenv("TMPDIR", t.TempDir()) // reboot: a fresh, empty temp dir
+	if at, d := OverviewMark(root, "sent-sx"); at.IsZero() || d != "data" {
+		t.Fatalf("mark lost with the temp dir: %v %q", at, d)
+	}
+
+	legacy := filepath.Join(os.Getenv("TMPDIR"), overviewMarkName(root, "reset-sold"))
+	os.WriteFile(legacy, []byte("compact"), 0o600)
+	if at, d := OverviewMark(root, "reset-sold"); at.IsZero() || d != "compact" {
+		t.Fatalf("legacy temp-dir mark not read: %v %q", at, d)
+	}
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(legacy, old, old)
+	MarkOverview(root, "reset-sold", "clear")
+	if _, d := OverviewMark(root, "reset-sold"); d != "clear" {
+		t.Fatalf("the later copy must count, got %q", d)
+	}
+	os.Chtimes(legacy, old.Add(-10*24*time.Hour), old.Add(-10*24*time.Hour))
+	PruneOverviewMarks(root, []string{"reset-s"}, 7*24*time.Hour)
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatal("stale legacy marks must be pruned too")
 	}
 }
 

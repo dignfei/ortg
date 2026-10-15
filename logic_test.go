@@ -48,7 +48,20 @@ func scanWithHeader() (string, error) {
 // integration tests' binaries inherit the variable.
 func TestMain(m *testing.M) {
 	os.Setenv("ORTG_CBM", "off")
-	os.Exit(m.Run())
+	// Session marks go to a state dir of the test run, not the user's
+	// cache; child test processes inherit their parent's.
+	if os.Getenv("ORTG_TEST_STATE_DIR") != "" {
+		os.Exit(m.Run())
+	}
+	state, err := os.MkdirTemp("", "ortg-state-test")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("ORTG_STATE_DIR", state)
+	os.Setenv("ORTG_TEST_STATE_DIR", "1")
+	code := m.Run()
+	os.RemoveAll(state)
+	os.Exit(code)
 }
 
 func TestClassify(t *testing.T) {
@@ -2256,6 +2269,40 @@ func TestTargetItems(t *testing.T) {
 	}
 	if _, err := TargetItems([]string{"x.go"}); err == nil {
 		t.Fatal("every item failing fails the call")
+	}
+}
+
+// A reboot empties the temp dir (often a tmpfs) but not the context of a
+// session resumed afterwards: what was sent to it, and that it loaded the
+// outline, must survive, so the resumed session is neither refused a read
+// nor sent the whole outline again.
+func TestOverviewSurvivesReboot(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("ORTG_STATE_DIR", t.TempDir())
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "a.go"), []byte("package a"), 0o644)
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	Update("a.go", "a.go[7 L ST T]: Role:存储 | Uses:- | API:Save | Constraints:-")
+	t.Cleanup(func() { callSession.ids, callSession.fromEnv = nil, false })
+	useCallSession(base.Args{"_meta": map[string]any{"threadId": "thread-r", "progressToken": 1}})
+	if out, _ := Overview("", false); !strings.Contains(out, "Role:存储") {
+		t.Fatalf("first overview sends the outline:\n%s", out)
+	}
+
+	t.Setenv("TMPDIR", t.TempDir()) // reboot: a fresh, empty temp dir
+	overviewMu.Lock()
+	overviewSent = map[string]*sentCache{} // and a new server process
+	overviewMu.Unlock()
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "thread-r", Source: "resume"})
+	if got, _ := Gate("Read", filepath.Join(root, "a.go"), "", "", ""); got != "" {
+		t.Fatalf("a resumed session must not be refused a read after a reboot: %q", got)
+	}
+	if out, _ := Overview("", false); strings.Contains(out, "Role:存储") {
+		t.Fatalf("a resumed session must not be resent the outline after a reboot:\n%s", out)
 	}
 }
 

@@ -439,44 +439,78 @@ func PreToolDecision(text string, deny bool) string {
 // Overview marks are per-repository files the hooks leave for the MCP server,
 // which outlives compactions and clears; the kind names what happened and,
 // for per-session or per-process marks, whose (the caller builds the kind).
-// The mtime is the moment; the content is optional data.
+// The mtime is the moment; the content is optional data. They live in a
+// state directory that survives a reboot — the temp dir is often a tmpfs, and
+// losing the marks there would make a resumed session look like it never got
+// its outline: ORTG_STATE_DIR, else the user cache dir. Marks older binaries
+// left in the temp dir are still read, so an upgrade resends nothing.
 func overviewMarkFile(root, kind string) string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("ortg-overview-%s-%x", kind, sha1.Sum([]byte(root))))
+	return filepath.Join(stateDir(), overviewMarkName(root, kind))
 }
 
-// MarkOverview writes root's mark of the given kind, stamped now.
+func overviewMarkName(root, kind string) string {
+	return fmt.Sprintf("ortg-overview-%s-%x", kind, sha1.Sum([]byte(root)))
+}
+
+func stateDir() string {
+	if d := os.Getenv("ORTG_STATE_DIR"); d != "" {
+		return d
+	}
+	if d, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(d, "ortg")
+	}
+	return os.TempDir()
+}
+
+// MarkOverview writes root's mark of the given kind, stamped now; into the
+// temp dir when the state dir cannot be written.
 func MarkOverview(root, kind, data string) {
 	f := overviewMarkFile(root, kind)
-	if err := os.WriteFile(f, []byte(data), 0o600); err != nil {
+	err := os.MkdirAll(filepath.Dir(f), 0o700)
+	if err == nil {
+		err = os.WriteFile(f, []byte(data), 0o600)
+	}
+	if err != nil {
 		Debugf("overview mark %s %s: %v", kind, root, err)
-		return
+		f = filepath.Join(os.TempDir(), overviewMarkName(root, kind))
+		if err := os.WriteFile(f, []byte(data), 0o600); err != nil {
+			Debugf("overview mark %s %s: %v", kind, root, err)
+			return
+		}
 	}
 	now := time.Now()
 	_ = os.Chtimes(f, now, now)
 }
 
 // OverviewMark returns when root's mark of the given kind was written and its
-// data; the zero time when never.
+// data; the zero time when never. Of the state dir's and the temp dir's
+// copies the later one counts.
 func OverviewMark(root, kind string) (time.Time, string) {
-	f := overviewMarkFile(root, kind)
-	fi, err := os.Stat(f)
-	if err != nil {
-		return time.Time{}, ""
+	var at time.Time
+	var data string
+	for _, f := range []string{overviewMarkFile(root, kind), filepath.Join(os.TempDir(), overviewMarkName(root, kind))} {
+		fi, err := os.Stat(f)
+		if err != nil || !fi.ModTime().After(at) {
+			continue
+		}
+		b, _ := os.ReadFile(f)
+		at, data = fi.ModTime(), string(b)
 	}
-	b, _ := os.ReadFile(f)
-	return fi.ModTime(), string(b)
+	return at, data
 }
 
 // PruneOverviewMarks removes root's marks whose kind starts with one of
-// prefixes and that were last written longer ago than age: per-session and
-// per-process marks would otherwise pile up in the temp dir.
+// prefixes and that were last written longer ago than age, in the state dir
+// and the temp dir: per-session and per-process marks would otherwise pile up.
 func PruneOverviewMarks(root string, prefixes []string, age time.Duration) {
 	cut := time.Now().Add(-age)
-	for _, pre := range prefixes {
-		fs, _ := filepath.Glob(filepath.Join(os.TempDir(), fmt.Sprintf("ortg-overview-%s*-%x", pre, sha1.Sum([]byte(root)))))
-		for _, f := range fs {
-			if fi, err := os.Stat(f); err == nil && fi.ModTime().Before(cut) {
-				_ = os.Remove(f)
+	for _, dir := range []string{stateDir(), os.TempDir()} {
+		for _, pre := range prefixes {
+			fs, _ := filepath.Glob(filepath.Join(dir, overviewMarkName(root, pre+"*")))
+			for _, f := range fs {
+				if fi, err := os.Stat(f); err == nil && fi.ModTime().Before(cut) {
+					_ = os.Remove(f)
+				}
 			}
 		}
 	}
