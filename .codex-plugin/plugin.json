@@ -1,6 +1,6 @@
 {
   "name": "ortg",
-  "version": "0.5.71",
+  "version": "0.5.72",
   "description": "单文件纲要引擎：SessionStart 注入规则与对账摘要；MCP 服务器由插件根 .mcp.json 声明，审批配置见 README。",
   "hooks": "./hooks/codex.json"
 }
