@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -47,8 +48,18 @@ func disabledChild(t *testing.T, root, mode, stdin string) string {
 	return string(out)
 }
 
+type disabledMCPReply struct {
+	Result struct {
+		Instructions string                  `json:"instructions"`
+		Tools        []struct{ Name string } `json:"tools"`
+		IsError      bool                    `json:"isError"`
+		Content      []struct{ Text string } `json:"content"`
+	} `json:"result"`
+	Error json.RawMessage `json:"error"`
+}
+
 // An ortg.disable at the repository root turns ORTG off for good: the MCP
-// server exits before the handshake, the hooks say nothing (Stop only the {}
+// server gives the model one line and no tool, the hooks say nothing (Stop only the {}
 // Codex requires), the gate lets everything through, the tools that still
 // get called answer disabledReply, and no entry point creates or writes the
 // table — not ortg_overview init=true, not the CLI scan, not an existing one.
@@ -107,11 +118,33 @@ func TestDisabledRepo(t *testing.T) {
 		t.Fatalf("gate must let writes through: %q", got)
 	}
 
-	// The real processes the host starts.
+	// The real processes the host starts. The MCP server shakes hands —
+	// exiting would make Claude Code cache the failure for every repository
+	// — but all the model gets is disabledReply: no tool, and the hidden gate
+	// allows.
 	init := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}` + "\n" +
-		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}` + "\n"
-	if out := disabledChild(t, root, "mcp", init); out != "" {
-		t.Fatalf("the MCP server must exit without a word: %q", out)
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}` + "\n" +
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ortg_gate","arguments":{"tool":"Read","path":"` + filepath.Join(root, "a.go") + `"}}}` + "\n" +
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ortg_overview","arguments":{"init":true}}}` + "\n"
+	var replies []disabledMCPReply
+	for _, line := range strings.Split(strings.TrimSpace(disabledChild(t, root, "mcp", init)), "\n") {
+		var r disabledMCPReply
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("MCP line %q: %v", line, err)
+		}
+		replies = append(replies, r)
+	}
+	if len(replies) != 4 || replies[0].Result.Instructions != disabledReply {
+		t.Fatalf("handshake must carry disabledReply as instructions: %+v", replies)
+	}
+	if len(replies[1].Result.Tools) != 0 {
+		t.Fatalf("the model must see no tool: %+v", replies[1].Result.Tools)
+	}
+	if g := replies[2].Result; g.IsError || len(g.Content) != 1 || g.Content[0].Text != "" {
+		t.Fatalf("the hidden gate must answer and allow: %+v %s", g, replies[2].Error)
+	}
+	if len(replies[3].Error) == 0 {
+		t.Fatalf("ortg_overview must not exist: %+v", replies[3])
 	}
 	payload := `{"hook_event_name":"%s","session_id":"s","cwd":"` + root + `","source":"startup"}`
 	for event, host := range map[string]string{"session": "SessionStart", "prompt": "UserPromptSubmit", "post": "PostToolUse"} {

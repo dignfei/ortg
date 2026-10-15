@@ -57,6 +57,27 @@ func TestServeProtocol(t *testing.T) {
 	}
 }
 
+// Instructions go out with the initialize result, and only when given.
+func TestInitializeInstructions(t *testing.T) {
+	init := func(instructions ...string) map[string]any {
+		var out bytes.Buffer
+		Serve(strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n"), &out, "t", "0", nil, instructions...)
+		var resp struct {
+			Result map[string]any `json:"result"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+			t.Fatalf("%v: %s", err, out.String())
+		}
+		return resp.Result
+	}
+	if got := init("off here"); got["instructions"] != "off here" {
+		t.Fatalf("instructions: %v", got)
+	}
+	if _, ok := init()["instructions"]; ok {
+		t.Fatal("no instructions key without instructions")
+	}
+}
+
 // A tool's Meta is published as _meta in tools/list; tools without one carry
 // no _meta key at all.
 func TestToolsListMeta(t *testing.T) {

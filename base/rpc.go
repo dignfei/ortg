@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 )
 
 // Prop describes one tool argument.
@@ -103,8 +104,10 @@ func schema(t Tool) map[string]any {
 }
 
 // Serve runs the stdio JSON-RPC 2.0 loop: one request per line, one
-// response per line. Notifications (no id) get no reply.
-func Serve(in io.Reader, out io.Writer, name, version string, tools []Tool) error {
+// response per line. Notifications (no id) get no reply. A non-empty
+// instructions goes out with the initialize result, which hosts hand the
+// model as the server's instructions.
+func Serve(in io.Reader, out io.Writer, name, version string, tools []Tool, instructions ...string) error {
 	byName := map[string]Tool{}
 	for _, t := range tools {
 		byName[t.Name] = t
@@ -147,8 +150,12 @@ func Serve(in io.Reader, out io.Writer, name, version string, tools []Tool) erro
 			if p.ProtocolVersion == "" {
 				p.ProtocolVersion = "2025-06-18"
 			}
-			result(map[string]any{"protocolVersion": p.ProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{}},
-				"serverInfo": map[string]any{"name": name, "version": version}})
+			init := map[string]any{"protocolVersion": p.ProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{}},
+				"serverInfo": map[string]any{"name": name, "version": version}}
+			if text := strings.Join(instructions, "\n"); text != "" {
+				init["instructions"] = text
+			}
+			result(init)
 		case "ping":
 			result(map[string]any{})
 		case "tools/list":

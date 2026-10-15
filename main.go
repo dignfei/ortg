@@ -119,9 +119,6 @@ func runHook(args []string) (err error) {
 }
 
 func runMCP(args []string) error {
-	if Disabled("") {
-		return nil // ortg.disable: no handshake, nothing reaches the model
-	}
 	tools := []base.Tool{
 		{Name: "ortg_overview", Description: toolDescription("ortg_overview"),
 			Props: map[string]base.Prop{"module": {Type: "string", Description: "只看这个模块(纲要行 B 标签)；\"*\" 取全部；留空按整份预算给整份或模块清单"},
@@ -276,6 +273,19 @@ func runMCP(args []string) error {
 			useCallSession(a)
 			return h(a)
 		}
+	}
+	if Disabled("") {
+		// ortg.disable: the model gets one line and no tools. Exiting instead
+		// would make Claude Code cache the failure and skip this server for
+		// 15 minutes in every repository. The hidden gate stays so the
+		// host's gate hook gets its (always allowing) answer.
+		var gate []base.Tool
+		for _, t := range tools {
+			if t.Hidden {
+				gate = append(gate, t)
+			}
+		}
+		return base.Serve(os.Stdin, os.Stdout, "ortg", version, gate, disabledReply)
 	}
 	return base.Serve(os.Stdin, os.Stdout, "ortg", version, tools)
 }

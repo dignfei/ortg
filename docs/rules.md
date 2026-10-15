@@ -46,7 +46,7 @@
 
 阶段完成提示在全批成功后按最终状态只生成一次：本批首次补齐全部认知档文件时，优先给最终修订与收尾提炼提示；否则首次补齐全部文档时给文档修订与核心代码阶段提示。重写已有条目不重复触发，失败批次不发成功或阶段完成提示。批量接口继续要求文档 → 修订 → 核心 → 修订 → 普通 → 最终修订；核心选择与语义修订依然由模型依据真实正文执行。
 
-仓库根（`FindRepoRoot`：有 ortg.tsv 的目录，否则 git 根）或 git 顶层有 `ortg.disable` 时永不启用 ORTG（`Disabled`），有表也一样：`ortg mcp` 启动即退出 0，不握手、不输出任何协议，工具说明与协议都不进模型上下文；`HookReplyFull` 对所有事件返回空（Stop 由 main 照常补 `{}`，Codex 要求）；`Gate` 一律放行；`openTable` 报 `errDisabled`，所以 CLI 与 MCP 的读写入口都拒绝、不建表不改表；会话中途才放的文件，已连上的 MCP 对 ortg_overview（含 `init=true`）、ortg_status 回 `disabledReply`。实测宿主不反复重启退出的 MCP：Claude Code 会话开始连试两次、Codex 一次，之后不再启动；没连上的 MCP 让 gate 钩子静默失败，不拦工具、不报给模型。
+仓库根（`FindRepoRoot`：有 ortg.tsv 的目录，否则 git 根）或 git 顶层有 `ortg.disable` 时永不启用 ORTG（`Disabled`），有表也一样：`ortg mcp` 照常握手，initialize 结果的 `instructions` 只有 `disabledReply` 一句，tools/list 为空（只留隐藏的 ortg_gate，一律放行），模型看不到任何 ortg 工具说明；`HookReplyFull` 对所有事件返回空（Stop 由 main 照常补 `{}`，Codex 要求）；`Gate` 一律放行；`openTable` 报 `errDisabled`，所以 CLI 与 MCP 的读写入口都拒绝、不建表不改表；会话中途才放的文件，已连上的 MCP 对 ortg_overview（含 `init=true`）、ortg_status 回 `disabledReply`。不让 MCP 直接退出的理由（实测）：Claude Code 把启动失败的 MCP 记进全局缓存 `~/.claude/mcp-needs-auth-cache.json`（键 `plugin:ortg:ortg`），此后 15 分钟内任何仓库的新会话都跳过连接 ortg；退出本身不会被反复重启（会话开始 Claude 连试两次、Codex 一次）。
 
 无表即未启用 ORTG：MCP 的 ortg_overview 不带 `init=true`、ortg_status 只回 `noTableReply`（未启用，不要再调用），不建表、不写任何文件；其余 MCP 工具报同一句（`errNoTable`，不再要求模型去建表）。理由：工具说明原写"开工先调用"，模型在任何仓库都会调 ortg_overview，旧实现随手建出 ortg.tsv，连只读的 ortg_status 也建表。只有用户明确要求创建（初始化）或对齐纲要时，模型以 `ortg_overview init=true` 建表，用户自己跑 `ortg scan` 也建表：根目录有 overview.txt 则整份导入为目标纲要，否则用模板建空表；随后把 `ortg.tsv.*` 写入 `.git/info/exclude`。
 
