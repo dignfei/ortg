@@ -2862,6 +2862,10 @@ func codeSearch(command string) bool {
 // ($VAR, backquotes, cd -) leaves the repository: what follows is not judged,
 // so "cd $R && grep x ortg.tsv" in another repository touches nothing here.
 func shellTargets(command, root string, inRepo func(string) (string, bool), mentioned func(string) []string) (touched, writes []string) {
+	return shellTargetsIn(command, root, inRepo, mentioned, 0)
+}
+
+func shellTargetsIn(command, root string, inRepo func(string) (string, bool), mentioned func(string) []string, depth int) (touched, writes []string) {
 	dir := root
 	var stack []string // pushd saves where popd returns
 	seen, wseen := map[string]bool{}, map[string]bool{}
@@ -2909,6 +2913,7 @@ func shellTargets(command, root string, inRepo func(string) (string, bool), ment
 			writes = append(writes, rel)
 		}
 	}
+segments:
 	for _, seg := range shellSegments(command) {
 		w := seg.words
 		for len(w) > 0 && (w[0] == "sudo" || w[0] == "time" || w[0] == "command") {
@@ -2935,8 +2940,42 @@ func shellTargets(command, root string, inRepo func(string) (string, bool), ment
 		if !here(".") {
 			continue // this command runs outside the repository
 		}
-		for _, p := range mentioned(strings.Join(w, " ")) {
-			add(p)
+		if depth < 3 && shellInterpreters[verb] {
+			for i, a := range w[1:] {
+				if strings.HasPrefix(a, "-") && strings.ContainsRune(a, 'c') && i+2 < len(w) {
+					t, ws := shellTargetsIn("cd "+strconv.Quote(dir)+"; "+w[i+2], root, inRepo, mentioned, depth+1)
+					for _, p := range t {
+						add(p)
+					}
+					for _, p := range ws {
+						if !wseen[p] {
+							wseen[p] = true
+							writes = append(writes, p)
+						}
+					}
+					continue segments
+				}
+			}
+		}
+		if script, ok := shellPythonScript(w, seg.stdin); ok {
+			for _, access := range pythonLiteralAccesses(script) {
+				if a, ok := resolve(access.path); ok {
+					if rel, inside := inRepo(a); inside {
+						for _, p := range mentioned(rel) {
+							if p == rel {
+								add(p)
+							}
+						}
+					}
+				}
+				if access.write {
+					write(access.path, false)
+				}
+			}
+		} else {
+			for _, p := range mentioned(strings.Join(w, " ")) {
+				add(p)
+			}
 		}
 		switch verb {
 		case "git", "xargs":
@@ -2957,6 +2996,148 @@ func shellTargets(command, root string, inRepo func(string) (string, bool), ment
 		}
 	}
 	return touched, writes
+}
+
+// Inline Python is code, not shell operands. Literal filesystem calls are
+// candidates; printed strings, comments and unresolved dynamic paths are not.
+func shellPythonScript(words []string, stdin string) (string, bool) {
+	verb := filepath.Base(words[0])
+	if verb != "python" && !strings.HasPrefix(verb, "python3") && !strings.HasPrefix(verb, "python2") {
+		return "", false
+	}
+	for i := 1; i < len(words); i++ {
+		a := words[i]
+		if a == "-c" && i+1 < len(words) {
+			return words[i+1], true
+		}
+		if strings.HasPrefix(a, "-c") && len(a) > 2 {
+			return a[2:], true
+		}
+		if a == "-m" || a == "-" || !strings.HasPrefix(a, "-") {
+			break
+		}
+		if a == "-W" || a == "-X" {
+			i++
+		}
+	}
+	if stdin != "" {
+		for i := 1; i < len(words); i++ {
+			a := words[i]
+			if a == "-" || strings.HasPrefix(a, "<<") {
+				return stdin, true
+			}
+			if a == "-m" || !strings.HasPrefix(a, "-") {
+				return "", false
+			}
+			if a == "-W" || a == "-X" {
+				i++
+			}
+		}
+		return stdin, true
+	}
+	return "", false
+}
+
+type pythonAccess struct {
+	path  string
+	write bool
+}
+
+func pythonLiteralAccesses(src string) []pythonAccess {
+	type token struct {
+		text    string
+		literal bool
+	}
+	var tokens []token
+	for i := 0; i < len(src); {
+		c := src[i]
+		if c == '#' {
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			if i+2 < len(src) && src[i:i+3] == strings.Repeat(string(c), 3) {
+				end := strings.Index(src[i+3:], src[i:i+3])
+				if end < 0 {
+					break
+				}
+				i += end + 6
+				tokens = append(tokens, token{})
+				continue
+			}
+			j := i + 1
+			var value strings.Builder
+			valid := true
+			for j < len(src) && src[j] != c {
+				r, _, tail, err := strconv.UnquoteChar(src[j:], c)
+				if err != nil {
+					valid = false
+					j++
+					continue
+				}
+				value.WriteRune(r)
+				j = len(src) - len(tail)
+			}
+			if j == len(src) {
+				break
+			}
+			if valid {
+				tokens = append(tokens, token{value.String(), true})
+			} else {
+				tokens = append(tokens, token{})
+			}
+			i = j + 1
+			continue
+		}
+		if c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' {
+			j := i + 1
+			for j < len(src) && (src[j] == '_' || src[j] >= 'a' && src[j] <= 'z' || src[j] >= 'A' && src[j] <= 'Z' || src[j] >= '0' && src[j] <= '9') {
+				j++
+			}
+			tokens = append(tokens, token{text: src[i:j]})
+			i = j
+			continue
+		}
+		if !unicode.IsSpace(rune(c)) {
+			tokens = append(tokens, token{text: string(c)})
+		}
+		i++
+	}
+	var out []pythonAccess
+	for i := 0; i+3 < len(tokens); i++ {
+		t := tokens[i]
+		if t.literal || tokens[i+1].text != "(" || !tokens[i+2].literal {
+			continue
+		}
+		file, method, at := tokens[i+2].text, t.text, i+3
+		if method == "Path" {
+			if at+3 >= len(tokens) || tokens[at].text != ")" || tokens[at+1].text != "." || tokens[at+3].text != "(" {
+				continue
+			}
+			method, at = tokens[at+2].text, at+4
+		} else if method != "open" || i > 0 && tokens[i-1].text == "." && (i < 2 || tokens[i-2].text != "io" && tokens[i-2].text != "builtins") {
+			continue
+		}
+		write := method == "write_text" || method == "write_bytes"
+		if !write && method != "open" && method != "read_text" && method != "read_bytes" {
+			continue
+		}
+		if method == "open" && at < len(tokens) {
+			if tokens[at].text == "," {
+				at++
+			}
+			if at+2 < len(tokens) && tokens[at].text == "mode" && tokens[at+1].text == "=" {
+				at += 2
+			}
+			if at < len(tokens) && tokens[at].literal && strings.ContainsAny(tokens[at].text, "wxa+") {
+				write = true
+			}
+		}
+		out = append(out, pythonAccess{file, write})
+	}
+	return out
 }
 
 // shellWrites reports, through write, the paths one simple command writes:
@@ -3135,8 +3316,9 @@ func redirectOut(a string) bool {
 
 type shellSegment struct {
 	words []string
-	piped bool // reads the previous command's output
-	bg    bool // ended by a lone & : the shell does not wait for it
+	piped bool   // reads the previous command's output
+	bg    bool   // ended by a lone & : the shell does not wait for it
+	stdin string // literal heredoc data, interpreted only by a recognised reader
 }
 
 // shellSegments splits a command line into simple commands at unquoted
@@ -3148,7 +3330,10 @@ func shellSegments(cmd string) []shellSegment {
 	cur := shellSegment{}
 	var word strings.Builder
 	inWord := false
-	var heredocs []string // delimiters whose bodies start at the next newline
+	var heredocs []struct {
+		delim   string
+		segment int
+	}
 	expectDelim := false
 	flushWord := func() {
 		if !inWord {
@@ -3160,12 +3345,18 @@ func shellSegments(cmd string) []shellSegment {
 		inWord = false
 		switch {
 		case expectDelim:
-			heredocs, expectDelim = append(heredocs, w), false
+			heredocs, expectDelim = append(heredocs, struct {
+				delim   string
+				segment int
+			}{w, len(segs)}), false
 		case w == "<<" || w == "<<-":
 			expectDelim = true
 		case strings.HasPrefix(w, "<<") && !strings.HasPrefix(w, "<<<"):
 			if d := strings.TrimPrefix(w[2:], "-"); d != "" {
-				heredocs = append(heredocs, d)
+				heredocs = append(heredocs, struct {
+					delim   string
+					segment int
+				}{d, len(segs)})
 			}
 		}
 	}
@@ -3216,14 +3407,17 @@ func shellSegments(cmd string) []shellSegment {
 			// line holding just its delimiter.
 			k := i + 1
 			for _, d := range heredocs {
+				body := k
 				for k < len(rs) {
+					lineStart := k
 					e := k
 					for e < len(rs) && rs[e] != '\n' {
 						e++
 					}
 					line := strings.TrimSpace(string(rs[k:e]))
 					k = e + 1
-					if line == d {
+					if line == d.delim {
+						segs[d.segment].stdin += string(rs[body:lineStart])
 						break
 					}
 				}
@@ -5307,8 +5501,16 @@ func shellNote(x *base.Index, in base.HookInput, cwd string) string {
 			}
 		}
 	}
-	for _, rel := range x.MentionedPaths(cmd) {
-		consider(rel, true)
+	accessCommand := cmd
+	if cwd != "" && cwd != x.Root() {
+		accessCommand = "cd " + strconv.Quote(cwd) + "; " + cmd
+	}
+	inRepo := func(p string) (string, bool) { return base.Rel(x.Root(), p) }
+	paths, writes := shellTargets(accessCommand, x.Root(), inRepo, x.MentionedPaths)
+	for _, rel := range append(paths, writes...) {
+		if rel != "." {
+			consider(rel, true)
+		}
 	}
 	for _, rel := range x.TouchedPaths() {
 		consider(rel, false)
