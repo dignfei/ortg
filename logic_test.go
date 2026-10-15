@@ -2615,7 +2615,7 @@ func TestDisciplineOncePerContext(t *testing.T) {
 		return HookReply("post", base.HookInput{ToolName: "Edit", FilePath: a, Cwd: root, SessionID: session, AgentID: agent, TranscriptPath: tr})
 	}
 	full := func(out string) bool {
-		return strings.Count(out, "纲要行纪律：") == 1 && strings.Count(out, "任务依赖闭环：") == 1 && strings.Count(out, "多入口契约：") == 1 && strings.Count(out, "逐项对照该集合") == 1 && strings.Contains(out, "未执行项保留未验证") && strings.Count(out, "相关仓库相对路径及关联理由") == 1 && strings.Count(out, "工厂或装饰器返回可调用对象时") == 1 && strings.Contains(out, "Signature.bind 不得相对公开契约额外收窄合法调用") && strings.Contains(out, "未执行的调用形状保留未验证") && strings.Count(out, "公开接口对同一参数规定多种值形态或重载时") == 1 && strings.Contains(out, "API/Constraints 和目标计划") && strings.Contains(out, "不能仅凭容器类型一律拆分") && strings.Contains(out, "未验证形态保持未知") && strings.Contains(out, "公开反例须转为实际断言后复验") && strings.Contains(out, "不扩为无关形态、全组合或全库测试")
+		return strings.Count(out, "纲要行纪律：") == 1 && strings.Count(out, "任务依赖闭环：") == 1 && strings.Count(out, "多入口契约：") == 1 && strings.Count(out, "逐项对照该集合") == 1 && strings.Contains(out, "未执行项保留未验证") && strings.Count(out, "相关仓库相对路径及关联理由") == 1 && strings.Count(out, "工厂或装饰器返回可调用对象时") == 1 && strings.Contains(out, "Signature.bind 不得相对公开契约额外收窄合法调用") && strings.Contains(out, "未执行的调用形状保留未验证") && strings.Count(out, "公开接口对同一参数规定多种值形态或重载时") == 1 && strings.Contains(out, "API/Constraints 和目标计划") && strings.Contains(out, "不能仅凭容器类型一律拆分") && strings.Contains(out, "未验证形态保持未知") && strings.Contains(out, "公开反例须转为实际断言后复验") && strings.Contains(out, "不扩为无关形态、全组合或全库测试") && strings.Count(out, "最短必要链") == 1 && strings.Contains(out, "“不要求完整子系统”不等于“禁止必要 helper”") && strings.Contains(out, "显式禁止须遵守") && strings.Contains(out, "不凭假想外围流程扩展恢复范围") && strings.Contains(out, "含函数对象传递/注册，不能只搜调用括号")
 	}
 	if out := edit("s1", ""); !full(out) || strings.Contains(out, disciplineSeen) {
 		t.Fatalf("the first edit carries the discipline once, nothing doubled:\n%s", out)
@@ -4178,7 +4178,7 @@ func TestFailedTestsRemainUntilSameCommandPasses(t *testing.T) {
 			t.Fatalf("unexpected stop for %+v: %q", c, got)
 		}
 	}
-	if got := stop(session, false); !strings.Contains(got, cmd) || !strings.Contains(got, "55 failed") || !strings.Contains(got, "4 errors") {
+	if got := stop(session, false); !strings.Contains(got, cmd) || !strings.Contains(got, "55 failed") || !strings.Contains(got, "4 errors") || !strings.Contains(got, "按首个异常和实际调用路径分组核证") || !strings.Contains(got, "不能用一个外围或环境缺口替整批其他首因免责") {
 		t.Fatalf("the actual failed command and summary must survive: %q", got)
 	}
 	if got := stop(session, false); got != "" {
