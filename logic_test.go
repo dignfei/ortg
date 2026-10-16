@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"ortg/base"
 	"ortg/migrate"
@@ -4231,6 +4233,80 @@ func TestFailedTestsRemainUntilSameCommandPasses(t *testing.T) {
 	postAt("a", "=== 80 passed in 1.2s ===")
 	if len(loadFailedTests(root, session).Runs) != 0 {
 		t.Fatal("the original working directory's successful run should clear its failure")
+	}
+}
+
+func TestFailedTestsStopBudget(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root, _ := gitRepo(t, map[string]string{"a.py": "x = 1\n"})
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(root, "a.py"), []byte("x = 2\n"), 0o644)
+	for _, text := range []string{"x", "多字节"} {
+		t.Run(text, func(t *testing.T) {
+			session := "stop-budget-" + text
+			var commands []string
+			for i := 0; i < 40; i++ {
+				cmd := fmt.Sprintf("pytest cases/item_%02d.py --label=%s", i, strings.Repeat(text, 220))
+				commands = append(commands, cmd)
+				recordTestResult(root, session, root, cmd, "=== 1 failed in 0.2s ===\n")
+			}
+			if got := failedTestStopNoteBudget(root, base.HookInput{SessionID: session}, 512); got != "" {
+				t.Fatal("a budget smaller than the explanation must not mark anything")
+			}
+			first := failedTestStopNote(root, base.HookInput{SessionID: session})
+			if !utf8.ValidString(first) || len(first) > 12<<10 || strings.Count(first, "- "+root+" 下") <= 3 {
+				t.Fatalf("UTF-8 byte budget should replace the three-run cap: %d bytes, %q", len(first), first)
+			}
+			if strings.Count(first, stopFailedWholeNote) != 1 {
+				t.Fatal("unknown-node instructions must be shared once")
+			}
+			if !strings.Contains(first, "本次未列") {
+				t.Fatal("overflow must be explicit")
+			}
+			seen := map[string]bool{}
+			note := first
+			for page := 0; note != ""; page++ {
+				if page >= len(commands) || len(note) > 12<<10 || !utf8.ValidString(note) {
+					t.Fatal("bounded pages must make progress")
+				}
+				for _, cmd := range commands {
+					if strings.Contains(note, "`"+cmd+"`") {
+						if seen[cmd] {
+							t.Fatal("the same command+At was delivered twice")
+						}
+						seen[cmd] = true
+					}
+				}
+				for _, r := range loadFailedTests(root, session).Runs {
+					key := fmt.Sprintf("stopfail:%x:%d", sha1.Sum([]byte(root+"\x00"+r.Command)), r.At.UnixNano())
+					_, err := os.Stat(filepath.Join(os.TempDir(), "ortg-hook-"+session, fmt.Sprintf("%x", sha1.Sum([]byte(key)))))
+					if (err == nil) != seen[r.Command] {
+						t.Fatal("only entries included in a reply may be marked")
+					}
+				}
+				note = failedTestStopNote(root, base.HookInput{SessionID: session})
+			}
+			if len(seen) != len(commands) || len(loadFailedTests(root, session).Runs) != len(commands) {
+				t.Fatal("overflow must remain available without clearing failures")
+			}
+			recordTestResult(root, session, root, commands[0], "=== 1 failed in 0.2s ===\n")
+			if got := failedTestStopNote(root, base.HookInput{SessionID: session}); !strings.Contains(got, commands[0]) || strings.Count(got, "- "+root+" 下") != 1 {
+				t.Fatal("a new At for the same command must be reminded again")
+			}
+		})
+	}
+	const session = "stop-long-command"
+	cmd := "pytest cases/long.py --label=" + strings.Repeat("长载荷", 20000)
+	recordTestResult(root, session, root, cmd, "=== 1 failed in 0.2s ===\n")
+	note := failedTestStopNote(root, base.HookInput{SessionID: session})
+	if !utf8.ValidString(note) || len(note) > 12<<10 || !strings.Contains(note, "pytest cases/long.py") || !strings.Contains(note, "1 failed") || !strings.Contains(note, "非完整命令") {
+		t.Fatalf("a huge command must yield an explicit readable excerpt: %d bytes", len(note))
+	}
+	if got := failedTestStopNote(root, base.HookInput{SessionID: session}); got != "" {
+		t.Fatal("an excerpt uses the original command identity, not its shortened text")
 	}
 }
 

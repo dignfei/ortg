@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"ortg/base"
 	"ortg/migrate"
@@ -1946,7 +1947,26 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	}
 }
 
+const stopFailedTestsMax = 12 << 10 // failure reply's UTF-8 byte ceiling; not its JSON envelope
+
 func failedTestStopNote(root string, in base.HookInput) string {
+	return failedTestStopNoteBudget(root, in, stopFailedTestsMax)
+}
+
+// stopExcerpt limits display only; the original command and timestamp remain
+// the reminder identity and the evidence required to discharge the failure.
+func stopExcerpt(s string, maxBytes int) (string, bool) {
+	if len(s) <= maxBytes {
+		return s, false
+	}
+	n := maxBytes - len("…")
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…", true
+}
+
+func failedTestStopNoteBudget(root string, in base.HookInput, budget int) string {
 	if in.StopHookActive || in.SessionID == "" {
 		return ""
 	}
@@ -1980,36 +2000,66 @@ func failedTestStopNote(root string, in base.HookInput) string {
 	}
 	sort.Strings(commands)
 	var lines []string
+	bodyBytes, whole := 0, false
+	baseBytes := len(fmt.Sprintf(stopFailedTestsNote, len(v.Runs), ""))
 	for _, commandKey := range commands {
 		r := v.Runs[commandKey]
 		key := fmt.Sprintf("stopfail:%x:%d", sha1.Sum([]byte(commandKey)), r.At.UnixNano())
-		if len(lines) < 3 && base.InjectOnce(in.SessionID, key) {
-			line := fmt.Sprintf(stopFailedTestsRun, r.Cwd, r.Command, r.Summary)
-			if r.Signature != "" && len(r.FailedNodeIDs) > 0 {
-				var shown []string
-				size := 0
-				for _, id := range r.FailedNodeIDs {
-					quoted := strconv.Quote(id)
-					if len(shown) == 8 || size+len(quoted) > 2048 {
-						break
-					}
-					shown = append(shown, quoted)
-					size += len(quoted)
-				}
-				line += fmt.Sprintf(stopFailedNodesNote, len(r.FailedNodeIDs), len(shown), strings.Join(shown, ", "))
-				if len(shown) < len(r.FailedNodeIDs) {
-					line += stopFailedNodesMore
-				}
-			} else {
-				line += stopFailedWholeNote
-			}
-			lines = append(lines, line)
+		cwd, cutCwd := stopExcerpt(r.Cwd, 512)
+		command, cutCommand := stopExcerpt(r.Command, 2048)
+		summary, cutSummary := stopExcerpt(r.Summary, 512)
+		line := fmt.Sprintf(stopFailedTestsRun, cwd, command, summary)
+		if cutCwd || cutCommand || cutSummary {
+			line += stopFailedExcerptNote
 		}
+		unknownNodes := r.Signature == "" || len(r.FailedNodeIDs) == 0
+		if !unknownNodes {
+			var shown []string
+			size := 0
+			for _, id := range r.FailedNodeIDs {
+				quoted := strconv.Quote(id)
+				if len(shown) == 8 || size+len(quoted) > 2048 {
+					break
+				}
+				shown = append(shown, quoted)
+				size += len(quoted)
+			}
+			line += fmt.Sprintf(stopFailedNodesNote, len(r.FailedNodeIDs), len(shown), strings.Join(shown, ", "))
+			if len(shown) < len(r.FailedNodeIDs) {
+				line += stopFailedNodesMore
+			}
+		}
+		n := len(lines) + 1
+		nextBytes := bodyBytes + len(line)
+		if len(lines) > 0 {
+			nextBytes++ // separator
+		}
+		size := baseBytes + nextBytes
+		if whole || unknownNodes {
+			size += len(stopFailedWholeNote)
+		}
+		if n < len(v.Runs) {
+			size += len(fmt.Sprintf(stopFailedTestsMore, n, len(v.Runs)-n))
+		}
+		// Test the complete reply before consuming the once marker. Skipping
+		// an oversized entry must not prevent a later shorter one from fitting.
+		if size > budget || !base.InjectOnce(in.SessionID, key) {
+			continue
+		}
+		lines = append(lines, line)
+		bodyBytes, whole = nextBytes, whole || unknownNodes
 	}
 	if len(lines) == 0 {
 		return ""
 	}
-	return fmt.Sprintf(stopFailedTestsNote, len(v.Runs), strings.Join(lines, "\n"))
+	body := strings.Join(lines, "\n")
+	if whole {
+		body += stopFailedWholeNote
+	}
+	if len(lines) < len(v.Runs) {
+		body += fmt.Sprintf(stopFailedTestsMore, len(lines), len(v.Runs)-len(lines))
+	}
+	return fmt.Sprintf(stopFailedTestsNote, len(v.Runs), body)
 }
 
 // editsInPlace reports whether a shell command edits file in place with
@@ -5589,7 +5639,8 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 	}
 	root := base.FindRepoRoot(start)
 	if event == "stop" {
-		return strings.TrimSpace(stopNote(root, in) + "\n" + failedTestStopNote(root, in)), ""
+		background := stopNote(root, in)
+		return strings.TrimSpace(background + "\n" + failedTestStopNoteBudget(root, in, stopFailedTestsMax-len(background)-1)), ""
 	}
 	open := base.Open // the other events only read: an old table stays as it is
 	if event == "session" {
