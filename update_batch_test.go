@@ -586,6 +586,9 @@ func TestUpdateWriteObligations(t *testing.T) {
 	if msg, failed := nativeUpdate(t, root, map[string]any{"path": "a.go", "outline": updateLine("a.go", "understood B")}); failed {
 		t.Fatal(msg)
 	}
+	if _, err := Align("paths", []string{"a.go"}); err != nil {
+		t.Fatalf("acknowledged unchanged content was deferred before Post: %v", err)
+	}
 	late.SessionID = "another parent"
 	HookReply("post", late)
 	if _, err := Align("paths", []string{"a.go"}); err != nil {
@@ -600,6 +603,9 @@ func TestUpdateWriteObligations(t *testing.T) {
 		t.Fatal(msg)
 	}
 	writeFile(t, restored.FilePath, "content B")
+	if _, err := Align("paths", []string{"a.go"}); err == nil || !strings.Contains(err.Error(), "尚未完成配对") {
+		t.Fatalf("restoring the pre image after Update must defer Align before Post: %v", err)
+	}
 	HookReply("post", restored)
 	if _, err := Align("paths", []string{"a.go"}); err == nil {
 		t.Fatal("restoring the pre image after Update must create a new obligation")

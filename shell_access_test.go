@@ -256,8 +256,23 @@ func TestPairedWriteAlignment(t *testing.T) {
 			}
 			_, proofBefore := base.OverviewMark(root, "writes")
 			_, err = Align("paths", []string{path})
-			if (err != nil) != tc.wantPending {
+			unfinished := tc.wrongPost || tc.wrongSession
+			if (err != nil) != (tc.wantPending || unfinished) {
 				t.Fatalf("pending=%v, Align error=%v", tc.wantPending, err)
+			}
+			if unfinished {
+				if !strings.Contains(err.Error(), "尚未完成配对") || strings.Contains(err.Error(), "已记录尚未提交") {
+					t.Fatalf("an unmatched completion is only a temporary deferral: %v", err)
+				}
+				if err := withWriteProofs(root, func(s *writeProofs) (bool, error) {
+					if len(s.Pending) != 0 {
+						t.Fatal("an unmatched completion created permanent evidence")
+					}
+					return false, nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return
 			}
 			if !tc.wantPending {
 				return
@@ -299,6 +314,78 @@ func TestPairedWriteAlignment(t *testing.T) {
 			HookReply("post", post) // duplicate completion cannot revive the obligation
 			if _, err := Align("paths", []string{path}); err != nil {
 				t.Fatalf("successful update did not clear the obligation: %v", err)
+			}
+		})
+	}
+}
+
+func TestInFlightWriteAlignment(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real CLI subprocess build")
+	}
+	bin := filepath.Join(t.TempDir(), "ortg")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = worktreeDir(t)
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("current CLI build: %v %s", err, out)
+	}
+	for _, tc := range []struct {
+		name, source, script string
+		deferAlignment       bool
+	}{
+		{"changed before inner align", "content", "printf changed > a.go", true},
+		{"same content", "content", "printf content > a.go", false},
+		{"old drift without a write", "independent drift", "false && printf changed > a.go", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ORTG_STATE_DIR", t.TempDir())
+			t.Setenv("ORTG_CBM", "off")
+			root := updateRepo(t, "a.go")
+			if _, err := scanWithHeader(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Update("a.go", updateLine("a.go", "original")); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, filepath.Join(root, "a.go"), tc.source)
+			command := tc.script + "; " + strconv.Quote(bin) + " align a.go"
+			in := base.HookInput{Cwd: root, SessionID: "writer", ToolUseID: "compound", ToolName: "Bash", Command: command}
+			HookReply("pre", in)
+			tableBefore, _ := os.ReadFile(filepath.Join(root, base.TableName))
+			shell := exec.Command("sh", "-c", command)
+			shell.Dir = root
+			out, err := shell.CombinedOutput()
+			if (err != nil) != tc.deferAlignment {
+				t.Fatalf("inner Align deferred=%v: %v %s", tc.deferAlignment, err, out)
+			}
+			if tc.deferAlignment {
+				if !strings.Contains(string(out), "尚未完成配对") || strings.Contains(string(out), "已记录尚未提交") {
+					t.Fatalf("in-flight refusal must differ from confirmed Post evidence: %s", out)
+				}
+				tableAfter, _ := os.ReadFile(filepath.Join(root, base.TableName))
+				if string(tableBefore) != string(tableAfter) {
+					t.Fatal("inner Align advanced fingerprints before completion")
+				}
+				if err := withWriteProofs(root, func(s *writeProofs) (bool, error) {
+					if len(s.Pending) != 0 {
+						t.Fatal("an unfinished operation became permanent evidence")
+					}
+					return false, nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			HookReply("post", in)
+			if tc.deferAlignment {
+				if status, err := Status(); err != nil || !strings.Contains(status, "过期 1") {
+					t.Fatalf("post must retain stale content after a refused inner Align: %v %s", err, status)
+				}
+				if _, err := Align("paths", []string{"a.go"}); err == nil || !strings.Contains(err.Error(), "已记录尚未提交") {
+					t.Fatalf("completed paired write must then require Update: %v", err)
+				}
+			} else if _, err := Align("paths", []string{"a.go"}); err != nil {
+				t.Fatalf("no actual operation change acquired an obligation: %v", err)
 			}
 		})
 	}

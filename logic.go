@@ -5424,21 +5424,51 @@ func Align(mode string, paths []string) (string, error) {
 					}
 				}
 			}
-			var blocked []string
+			// The outer shell may invoke the CLI before its own post hook.
+			// Changed in-flight images defer alignment without attributing a
+			// completed write or creating a permanent obligation.
+			images := map[string][]string{}
+			for _, b := range s.Before {
+				if b.Input == "" || time.Since(b.At) > staleMarkAge {
+					continue
+				}
+				for p, token := range b.Files {
+					if acknowledged := b.Updated[p]; acknowledged != "" {
+						token = acknowledged
+					}
+					images[p] = append(images[p], token)
+				}
+			}
+			var blocked, unfinished []string
 			for _, p := range paths {
 				rel, err := normRel(x.Root(), p)
 				if err != nil {
 					continue // preserve Align's legacy handling of unrelated paths
 				}
-				if _, pending := s.Pending[rel]; !pending || x.Excluded(rel, reconcileOpts) || x.Observed(rel, reconcileOpts) {
+				_, pending := s.Pending[rel]
+				if !pending && len(images[rel]) == 0 || x.Excluded(rel, reconcileOpts) || x.Observed(rel, reconcileOpts) {
 					continue
 				}
-				if f, _ := x.Inspect(rel); f.Exists {
+				f, _ := x.Inspect(rel)
+				if !f.Exists {
+					continue
+				}
+				if pending {
 					blocked = append(blocked, rel)
+				} else if f.ContentToken != "" {
+					for _, token := range images[rel] {
+						if token != f.ContentToken {
+							unfinished = append(unfinished, rel)
+							break
+						}
+					}
 				}
 			}
 			if len(blocked) != 0 {
 				return fmt.Errorf(alignNeedsUpdate, strings.Join(blocked, "、"))
+			}
+			if len(unfinished) != 0 {
+				return fmt.Errorf(alignInFlightWrite, strings.Join(unfinished, "、"))
 			}
 			n = len(paths)
 			return x.Align(paths)

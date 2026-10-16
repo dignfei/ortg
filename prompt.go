@@ -457,4 +457,6 @@ const dirRowMismatch = "%s：目录要写目录纲要（文件名以 / 结尾，
 
 const alignNeedsUpdate = "ortg: %s 已记录尚未提交新纲要的内容改动；请先调用 ortg_update，不能用 ortg_align 替代。"
 
+const alignInFlightWrite = "ortg: %s 有尚未完成配对的写操作且当前内容已变化，暂不能前移指纹；操作完成后请按实际变更调用 ortg_update。"
+
 const writeStateSaveWarning = "ortg: 纲要已提交，但实写维护记录保存失败（%v）；恢复状态目录后请重新提交对应纲要以清除旧记录。"
