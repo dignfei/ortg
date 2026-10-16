@@ -1866,9 +1866,9 @@ func pytestCollectionCommand(cmd string, depth int) string {
 	return string(b)
 }
 
-func recordTestResult(root, session, cwd, cmd, output string) {
+func recordTestResult(root, session, cwd, cmd, output string) bool {
 	if session == "" {
-		return
+		return false
 	}
 	if cwd == "" {
 		cwd = root
@@ -1894,11 +1894,11 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 		}
 	}
 	if invocations == 0 {
-		return
+		return false
 	}
 	summaries := pytestSummaries(output)
 	if len(summaries) == 0 {
-		return
+		return false
 	}
 	last := summaries[len(summaries)-1]
 	terminalSummary := last.complete && strings.TrimSpace(output[last.end:]) == ""
@@ -1939,16 +1939,16 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	}
 	if len(failures) == 0 {
 		if !terminal || len(summaries) != invocations || counts["passed"] == 0 {
-			return
+			return false
 		}
 		for _, s := range summaries {
 			if !s.complete {
-				return
+				return false
 			}
 		}
 		for k, n := range counts {
 			if n > 0 && k != "passed" && k != "deselected" && k != "warning" && k != "warnings" {
-				return
+				return false
 			}
 		}
 	}
@@ -2041,6 +2041,7 @@ func recordTestResult(root, session, cwd, cmd, output string) {
 	if b, err := json.Marshal(v); err == nil {
 		base.MarkOverview(root, failedTestsMark(session), string(b))
 	}
+	return len(failures) > 0
 }
 
 const stopFailedTestsMax = 12 << 10 // failure reply's UTF-8 byte ceiling; not its JSON envelope
@@ -4417,7 +4418,7 @@ func Scan() (string, error) {
 	if note != "" {
 		note += "\n"
 	}
-	return note + s.report(), nil
+	return note + s.report() + finalStatus(), nil
 }
 
 // Graph starts CBM's permanent daemon and refreshes this repository's call
@@ -4452,7 +4453,7 @@ func Status() (string, error) {
 	defer overviewMu.Unlock()
 	c := sentFor(x.Root())
 	defer saveSent(x.Root(), c)
-	return s.report() + "\n" + taskDependencyHints(x, c, x.Rows(), s), nil
+	return s.report() + "\n" + taskDependencyHints(x, c, x.Rows(), s) + finalStatus(), nil
 }
 
 // sQuota is the S-field rune budget per C importance level, and the only place
@@ -5350,6 +5351,7 @@ func headerFirstText(x *base.Index) string {
 // A permission or a stale fingerprint is not evidence of a write. These marks
 // retain only paired operations and their observed content transitions.
 type writeBefore struct {
+	Task    bool
 	At      time.Time
 	Input   string
 	Files   map[string]string
@@ -5360,9 +5362,290 @@ type writeChange struct {
 	Before, After, Context, Use string
 }
 
+// A final declaration is separate from plan permission and outline upkeep.
+// Only attributed, paired source deltas create this per-context obligation.
+type finalReviewState struct {
+	Scope              string
+	Revision           uint64
+	Files              map[string]string
+	Reviewed, Prompted string
+	Report             []string
+	Failures           map[string]bool
+}
+
+func finalContext(in base.HookInput) string {
+	if in.AgentID != "" {
+		return in.AgentID
+	}
+	return in.SessionID
+}
+
+func finalGeneration(f finalReviewState) string {
+	if len(f.Files) == 0 {
+		return ""
+	}
+	paths := make([]string, 0, len(f.Files))
+	for p := range f.Files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\x00%d\x00", f.Scope, f.Revision)
+	for _, p := range paths {
+		fmt.Fprintf(&b, "%s\x00%s\n", p, f.Files[p])
+	}
+	return fmt.Sprintf("%x", sha1.Sum([]byte(b.String())))
+}
+
+// Reuse known source-language extensions, excluding generic configuration
+// and manifest names that the broader commit-test policy also calls code.
+func finalSourceFile(rel string) bool {
+	ext := strings.ToLower(path.Ext(rel))
+	return codeExts[ext] && ext != ".toml" && ext != ".cfg" && ext != ".ini"
+}
+
+func finalChanges(s *writeProofs, root, context string, files map[string]string) {
+	if context == "" || len(files) == 0 {
+		return
+	}
+	f := s.Final[context]
+	f.Scope = root + "\x00" + context
+	if f.Files == nil {
+		f.Files = map[string]string{}
+	}
+	changed := false
+	for p, token := range files {
+		if f.Files[p] != token {
+			f.Files[p] = token
+			changed = true
+		}
+	}
+	if changed {
+		f.Revision++
+		s.Final[context] = f
+	}
+}
+
+// Recheck only already attributed paths. This catches another context changing
+// the same source image without adopting unrelated work or scanning the repo.
+func refreshFinal(x *base.Index, f *finalReviewState) (bool, int) {
+	changed, unknown := false, 0
+	for p, old := range f.Files {
+		fact, _ := x.Inspect(p)
+		if fact.ContentToken == "" {
+			unknown++
+			continue
+		}
+		if fact.ContentToken != old {
+			f.Files[p] = fact.ContentToken
+			changed = true
+		}
+	}
+	if changed {
+		f.Revision++
+	}
+	return changed, unknown
+}
+
+const finalReviewMax = 4 << 10
+
+func finalReviewText(f finalReviewState, unknown int) string {
+	g := finalGeneration(f)
+	status := finalReviewPending
+	if f.Reviewed == g && unknown == 0 {
+		status = finalReviewDone
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, finalReviewHead, g, status)
+	extra := ""
+	if unknown > 0 {
+		extra = fmt.Sprintf(finalReviewUnknown, unknown) + "\n"
+	}
+	reserve := len(fmt.Sprintf(finalReviewCount, len(f.Files), 8, len(f.Files)) + extra + finalReviewInstruction)
+	paths := make([]string, 0, len(f.Files))
+	for p := range f.Files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	shown := 0
+	for _, p := range paths {
+		line := fmt.Sprintf(finalReviewPath, strconv.Quote(p))
+		if shown == 8 || b.Len()+len(line)+reserve > finalReviewMax {
+			continue
+		}
+		b.WriteString(line)
+		shown++
+	}
+	fmt.Fprintf(&b, finalReviewCount, len(f.Files), shown, len(f.Files)-shown)
+	b.WriteString(extra + finalReviewInstruction)
+	return b.String()
+}
+
+func finalReview(generation string, report []string) (string, error) {
+	if len(callSession.ids) == 0 || callSession.ids[0] == "" {
+		return "", errors.New(finalReviewNoSession)
+	}
+	context := callSession.ids[0]
+	inspect := generation == "" && len(report) == 0
+	report = slices.Clone(report)
+	for i, line := range report {
+		report[i] = strings.TrimSpace(line)
+		if report[i] == "" {
+			return "", errors.New(finalReviewBadReport)
+		}
+	}
+	text := strings.Join(report, "\n")
+	if !inspect && (generation == "" || text == "" || len(text) > finalReviewMax || !utf8.ValidString(text)) {
+		return "", errors.New(finalReviewBadReport)
+	}
+	x, err := openIndex(repoRoot())
+	if err != nil {
+		return "", err
+	}
+	out := finalReviewNone
+	var invalid error
+	err = withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
+		f, exists := s.Final[context]
+		if !exists || len(f.Files) == 0 {
+			if !inspect {
+				invalid = errors.New(finalReviewMismatch)
+			}
+			return false, nil
+		}
+		changed, unknown := refreshFinal(x, &f)
+		current := finalGeneration(f)
+		switch {
+		case inspect:
+			out = finalReviewText(f, unknown)
+		case unknown > 0:
+			invalid = fmt.Errorf(finalReviewUnknown, unknown)
+		case generation != current:
+			invalid = errors.New(finalReviewMismatch)
+		default:
+			f.Reviewed = current
+			f.Report = report
+			changed = true
+			out = fmt.Sprintf(finalReviewAccepted, current)
+		}
+		s.Final[context] = f
+		return changed, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if invalid != nil {
+		return "", invalid
+	}
+	return out, nil
+}
+
+// Status reflects this caller's phase without consuming Stop delivery or
+// treating outline alignment as a final declaration. Unknown SID stays quiet.
+func finalStatus() string {
+	if len(callSession.ids) == 0 || callSession.ids[0] == "" {
+		return ""
+	}
+	text, err := finalReview("", nil)
+	if err != nil {
+		return "\n" + finalReviewStateWarning + "\n"
+	}
+	if text == finalReviewNone {
+		return ""
+	}
+	head, _, _ := strings.Cut(text, "\n")
+	return "\n" + head + "\n"
+}
+
+func finalReviewStopNoteBudget(root string, in base.HookInput, budget int) string {
+	if in.StopHookActive || in.SessionID == "" || budget <= 0 {
+		return ""
+	}
+	context := finalContext(in)
+	x, err := base.Open(root)
+	if err != nil {
+		return ""
+	}
+	out := ""
+	err = withWriteProofs(root, func(s *writeProofs) (bool, error) {
+		f, exists := s.Final[context]
+		if !exists || len(f.Files) == 0 {
+			return false, nil
+		}
+		changed, unknown := refreshFinal(x, &f)
+		g := finalGeneration(f)
+		key := g
+		if unknown > 0 {
+			key += ":unknown"
+		}
+		if (f.Reviewed == g && unknown == 0) || f.Prompted == key {
+			s.Final[context] = f
+			return changed, nil
+		}
+		text := finalReviewText(f, unknown)
+		if len(text) > min(budget, finalReviewMax) {
+			s.Final[context] = f
+			return changed, nil
+		}
+		out = text
+		f.Prompted = key
+		s.Final[context] = f
+		return true, nil
+	})
+	if err != nil {
+		base.Debugf("final stop: %v", err)
+		if len(finalReviewStateWarning) <= budget {
+			return finalReviewStateWarning
+		}
+		return ""
+	}
+	return out
+}
+
+// Existing pytest recognition/clearance stays unchanged. Only its recognized
+// failure event invalidates an already existing final declaration.
+func finalFailureNote(root string, in base.HookInput) string {
+	context, key := writeIdentity(in)
+	if context == "" {
+		context = finalContext(in)
+	}
+	if context == "" {
+		return ""
+	}
+	unidentified := key == ""
+	invalidated := false
+	err := withWriteProofs(root, func(s *writeProofs) (bool, error) {
+		f, exists := s.Final[context]
+		if !exists || len(f.Files) == 0 {
+			return false, nil
+		}
+		if !unidentified {
+			if f.Failures[key] {
+				return false, nil
+			}
+			if f.Failures == nil {
+				f.Failures = map[string]bool{}
+			}
+			f.Failures[key] = true
+		}
+		invalidated = true
+		f.Revision++
+		s.Final[context] = f
+		return true, nil
+	})
+	if err != nil {
+		base.Debugf("final failure: %v", err)
+		return finalReviewStateWarning
+	}
+	if unidentified && invalidated {
+		return finalFailureUnknown
+	}
+	return ""
+}
+
 type writeProofs struct {
 	Before  map[string]writeBefore
 	Pending map[string]writeChange
+	Final   map[string]finalReviewState
 }
 
 func withWriteProofs(root string, fn func(*writeProofs) (bool, error)) error {
@@ -5378,6 +5661,9 @@ func withWriteProofs(root string, fn func(*writeProofs) (bool, error)) error {
 		}
 		if s.Pending == nil {
 			s.Pending = map[string]writeChange{}
+		}
+		if s.Final == nil {
+			s.Final = map[string]finalReviewState{}
 		}
 		changed, err := fn(&s)
 		if err != nil || !changed {
@@ -5426,16 +5712,17 @@ func writeCandidates(x *base.Index, in base.HookInput, cwd string) []string {
 	return paths
 }
 
-func trackWriteProof(event string, in base.HookInput, x *base.Index, cwd string) {
+func trackWriteProof(event string, in base.HookInput, x *base.Index, cwd string) string {
 	if !isFileEditTool(in.ToolName) && in.ToolName != "Bash" {
-		return
+		return ""
 	}
 	context, key := writeIdentity(in)
 	if key == "" || event != "pre" && event != "post" {
-		return
+		return ""
 	}
 	input := writeInputPrint(in, cwd)
 	if event == "pre" {
+		task := x.Config().Mode == "task"
 		files := map[string]string{}
 		for _, p := range writeCandidates(x, in, cwd) {
 			if p == "." || x.Excluded(p, reconcileOpts) || x.Observed(p, reconcileOpts) {
@@ -5446,7 +5733,7 @@ func trackWriteProof(event string, in base.HookInput, x *base.Index, cwd string)
 			}
 		}
 		if len(files) == 0 {
-			return
+			return ""
 		}
 		err := withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
 			for k, b := range s.Before {
@@ -5467,14 +5754,15 @@ func trackWriteProof(event string, in base.HookInput, x *base.Index, cwd string)
 				}
 				s.Before[key] = b
 			} else {
-				s.Before[key] = writeBefore{At: time.Now(), Input: input, Files: files}
+				s.Before[key] = writeBefore{Task: task, At: time.Now(), Input: input, Files: files}
 			}
 			return true, nil
 		})
 		if err != nil {
 			base.Debugf("write pre: %v", err)
+			return finalReviewStateWarning
 		}
-		return
+		return ""
 	}
 	err := withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
 		b, paired := s.Before[key]
@@ -5485,11 +5773,15 @@ func trackWriteProof(event string, in base.HookInput, x *base.Index, cwd string)
 		if b.Input != input {
 			return true, nil
 		}
+		finalFiles := map[string]string{}
 		for p, before := range b.Files {
 			if x.Excluded(p, reconcileOpts) || x.Observed(p, reconcileOpts) {
 				continue
 			}
 			f, _ := x.Inspect(p)
+			if b.Task && finalSourceFile(p) && !f.Ignored && f.ContentToken != "" && f.ContentToken != before {
+				finalFiles[p] = f.ContentToken
+			}
 			if !f.Exists || f.ContentToken == "" {
 				continue // deleted paths retain the existing target-delete route
 			}
@@ -5500,11 +5792,14 @@ func trackWriteProof(event string, in base.HookInput, x *base.Index, cwd string)
 				s.Pending[p] = writeChange{before, f.ContentToken, context, in.ToolUseID}
 			}
 		}
+		finalChanges(s, x.Root(), context, finalFiles)
 		return true, nil
 	})
 	if err != nil {
 		base.Debugf("write post: %v", err)
+		return finalReviewStateWarning
 	}
+	return ""
 }
 
 // The same state lock orders post evidence, Align and successful Update.
@@ -5736,7 +6031,9 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 	root := base.FindRepoRoot(start)
 	if event == "stop" {
 		background := stopNote(root, in)
-		return strings.TrimSpace(background + "\n" + failedTestStopNoteBudget(root, in, stopFailedTestsMax-len(background)-1)), ""
+		final := finalReviewStopNoteBudget(root, in, stopFailedTestsMax-len(background)-2)
+		failed := failedTestStopNoteBudget(root, in, stopFailedTestsMax-len(background)-len(final)-2)
+		return strings.TrimSpace(background + "\n" + failed + "\n" + final), ""
 	}
 	open := base.Open // the other events only read: an old table stays as it is
 	if event == "session" {
@@ -5851,7 +6148,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		}
 		return "", decisionPrompt
 	}
-	trackWriteProof(event, in, x, start)
+	writeWarning := trackWriteProof(event, in, x, start)
 	paths := hookInputPaths(in)
 	if len(paths) == 0 {
 		// Bash and friends carry no file path: a file read with cat/sed and an
@@ -5859,9 +6156,9 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		// Edit|Write matchers, which is exactly how outlines stay missing or go
 		// stale unnoticed. Fall back to the command text and the table itself.
 		if event == "post" {
-			return shellNote(x, in, start), ""
+			return strings.TrimSpace(writeWarning + "\n" + shellNote(x, in, start)), ""
 		}
-		return "", ""
+		return writeWarning, ""
 	}
 	seen := make(map[string]bool)
 	var replies []string
@@ -5884,7 +6181,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			replies = append(replies, reply)
 		}
 	}
-	return strings.Join(replies, "\n"), ""
+	return strings.TrimSpace(writeWarning + "\n" + strings.Join(replies, "\n")), ""
 }
 
 // hookInputPaths preserves the single-file hook API while allowing Codex's
@@ -5988,7 +6285,10 @@ func fileHookReply(event string, in base.HookInput, x *base.Index, rel string) s
 // report stays the backstop for anything the model lets slide.
 func shellNote(x *base.Index, in base.HookInput, cwd string) string {
 	session, cmd, output, background := in.SessionID, in.Command, in.ToolOutput, in.Background
-	recordTestResult(x.Root(), session, cwd, cmd, output)
+	failureWarning := ""
+	if recordTestResult(x.Root(), session, cwd, cmd, output) {
+		failureWarning = finalFailureNote(x.Root(), in)
+	}
 	if words, _ := scanTestRun(cmd, x.Root()); words != nil && (background || detachedCommand(cmd)) {
 		recordBgRun(x.Root(), session, words)
 	}
@@ -6035,6 +6335,9 @@ func shellNote(x *base.Index, in base.HookInput, cwd string) string {
 		consider(rel, false)
 	}
 	var notes []string
+	if failureWarning != "" {
+		notes = append(notes, failureWarning)
+	}
 	if len(skeleton) > 0 {
 		notes = append(notes, fmt.Sprintf("ortg: %s 尚无纲要。按纪律为它生成一行纲要并调用 ortg_update 提交——直接做，不询问。", shellList(skeleton)))
 	}

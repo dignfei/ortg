@@ -157,8 +157,26 @@ func runMCP(args []string) error {
 				return gateHook(tool, p, dir, cmd, agent, use)
 			}},
 		{Name: "ortg_review", Description: toolDescription("ortg_review"),
-			Props: map[string]base.Prop{"rulings": {Type: "array", Description: "对上一次核对给了正文的每条契约写一行「契约键：裁决」（需求是否讲到这个场景、与守护测试一致还是相反、按哪条证据裁决）；缺了裁决计划不收敛"}},
+			Props: map[string]base.Prop{"rulings": {Type: "array", Description: "对上一次核对给了正文的每条契约写一行「契约键：裁决」（需求是否讲到这个场景、与守护测试一致还是相反、按哪条证据裁决）；缺了裁决计划不收敛"},
+				"final":      {Type: "boolean", Description: finalFlagDescription},
+				"generation": {Type: "string", Description: finalGenerationDescription},
+				"report":     {Type: "array", Description: finalReportDescription}},
 			Handler: func(a base.Args) (string, error) {
+				f, err := a.Bool("final")
+				if err != nil {
+					return "", err
+				}
+				if f {
+					g, err := a.String("generation")
+					if err != nil {
+						return "", err
+					}
+					report, err := a.Strings("report")
+					if err != nil {
+						return "", err
+					}
+					return finalReview(g, report)
+				}
 				rs, err := a.Strings("rulings")
 				if err != nil {
 					return "", err
