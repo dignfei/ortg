@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -54,6 +55,7 @@ func TestEntryFamilyDelivery(t *testing.T) {
 		map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_overview", "arguments": map[string]any{}}},
 		map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_gate", "arguments": map[string]any{"tool": "Edit", "path": filepath.Join(root, "a.go"), "dir": root}}},
 	)
+	check("initial overview", replies[0])
 	check("unplanned edit gate", replies[1])
 	replies = nativeMCP(t, root,
 		map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_target", "arguments": map[string]any{"items": []string{"a.go " + updateLine("a.go", "new target"), "b.go " + updateLine("b.go", "new target")}}}},
@@ -62,4 +64,93 @@ func TestEntryFamilyDelivery(t *testing.T) {
 	check("review checklist", replies[1])
 	writeFile(t, filepath.Join(root, "a.go"), "updated fixture")
 	checkText("edit hook", HookReply("post", base.HookInput{Cwd: root, SessionID: "entry-contract-hook", ToolName: "Edit", FilePath: filepath.Join(root, "a.go")}))
+}
+
+func TestOverviewRuleDelivery(t *testing.T) {
+	for _, host := range []string{"claude", "codex"} {
+		t.Run(host, func(t *testing.T) {
+			t.Setenv("ORTG_AGENT", host)
+			// These real host settings reach the separately executed MCP child.
+			t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "100")
+			profile := t.TempDir()
+			writeFile(t, filepath.Join(profile, "config.toml"), "model_context_window = 100\n")
+			t.Setenv("CODEX_HOME", profile)
+			root := updateRepo(t, "a.go", "unknown.go")
+			if _, err := scanWithHeader(); err != nil {
+				t.Fatal(err)
+			}
+			outline := updateLine("a.go", "fixture")
+			if _, err := Update("a.go", outline); err != nil {
+				t.Fatal(err)
+			}
+			get := func(module, thread string) string {
+				t.Helper()
+				r := nativeMCP(t, root, map[string]any{"method": "tools/call", "params": map[string]any{
+					"name": "ortg_overview", "arguments": map[string]any{"module": module}, "_meta": map[string]any{"threadId": thread},
+				}})[0]
+				if r.Result.IsError || len(r.Result.Content) != 1 {
+					t.Fatalf("overview: %+v", r)
+				}
+				return r.Result.Content[0].Text
+			}
+			check := func(out string, wantRules bool) {
+				t.Helper()
+				for _, rule := range []string{"纲要行纪律：", "公开契约涉及可选、尽力或非致命的附带步骤时", "任务依赖闭环："} {
+					want := 0
+					if wantRules {
+						want = 1
+					}
+					if strings.Count(out, rule) != want {
+						t.Fatalf("want rules=%v for %q:\n%s", wantRules, rule, out)
+					}
+				}
+			}
+			bare := get("", testMCPSession)
+			check(bare, true)
+			if !strings.HasSuffix(bare, overviewModulesFooter) || strings.Contains(bare, outline) {
+				t.Fatal("rules must not bypass the whole-outline budget")
+			}
+			check(get("", testMCPSession), false) // another server, same context
+			module := get("ST", testMCPSession)
+			check(module, false)
+			if !strings.Contains(module, outline) {
+				t.Fatal("rules must not mark unsent outline rows as delivered")
+			}
+			// Old binaries had no Rules field; changed content has a different
+			// fingerprint. Both keep the already-delivered header and rows.
+			for _, old := range []string{"", "previous neutral rule content"} {
+				_, saved := base.OverviewMark(root, sentMark(testMCPSession))
+				var cache map[string]any
+				if err := json.Unmarshal([]byte(saved), &cache); err != nil {
+					t.Fatal(err)
+				}
+				if old == "" {
+					delete(cache, "Rules")
+				} else {
+					cache["Rules"] = old
+				}
+				wire, err := json.Marshal(cache)
+				if err != nil {
+					t.Fatal(err)
+				}
+				base.MarkOverview(root, sentMark(testMCPSession), string(wire))
+				short := get("ST", testMCPSession)
+				check(short, true)
+				if !strings.HasSuffix(short, overviewShortFooter) || strings.Contains(short, outline) {
+					t.Fatal("rule upgrades must keep the outline's short-reply cache")
+				}
+				check(get("ST", testMCPSession), false)
+			}
+			status, err := Status()
+			if err != nil || !strings.Contains(status, "unknown.go") || strings.Contains(status, "纲要行纪律：") {
+				t.Fatalf("Status must retain its detailed inventory report: %q, %v", status, err)
+			}
+			markReset(root, testMCPSession, "", "compact")
+			check(get("", testMCPSession), true)
+			if host == "codex" {
+				check(get("", "forked-neutral-context"), true)
+				check(get("", "forked-neutral-context"), false)
+			}
+		})
+	}
 }

@@ -540,6 +540,7 @@ func Overview(module string, force bool) (string, error) {
 	defer overviewMu.Unlock()
 	c := sentFor(x.Root())
 	defer saveSent(x.Root(), c)
+	rules := overviewDiscipline(c)
 	first := "" // a fresh table: the docs come before any outline
 	if headerUnwritten(x.Header()) {
 		first = headerFirstText(x) + "\n\n"
@@ -601,11 +602,11 @@ func Overview(module string, force bool) (string, error) {
 		if headerFresh {
 			b.WriteString(gateOverview(x))
 		}
-		b.WriteString("\n" + s.countsReport() + "\n" + overviewModulesFooter)
+		b.WriteString("\n" + s.countsReport() + "\n" + rules + overviewModulesFooter)
 		return b.String(), nil
 	}
 	if len(fresh) == 0 && !headerFresh {
-		return first + fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.countsReport() + "\n" + taskDependencyHints(x, c, cand, s) + overviewShortFooter, nil
+		return first + fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.countsReport() + "\n" + rules + taskDependencyHints(x, c, cand, s) + overviewShortFooter, nil
 	}
 	sub := opts
 	set := make(map[string]bool, len(fresh))
@@ -630,7 +631,7 @@ func Overview(module string, force bool) (string, error) {
 	if headerFresh {
 		b.WriteString(gateOverview(x))
 	}
-	b.WriteString("\n" + s.countsReport())
+	b.WriteString("\n" + s.countsReport() + "\n" + rules)
 	b.WriteString("\n" + taskDependencyHints(x, c, cand, s))
 	if skipped := len(cand) - len(fresh); skipped > 0 {
 		b.WriteString("\n" + fmt.Sprintf(overviewIncrementNote, len(fresh), skipped))
@@ -848,6 +849,20 @@ func noteTranscript(root, session, transcript string) {
 	}
 }
 
+func disciplineText() string { return updateDiscipline + " " + impactRules }
+
+// Overview carries the current rules even when no host edit hook runs.
+// Its existing context cache persists the content fingerprint across servers.
+func overviewDiscipline(c *sentCache) string {
+	full := disciplineText()
+	fingerprint := fmt.Sprintf("%x", sha1.Sum([]byte(full)))
+	if c.rules == fingerprint {
+		return ""
+	}
+	c.rules = fingerprint
+	return full + "\n"
+}
+
 // disciplineFor is the outline discipline a hook adds to a notice: in full
 // the first time a context gets one (with impactRules), afterwards one line
 // pointing back to it. The context is the subagent's when agent_id is set.
@@ -860,7 +875,7 @@ func disciplineFor(root string, in base.HookInput) string {
 	if in.AgentID != "" {
 		key = in.AgentID
 	}
-	full := updateDiscipline + " " + impactRules
+	full := disciplineText()
 	if key == "" {
 		return full
 	}
@@ -925,7 +940,8 @@ type sentCache struct {
 	// of the same plan sends only what changed: each file's target as last
 	// shown, the contracts and fallback entries quoted in full, the affected
 	// files named, and whether the conflict text and the checklist went out.
-	plan planSeen
+	plan  planSeen
+	rules string // fingerprint of the complete discipline last sent by Overview
 }
 
 // planSeen is what the reviews of one plan have shown; the zero value is a
@@ -980,12 +996,13 @@ type sentFile struct {
 	Planned    map[string]bool
 	Solo       map[string]bool
 	Plan       planSeen
+	Rules      string
 }
 
 // saveSent writes the cache to its session's "sent" mark. Callers hold
 // overviewMu.
 func saveSent(root string, c *sentCache) {
-	b, err := json.Marshal(sentFile{c.lost, c.born, c.header, c.rows, c.denied, c.nagged, c.reviews, c.lastReview, c.planned, c.solo, c.plan})
+	b, err := json.Marshal(sentFile{c.lost, c.born, c.header, c.rows, c.denied, c.nagged, c.reviews, c.lastReview, c.planned, c.solo, c.plan, c.rules})
 	if err != nil {
 		return
 	}
@@ -1009,7 +1026,7 @@ func loadSent(root, sid string) *sentCache {
 		return nil
 	}
 	c := &sentCache{sid: sid, lost: f.Lost, born: f.Born, header: f.Header, rows: f.Rows, denied: f.Denied, nagged: f.Nagged,
-		reviews: f.Reviews, lastReview: f.LastReview, planned: f.Planned, solo: f.Solo, plan: f.Plan}
+		reviews: f.Reviews, lastReview: f.LastReview, planned: f.Planned, solo: f.Solo, plan: f.Plan, rules: f.Rules}
 	if c.rows == nil {
 		c.rows = map[string]string{}
 	}
