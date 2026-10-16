@@ -4815,7 +4815,8 @@ func updateOutlines(entries [][2]string) (string, error) {
 	var messages, depChanged, newDeps, distill []string
 	var docsComplete, initComplete bool
 	failedPath := ""
-	err = x.Batch(func() error {
+	var writeWarning string
+	writeWarning, err = updateWriteBatch(x, paths, func() error {
 		// Batch may reload a concurrent writer's table. Gates use this latest
 		// pre-batch state: completing documents here must not skip revision.
 		unwritten := headerUnwritten(x.Header())
@@ -4943,6 +4944,9 @@ func updateOutlines(entries [][2]string) (string, error) {
 	overviewMu.Unlock()
 	x.RefreshGraph()
 	msg := strings.Join(messages, "\n")
+	if writeWarning != "" {
+		msg += "\n" + writeWarning
+	}
 	if len(depChanged) > 0 {
 		msg += "\n" + fmt.Sprintf(headerDepNote, strings.Join(depChanged, "、"))
 	}
@@ -5197,6 +5201,208 @@ func headerFirstText(x *base.Index) string {
 	return headerNoDocsNote
 }
 
+// A permission or a stale fingerprint is not evidence of a write. These marks
+// retain only paired operations and their observed content transitions.
+type writeBefore struct {
+	At      time.Time
+	Input   string
+	Files   map[string]string
+	Updated map[string]string
+}
+
+type writeChange struct {
+	Before, After, Context, Use string
+}
+
+type writeProofs struct {
+	Before  map[string]writeBefore
+	Pending map[string]writeChange
+}
+
+func withWriteProofs(root string, fn func(*writeProofs) (bool, error)) error {
+	return base.MutateOverviewMark(root, "writes", func(data string) (string, error) {
+		var s writeProofs
+		if data != "" {
+			if err := json.Unmarshal([]byte(data), &s); err != nil {
+				return "", err
+			}
+		}
+		if s.Before == nil {
+			s.Before = map[string]writeBefore{}
+		}
+		if s.Pending == nil {
+			s.Pending = map[string]writeChange{}
+		}
+		changed, err := fn(&s)
+		if err != nil || !changed {
+			return data, err
+		}
+		b, err := json.Marshal(s)
+		return string(b), err
+	})
+}
+
+func writeIdentity(in base.HookInput) (context, key string) {
+	context = in.SessionID
+	if in.AgentID != "" {
+		context = in.AgentID
+	}
+	if context == "" || context == "." || context == ".." || strings.TrimSpace(in.ToolUseID) == "" {
+		return "", ""
+	}
+	return context, fmt.Sprintf("%x", sha1.Sum([]byte(context+"\x00"+in.TurnID+"\x00"+in.ToolUseID)))
+}
+
+func writeInputPrint(in base.HookInput, cwd string) string {
+	paths := hookInputPaths(in)
+	sort.Strings(paths)
+	b, _ := json.Marshal([]any{strings.ToLower(in.ToolName), filepath.Clean(cwd), in.Command, paths})
+	return fmt.Sprintf("%x", sha1.Sum(b))
+}
+
+func writeCandidates(x *base.Index, in base.HookInput, cwd string) []string {
+	var paths []string
+	if isFileEditTool(in.ToolName) {
+		for _, p := range hookInputPaths(in) {
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(cwd, p)
+			}
+			if rel, inside := base.Rel(x.Root(), p); inside {
+				paths = append(paths, rel)
+			}
+		}
+	} else if in.ToolName == "Bash" && !in.Background && !detachedCommand(in.Command) {
+		command := "cd " + strconv.Quote(cwd) + "; " + in.Command
+		_, paths = shellTargets(command, x.Root(), func(p string) (string, bool) {
+			return base.Rel(x.Root(), p)
+		}, func(string) []string { return nil })
+	}
+	return paths
+}
+
+func trackWriteProof(event string, in base.HookInput, x *base.Index, cwd string) {
+	if !isFileEditTool(in.ToolName) && in.ToolName != "Bash" {
+		return
+	}
+	context, key := writeIdentity(in)
+	if key == "" || event != "pre" && event != "post" {
+		return
+	}
+	input := writeInputPrint(in, cwd)
+	if event == "pre" {
+		files := map[string]string{}
+		for _, p := range writeCandidates(x, in, cwd) {
+			if p == "." || x.Excluded(p, reconcileOpts) || x.Observed(p, reconcileOpts) {
+				continue
+			}
+			if f, _ := x.Inspect(p); f.ContentToken != "" {
+				files[p] = f.ContentToken
+			}
+		}
+		if len(files) == 0 {
+			return
+		}
+		err := withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
+			for k, b := range s.Before {
+				if time.Since(b.At) > staleMarkAge {
+					delete(s.Before, k) // only abandoned pre records expire
+				}
+			}
+			if b, exists := s.Before[key]; exists {
+				// Duplicate identical pre hooks are harmless. Conflicting uses
+				// of one identity cannot support a definite attribution.
+				if b.Input != input || len(b.Files) != len(files) {
+					b.Input = ""
+				}
+				for p, token := range files {
+					if b.Files[p] != token {
+						b.Input = ""
+					}
+				}
+				s.Before[key] = b
+			} else {
+				s.Before[key] = writeBefore{At: time.Now(), Input: input, Files: files}
+			}
+			return true, nil
+		})
+		if err != nil {
+			base.Debugf("write pre: %v", err)
+		}
+		return
+	}
+	err := withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
+		b, paired := s.Before[key]
+		if !paired {
+			return false, nil
+		}
+		delete(s.Before, key) // a repeated post cannot revive an acknowledged write
+		if b.Input != input {
+			return true, nil
+		}
+		for p, before := range b.Files {
+			if x.Excluded(p, reconcileOpts) || x.Observed(p, reconcileOpts) {
+				continue
+			}
+			f, _ := x.Inspect(p)
+			if !f.Exists || f.ContentToken == "" {
+				continue // deleted paths retain the existing target-delete route
+			}
+			if acknowledged := b.Updated[p]; acknowledged != "" {
+				before = acknowledged
+			}
+			if f.ContentToken != before {
+				s.Pending[p] = writeChange{before, f.ContentToken, context, in.ToolUseID}
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		base.Debugf("write post: %v", err)
+	}
+}
+
+// The same state lock orders post evidence, Align and successful Update.
+// In-flight pre records retain the exact stored token that Update acknowledged,
+// so a late post is judged against that token rather than reviving old work.
+func updateWriteBatch(x *base.Index, paths []string, fn func() error) (warning string, err error) {
+	committed := false
+	err = withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
+		if err := x.Batch(fn); err != nil {
+			return false, err
+		}
+		committed = true
+		changed := false
+		for _, p := range paths {
+			if _, pending := s.Pending[p]; pending {
+				delete(s.Pending, p)
+				changed = true
+			}
+			for key, b := range s.Before {
+				if _, captured := b.Files[p]; !captured {
+					continue
+				}
+				f, _ := x.Inspect(p)
+				if f.OutlineToken == "" {
+					continue
+				}
+				if b.Updated == nil {
+					b.Updated = map[string]string{}
+				}
+				b.Updated[p] = f.OutlineToken
+				s.Before[key] = b
+				changed = true
+			}
+		}
+		return changed, nil
+	})
+	if committed && err != nil {
+		// The table and its backup already committed. A failed state save
+		// leaves conservative old evidence; it is not a table rollback.
+		return fmt.Sprintf(writeStateSaveWarning, err), nil
+	}
+	return "", err
+}
+
 // Align advances fingerprints after a human confirmed the outlines.
 func Align(mode string, paths []string) (string, error) {
 	x, err := openIndex(repoRoot())
@@ -5204,21 +5410,39 @@ func Align(mode string, paths []string) (string, error) {
 		return "", err
 	}
 	n := 0
-	err = x.Batch(func() error {
-		facts, err := x.Reconcile(reconcileOpts)
-		if err != nil {
-			return err
-		}
-		if mode == "all" {
-			paths = nil
-			for _, f := range facts {
-				if f.Exists && !f.Ignored && !f.IsNew {
-					paths = append(paths, f.Path)
+	err = withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
+		return false, x.Batch(func() error {
+			facts, err := x.Reconcile(reconcileOpts)
+			if err != nil {
+				return err
+			}
+			if mode == "all" {
+				paths = nil
+				for _, f := range facts {
+					if f.Exists && !f.Ignored && !f.IsNew {
+						paths = append(paths, f.Path)
+					}
 				}
 			}
-		}
-		n = len(paths)
-		return x.Align(paths)
+			var blocked []string
+			for _, p := range paths {
+				rel, err := normRel(x.Root(), p)
+				if err != nil {
+					continue // preserve Align's legacy handling of unrelated paths
+				}
+				if _, pending := s.Pending[rel]; !pending || x.Excluded(rel, reconcileOpts) || x.Observed(rel, reconcileOpts) {
+					continue
+				}
+				if f, _ := x.Inspect(rel); f.Exists {
+					blocked = append(blocked, rel)
+				}
+			}
+			if len(blocked) != 0 {
+				return fmt.Errorf(alignNeedsUpdate, strings.Join(blocked, "、"))
+			}
+			n = len(paths)
+			return x.Align(paths)
+		})
 	})
 	if err != nil {
 		return "", err
@@ -5450,6 +5674,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 		}
 		return "", decisionPrompt
 	}
+	trackWriteProof(event, in, x, start)
 	paths := hookInputPaths(in)
 	if len(paths) == 0 {
 		// Bash and friends carry no file path: a file read with cat/sed and an

@@ -157,3 +157,149 @@ func TestShellPathIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestPairedWriteAlignment(t *testing.T) {
+	cases := []struct {
+		name, command string
+		wantPending   bool
+		planned       bool
+		observed      bool
+		noID          bool
+		wrongPost     bool
+		wrongSession  bool
+		exitFailure   bool
+		preexisting   bool
+		changedInput  bool
+	}{
+		{name: "write", command: "printf changed > a.go", wantPending: true},
+		{name: "planned", command: "printf changed > a.go", wantPending: true, planned: true},
+		{name: "same bytes", command: "printf content > a.go"},
+		{name: "failed before write", command: "false && printf changed > a.go", exitFailure: true},
+		{name: "independent drift then failed write", command: "false && printf changed > a.go", exitFailure: true, preexisting: true},
+		{name: "changed despite failure", command: "printf changed > a.go; false", wantPending: true, exitFailure: true},
+		{name: "missing identity", command: "printf changed > a.go", noID: true},
+		{name: "wrong operation", command: "printf changed > a.go", wrongPost: true},
+		{name: "wrong context", command: "printf changed > a.go", wrongSession: true},
+		{name: "changed input", command: "printf changed > a.go", changedInput: true},
+		{name: "read", command: "cat a.go"},
+		{name: "observed", command: "printf changed > a.go", observed: true},
+		{name: "added", command: "printf changed > new.go", wantPending: true},
+		{name: "removed", command: "rm a.go"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ORTG_STATE_DIR", t.TempDir())
+			t.Setenv("ORTG_AGENT", "codex")
+			root := updateRepo(t, "a.go", "b.go")
+			if _, err := scanWithHeader(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Header("", nil, nil, nil, nil, nil, nil, "task"); err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range []string{"a.go", "b.go"} {
+				if _, err := Update(p, updateLine(p, "public fixture")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.observed {
+				if _, err := Header("", nil, nil, nil, nil, []string{"a.go"}, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := Overview("", false); err != nil {
+				t.Fatal(err)
+			}
+			if tc.planned {
+				if _, err := Target("a.go", "=", false, ""); err != nil {
+					t.Fatal(err)
+				}
+				if out, err := Review(); err != nil || !strings.Contains(out, "已收敛") {
+					t.Fatalf("planned write: %v %s", err, out)
+				}
+			}
+			if tc.preexisting {
+				writeFile(t, filepath.Join(root, "a.go"), "independent drift")
+			}
+			if out, err := Gate("Bash", "", "", tc.command, ""); err != nil || strings.Contains(out, deniedMark) {
+				t.Fatalf("fixture write was not allowed: %v %s", err, out)
+			}
+			in := base.HookInput{Cwd: root, SessionID: "writer", TurnID: "turn", ToolUseID: "operation", ToolName: "Bash", Command: tc.command}
+			if tc.noID {
+				in.ToolUseID = ""
+			}
+			if out := HookReply("pre", in); out != "" {
+				t.Fatalf("shell sampling must be silent: %s", out)
+			}
+			cmd := exec.Command("sh", "-c", tc.command)
+			if out, err := cmd.CombinedOutput(); (err != nil) != tc.exitFailure {
+				t.Fatalf("actual shell result: %v %s", err, out)
+			}
+			post := in
+			if tc.wrongPost {
+				post.ToolUseID = "other operation"
+			}
+			if tc.wrongSession {
+				post.SessionID = "other context"
+			}
+			if tc.changedInput {
+				post.Command += " # modified by another pre hook"
+			}
+			HookReply("post", post)
+			path := "a.go"
+			if tc.name == "added" {
+				path = "new.go"
+			}
+			before, err := os.ReadFile(filepath.Join(root, base.TableName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, proofBefore := base.OverviewMark(root, "writes")
+			_, err = Align("paths", []string{path})
+			if (err != nil) != tc.wantPending {
+				t.Fatalf("pending=%v, Align error=%v", tc.wantPending, err)
+			}
+			if !tc.wantPending {
+				return
+			}
+			if !strings.Contains(err.Error(), "ortg_update") {
+				t.Fatalf("refusal must name the existing maintenance route: %v", err)
+			}
+			after, _ := os.ReadFile(filepath.Join(root, base.TableName))
+			_, proofAfter := base.OverviewMark(root, "writes")
+			if string(before) != string(after) || proofBefore != proofAfter {
+				t.Fatal("a refused Align changed the table or its evidence")
+			}
+			if tc.name == "write" {
+				HookReply("compact", base.HookInput{Cwd: root, SessionID: "writer"})
+				r := nativeMCP(t, root, map[string]any{"method": "tools/call", "params": map[string]any{
+					"name": "ortg_align", "arguments": map[string]any{"mode": "all"}, "_meta": map[string]any{"threadId": "another context"},
+				}})[0]
+				if !r.Result.IsError || !strings.Contains(r.Result.Content[0].Text, "ortg_update") {
+					t.Fatalf("another MCP process/context after compaction bypassed the obligation: %+v", r)
+				}
+				if !testing.Short() {
+					bin := filepath.Join(t.TempDir(), "ortg")
+					build := exec.Command("go", "build", "-o", bin, ".")
+					build.Dir = worktreeDir(t)
+					build.Env = append(os.Environ(), "CGO_ENABLED=0")
+					if out, err := build.CombinedOutput(); err != nil {
+						t.Fatalf("current CLI build: %v %s", err, out)
+					}
+					cli := exec.Command(bin, "align", "a.go")
+					cli.Dir = root
+					if out, err := cli.CombinedOutput(); err == nil || !strings.Contains(string(out), "ortg_update") {
+						t.Fatalf("real CLI bypassed the obligation: %v %s", err, out)
+					}
+				}
+			}
+			if _, err := Update(path, updateLine(path, "understood final fixture")); err != nil {
+				t.Fatal(err)
+			}
+			HookReply("post", post) // duplicate completion cannot revive the obligation
+			if _, err := Align("paths", []string{path}); err != nil {
+				t.Fatalf("successful update did not clear the obligation: %v", err)
+			}
+		})
+	}
+}

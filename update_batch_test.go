@@ -452,6 +452,8 @@ func TestUpdateMCPNewAPIRollback(t *testing.T) {
 
 func TestUpdateMCPDiskSaveFailure(t *testing.T) {
 	useTestMCPSession(t)
+	t.Setenv("ORTG_STATE_DIR", t.TempDir())
+	t.Setenv("ORTG_CBM", "off")
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX file-size limit unavailable")
 	}
@@ -478,6 +480,13 @@ func TestUpdateMCPDiskSaveFailure(t *testing.T) {
 	c.solo["a.go"] = true
 	saveSent(root, c)
 	overviewMu.Unlock()
+	for _, name := range []string{"a.go", "b.go"} {
+		in := base.HookInput{Cwd: root, SessionID: testMCPSession, ToolUseID: "save-failure-" + name, ToolName: "Edit", FilePath: filepath.Join(root, name)}
+		HookReply("pre", in)
+		writeFile(t, in.FilePath, "actual write before failing save")
+		HookReply("post", in)
+	}
+	_, writeProofBefore := base.OverviewMark(root, "writes")
 	before, err := os.ReadFile(filepath.Join(root, base.TableName))
 	if err != nil || len(before) >= 4096 {
 		t.Fatalf("pre-batch table must fit below the real write limit: %d bytes, %v", len(before), err)
@@ -510,5 +519,89 @@ func TestUpdateMCPDiskSaveFailure(t *testing.T) {
 	_, sentAfter := base.OverviewMark(root, sentMark(testMCPSession))
 	if sentAfter != sentBefore {
 		t.Fatal("failed save must not change the persisted sent/solo cache")
+	}
+	_, writeProofAfter := base.OverviewMark(root, "writes")
+	if writeProofBefore == "" || writeProofBefore != writeProofAfter {
+		t.Fatal("a real table save failure changed confirmed write evidence")
+	}
+	if _, err := Align("paths", []string{"a.go"}); err == nil {
+		t.Fatal("a real failed save must leave the semantic-maintenance obligation")
+	}
+
+}
+
+func TestUpdateWriteObligations(t *testing.T) {
+	t.Setenv("ORTG_STATE_DIR", t.TempDir())
+	t.Setenv("ORTG_CBM", "off")
+	root := updateRepo(t, "a.go", "b.go")
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Header("", nil, nil, nil, nil, nil, nil, "task"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"a.go", "b.go"} {
+		if _, err := Update(p, updateLine(p, "original fixture")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	operation := func(path, id string) base.HookInput {
+		return base.HookInput{Cwd: root, SessionID: "writer", AgentID: "child writer", ToolUseID: id, ToolName: "Edit", FilePath: filepath.Join(root, path)}
+	}
+	a, b := operation("a.go", "one"), operation("b.go", "two")
+	for _, in := range []base.HookInput{a, b} {
+		HookReply("pre", in)
+		writeFile(t, in.FilePath, "actual content change "+in.ToolUseID)
+		HookReply("post", in)
+	}
+	_, before := base.OverviewMark(root, "writes")
+	msg, failed := nativeUpdate(t, root, map[string]any{"items": []string{"a.go " + updateLine("a.go", "valid"), "b.go invalid"}})
+	if !failed {
+		t.Fatalf("invalid batch passed: %s", msg)
+	}
+	_, after := base.OverviewMark(root, "writes")
+	if before != after {
+		t.Fatal("failed validation changed write obligations")
+	}
+	if _, err := Align("paths", []string{"a.go", "b.go"}); err == nil {
+		t.Fatal("a failed batch cleared obligations")
+	}
+	if msg, failed := nativeUpdate(t, root, map[string]any{"path": "a.go", "outline": updateLine("a.go", "understood")}); failed {
+		t.Fatal(msg)
+	}
+	if _, err := Align("paths", []string{"a.go"}); err != nil {
+		t.Fatalf("successful update did not acknowledge its path: %v", err)
+	}
+	if _, err := Align("paths", []string{"b.go"}); err == nil {
+		t.Fatal("updating one path cleared another path's obligation")
+	}
+	HookReply("post", a)
+	if _, err := Align("paths", []string{"a.go"}); err != nil {
+		t.Fatalf("duplicate post revived an acknowledged operation: %v", err)
+	}
+	// A matching child identity takes precedence over the parent's session.
+	late := operation("a.go", "late")
+	HookReply("pre", late)
+	writeFile(t, late.FilePath, "content B")
+	if msg, failed := nativeUpdate(t, root, map[string]any{"path": "a.go", "outline": updateLine("a.go", "understood B")}); failed {
+		t.Fatal(msg)
+	}
+	late.SessionID = "another parent"
+	HookReply("post", late)
+	if _, err := Align("paths", []string{"a.go"}); err != nil {
+		t.Fatalf("late post revived content already submitted during the operation: %v", err)
+	}
+	// The acknowledged content, rather than the original pre image, is the
+	// comparison baseline when the operation changes content again afterward.
+	restored := operation("a.go", "restored")
+	HookReply("pre", restored) // B
+	writeFile(t, restored.FilePath, "content C")
+	if msg, failed := nativeUpdate(t, root, map[string]any{"path": "a.go", "outline": updateLine("a.go", "understood C")}); failed {
+		t.Fatal(msg)
+	}
+	writeFile(t, restored.FilePath, "content B")
+	HookReply("post", restored)
+	if _, err := Align("paths", []string{"a.go"}); err == nil {
+		t.Fatal("restoring the pre image after Update must create a new obligation")
 	}
 }

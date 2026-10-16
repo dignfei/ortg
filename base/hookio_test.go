@@ -3,6 +3,8 @@ package base
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -10,9 +12,272 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestReadHookInputOperationIdentity(t *testing.T) {
+	for _, event := range []string{"PreToolUse", "PostToolUse", "PostToolUseFailure"} {
+		payload := fmt.Sprintf(`{"hook_event_name":%q,"session_id":"parent/session","agent_id":"agents/sub","tool_use_id":"op/opaque:1","turn_id":"turn/opaque:2","tool_name":"Write","tool_input":{"file_path":"unit.go"}}`, event)
+		in := ReadHookInput(strings.NewReader(payload), time.Second)
+		if in.Event != event || in.SessionID != "session" || in.AgentID != "sub" || in.ToolUseID != "op/opaque:1" || in.TurnID != "turn/opaque:2" {
+			t.Fatalf("operation identity was lost: %+v", in)
+		}
+	}
+	for _, payload := range []string{`{}`, `{"session_id":""}`, `{"tool_input":{"tool_use_id":"nested","turn_id":"nested"}}`} {
+		in := ReadHookInput(strings.NewReader(payload), time.Second)
+		if in.SessionID != "" || in.AgentID != "" || in.ToolUseID != "" || in.TurnID != "" {
+			t.Fatalf("missing top-level identities must remain empty: %+v", in)
+		}
+	}
+}
+
+func TestMutateOverviewMarkAbandonedLock(t *testing.T) {
+	t.Setenv("ORTG_STATE_DIR", t.TempDir())
+	root := t.TempDir()
+	p := overviewMarkFile(root, "abandoned") + ".lock"
+	cmd := exec.Command(os.Args[0], "-test.run=^TestReadHookInputOperationIdentity$")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("finished owner process: %v %s", err, out)
+	}
+	identity := []byte(strconv.Itoa(cmd.Process.Pid))
+	if err := os.WriteFile(p, identity, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	start := time.Now()
+	err = MutateOverviewMark(root, "abandoned", func(string) (string, error) {
+		called = true
+		return "must not run", nil
+	})
+	after, statErr := os.Stat(p)
+	b, readErr := os.ReadFile(p)
+	if !errors.Is(err, ErrLockTimeout) || called || time.Since(start) < 2*time.Second || statErr != nil || readErr != nil || !os.SameFile(before, after) || !bytes.Equal(b, identity) {
+		t.Fatalf("interrupted evidence lock must stay busy without reclamation: err=%v called=%v stat=%v read=%v body=%q", err, called, statErr, readErr, b)
+	}
+}
+
+func TestMutateOverviewMark(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state")
+	t.Setenv("ORTG_STATE_DIR", state)
+	t.Setenv("TMPDIR", t.TempDir())
+	root, kind := t.TempDir(), "mutation"
+	p := overviewMarkFile(root, kind)
+	legacy := filepath.Join(os.TempDir(), overviewMarkName(root, kind))
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := MutateOverviewMark(root, kind, func(old string) (string, error) {
+		if old != "" {
+			t.Fatalf("canonical mutation read a legacy copy: %q", old)
+		}
+		return "", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("an empty no-op must not create a mark: %v", err)
+	}
+	if st, err := os.Stat(state); err != nil || st.Mode().Perm() != 0o700 {
+		t.Fatalf("state directory permissions: %v %v", st, err)
+	}
+	if err := MutateOverviewMark(root, kind, func(string) (string, error) { return "kept", nil }); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbackErr := errors.New("callback failed")
+	for _, tc := range []struct {
+		name, next string
+		err        error
+	}{{"same text", "kept", nil}, {"callback error", "discarded", callbackErr}} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := MutateOverviewMark(root, kind, func(text string) (string, error) {
+				if text != "kept" {
+					t.Fatalf("current mark: %q", text)
+				}
+				return tc.next, tc.err
+			})
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("callback result: %v, want %v", err, tc.err)
+			}
+			after, statErr := os.Stat(p)
+			text, readErr := os.ReadFile(p)
+			if statErr != nil || readErr != nil || !os.SameFile(before, after) || !after.ModTime().Equal(before.ModTime()) || string(text) != "kept" {
+				t.Fatalf("a no-write result changed the mark: stat=%v read=%v text=%q", statErr, readErr, text)
+			}
+		})
+	}
+	t.Run("read error", func(t *testing.T) {
+		badKind := "directory"
+		if err := os.Mkdir(overviewMarkFile(root, badKind), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		called := false
+		err := MutateOverviewMark(root, badKind, func(string) (string, error) { called = true; return "changed", nil })
+		if err == nil || called {
+			t.Fatalf("non-ENOENT reads must fail before the callback: err=%v called=%v", err, called)
+		}
+	})
+	t.Run("no fallback", func(t *testing.T) {
+		blocked := filepath.Join(t.TempDir(), "file")
+		if err := os.WriteFile(blocked, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("ORTG_STATE_DIR", blocked)
+		called := false
+		err := MutateOverviewMark(root, "blocked", func(string) (string, error) { called = true; return "changed", nil })
+		if err == nil || called {
+			t.Fatalf("invalid canonical directory must fail: err=%v called=%v", err, called)
+		}
+		if _, err := os.Stat(filepath.Join(os.TempDir(), overviewMarkName(root, "blocked"))); !os.IsNotExist(err) {
+			t.Fatalf("mutation escaped to a temporary fallback: %v", err)
+		}
+	})
+	for _, failMark := range []bool{false, true} {
+		t.Run(fmt.Sprintf("nested batch mark failure=%v", failMark), func(t *testing.T) {
+			x, err := Create(t.TempDir(), testHeader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			batchKind := fmt.Sprintf("batch-%v", failMark)
+			err = MutateOverviewMark(root, batchKind, func(string) (string, error) {
+				if err := x.Batch(func() error { return x.AddSkeleton("unit.go") }); err != nil {
+					return "", err
+				}
+				if failMark {
+					if err := os.Mkdir(overviewMarkFile(root, batchKind), 0o700); err != nil {
+						return "", err
+					}
+				}
+				return "batch committed", nil
+			})
+			if (err != nil) != failMark {
+				t.Fatalf("mark failure=%v: %v", failMark, err)
+			}
+			reopened, openErr := Open(x.Root())
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			if _, known := reopened.Inspect("unit.go"); !known {
+				t.Fatal("a completed table batch must survive a later mark-write failure")
+			}
+		})
+	}
+}
+
+func TestMutateOverviewMarkConcurrency(t *testing.T) {
+	// The helper is this same test binary, not a model or another executable.
+	if root := os.Getenv("ORTG_TEST_MUTATE_MARK_ROOT"); root != "" {
+		kind := os.Getenv("ORTG_TEST_MUTATE_MARK_KIND")
+		n, err := strconv.Atoi(os.Getenv("ORTG_TEST_MUTATE_MARK_COUNT"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < n; i++ {
+			if err := MutateOverviewMark(root, kind, incrementMark); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return
+	}
+	t.Setenv("ORTG_STATE_DIR", t.TempDir())
+	root, kind := t.TempDir(), "counter"
+	const workers, iterations, processes = 6, 8, 2
+	cmds := make([]*exec.Cmd, processes)
+	outs := make([]bytes.Buffer, processes)
+	for i := range cmds {
+		cmds[i] = exec.Command(os.Args[0], "-test.run=^TestMutateOverviewMarkConcurrency$")
+		cmds[i].Env = append(os.Environ(), "ORTG_TEST_MUTATE_MARK_ROOT="+root, "ORTG_TEST_MUTATE_MARK_KIND="+kind, "ORTG_TEST_MUTATE_MARK_COUNT="+strconv.Itoa(iterations))
+		cmds[i].Stdout, cmds[i].Stderr = &outs[i], &outs[i]
+		if err := cmds[i].Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				if err := MutateOverviewMark(root, kind, incrementMark); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	for i, cmd := range cmds {
+		if err := cmd.Wait(); err != nil {
+			t.Errorf("child %d: %v\n%s", i, err, outs[i].String())
+		}
+	}
+	b, err := os.ReadFile(overviewMarkFile(root, kind))
+	want := strconv.Itoa((workers + processes) * iterations)
+	if err != nil || string(b) != want {
+		t.Fatalf("serialized increments: got %q err=%v, want %s", b, err, want)
+	}
+}
+
+func incrementMark(text string) (string, error) {
+	n := 0
+	if text != "" {
+		var err error
+		n, err = strconv.Atoi(text)
+		if err != nil {
+			return "", err
+		}
+	}
+	time.Sleep(time.Millisecond)
+	return strconv.Itoa(n + 1), nil
+}
+
+func TestMutateOverviewMarkBlockedLocks(t *testing.T) {
+	t.Setenv("ORTG_STATE_DIR", t.TempDir())
+	for _, identity := range []string{"", "invalid", strconv.Itoa(os.Getpid())} {
+		t.Run(fmt.Sprintf("pid=%q", identity), func(t *testing.T) {
+			root, kind := t.TempDir(), "held"
+			p := overviewMarkFile(root, kind)
+			if err := os.WriteFile(p+".lock", []byte(identity), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			entered, done := make(chan struct{}), make(chan error, 1)
+			go func() {
+				done <- MutateOverviewMark(root, kind, func(string) (string, error) { close(entered); return "released", nil })
+			}()
+			select {
+			case <-entered:
+				t.Fatal("an empty, invalid or live own-PID lock was reclaimed")
+			case err := <-done:
+				t.Fatalf("lock failed before release: %v", err)
+			case <-time.After(150 * time.Millisecond):
+			}
+			if err := os.Remove(p + ".lock"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(4 * time.Second):
+				t.Fatal("mutation did not resume after the holder released its lock")
+			}
+		})
+	}
+}
 
 func TestReadHookInputTimeoutAndBOM(t *testing.T) {
 	pr, pw := io.Pipe()

@@ -38,6 +38,12 @@ type Fact struct {
 	Observed  bool
 	Deleted   bool
 	NeverSeen bool // row has no fingerprint yet (planned file)
+	// ContentToken is Inspect's current file CRC32 in hex, "missing" for
+	// ENOENT, and empty for a directory or an unknown I/O result.
+	ContentToken string
+	// OutlineToken is the stored CRC32 in hex when the row has an outline.
+	// Align, as well as SetOutline, can advance that stored fingerprint.
+	OutlineToken string
 }
 
 // Row is the read view of one table row.
@@ -277,12 +283,23 @@ func (x *Index) Reconcile(opts ReconcileOptions) ([]Fact, error) {
 // Inspect returns the facts for one path without a full scan (hook use).
 func (x *Index) Inspect(rel string) (Fact, bool) {
 	r := x.t.get(rel)
-	fp, err := fingerprintFile(filepath.Join(x.root, filepath.FromSlash(rel)))
+	full := filepath.Join(x.root, filepath.FromSlash(rel))
+	fp, err := fingerprintFile(full)
 	f := Fact{Path: rel, Exists: err == nil, IsNew: r == nil && err == nil, IsMissing: r != nil && err != nil, OutlineEmpty: true}
+	if err == nil {
+		if st, statErr := os.Stat(full); statErr == nil && !st.IsDir() {
+			f.ContentToken = fmt.Sprintf("%08x", fp.CRC)
+		}
+	} else if os.IsNotExist(err) {
+		f.ContentToken = "missing"
+	}
 	if r == nil {
 		return f, false
 	}
 	f.OutlineEmpty, f.HasTarget, f.TargetDelete, f.Deleted, f.Ignored = r.Outline == "", r.Target != "", r.TargetDelete, r.Deleted, r.Ignored
+	if r.Outline != "" {
+		f.OutlineToken = fmt.Sprintf("%08x", r.CRC)
+	}
 	f.NeverSeen = r.CRC == 0 && r.Mtime.IsZero()
 	if err == nil {
 		f.FingerprintChanged = r.CRC != fp.CRC

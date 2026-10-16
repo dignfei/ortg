@@ -87,6 +87,9 @@ func TestManifestsAgree(t *testing.T) {
 				applyPatchMatchers++
 			}
 		}
+		if hk.ev == "PreToolUse" && cmd == "ortg hook --event pre" && !regexp.MustCompile("^(?:"+hk.matcher+")$").MatchString("Bash") {
+			t.Errorf("pre command hook must silently capture explicit shell writes: %q", hk.matcher)
+		}
 	}
 	// session, subagent, prompt, pre, post(Read), post(Edit|Write|MultiEdit), post(Bash), compact, stop
 	if len(claude) != 9 {

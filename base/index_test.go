@@ -2,13 +2,89 @@ package base
 
 import (
 	"fmt"
+	"hash/crc32"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestInspectContentTokens(t *testing.T) {
+	root := t.TempDir()
+	x := NewMemIndex(root, testHeader)
+	p := filepath.Join(root, "unit.go")
+	stamp := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	write := func(text string) string {
+		t.Helper()
+		if err := os.WriteFile(p, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(text)))
+	}
+	first := write("package first\n")
+	if f, known := x.Inspect("unit.go"); known || !f.Exists || !f.IsNew || f.ContentToken != first || f.OutlineToken != "" {
+		t.Fatalf("untracked content: known=%v fact=%+v", known, f)
+	}
+	if err := x.AddSkeleton("unit.go"); err != nil {
+		t.Fatal(err)
+	}
+	if f, known := x.Inspect("unit.go"); !known || !f.OutlineEmpty || f.ContentToken != first || f.OutlineToken != "" {
+		t.Fatalf("a skeleton has no outline token: known=%v fact=%+v", known, f)
+	}
+	line := "unit.go[5 L ST T]: Role:公开临时文件 | Uses:- | API:- | Constraints:-"
+	if err := x.SetOutline("unit.go", line); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := x.Inspect("unit.go"); f.ContentToken != first || f.OutlineToken != first || f.FingerprintChanged {
+		t.Fatalf("stored content: %+v", f)
+	}
+	second := write("package second\n") // Same mtime; the content token still changes.
+	if f, _ := x.Inspect("unit.go"); f.ContentToken != second || f.OutlineToken != first || !f.FingerprintChanged {
+		t.Fatalf("current and stored content must stay distinct: %+v", f)
+	}
+	if err := x.SetOutline("unit.go", line); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := x.Inspect("unit.go"); f.OutlineToken != second || f.ContentToken != second || f.FingerprintChanged {
+		t.Fatalf("submitting an outline advances the stored token: %+v", f)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if f, known := x.Inspect("unit.go"); !known || !f.IsMissing || f.ContentToken != "missing" || f.OutlineToken != second {
+		t.Fatalf("missing tracked content: known=%v fact=%+v", known, f)
+	}
+	if f, known := x.Inspect("absent.go"); known || f.ContentToken != "missing" || f.OutlineToken != "" {
+		t.Fatalf("missing untracked content: known=%v fact=%+v", known, f)
+	}
+	if err := os.WriteFile(filepath.Join(root, "empty.go"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := x.Inspect("empty.go"); !f.Exists || f.ContentToken != "00000000" {
+		t.Fatalf("an empty file has a known zero CRC: %+v", f)
+	}
+	if err := os.Mkdir(filepath.Join(root, "bundle"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := x.Inspect("bundle/"); !f.Exists || f.ContentToken != "" {
+		t.Fatalf("a directory has no content token: %+v", f)
+	}
+	t.Run("unknown I/O", func(t *testing.T) {
+		bad := "empty.go/child"
+		if _, err := os.Stat(filepath.Join(root, bad)); os.IsNotExist(err) {
+			t.Skip("the host classifies a non-directory path component as missing")
+		}
+		if f, _ := x.Inspect(bad); f.Exists || f.ContentToken != "" || f.OutlineToken != "" {
+			t.Fatalf("non-ENOENT errors must stay unknown: %+v", f)
+		}
+	})
+}
 
 func TestCheckEntryRequiresExplicitFields(t *testing.T) {
 	x := NewMemIndex(t.TempDir(), testHeader)

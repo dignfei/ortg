@@ -45,8 +45,10 @@ func AtomicWrite(path string, data []byte) error {
 }
 
 // lock takes an exclusive cross-process lock via O_EXCL on path+".lock".
-// A lock whose pid is dead is reclaimed. Waits up to 3 seconds.
-func lock(path string) (func(), error) {
+// A lock whose pid is dead is reclaimed by default. Passing false disables
+// reclamation for state that must not risk two stale-lock reapers. Waits up
+// to 3 seconds; an interrupted non-reclaiming owner leaves a bounded busy error.
+func lock(path string, recoverDead ...bool) (func(), error) {
 	lockPath := path + ".lock"
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -59,9 +61,11 @@ func lock(path string) (func(), error) {
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
 		}
-		if b, rerr := os.ReadFile(lockPath); rerr == nil {
+		if b, rerr := os.ReadFile(lockPath); rerr == nil && (len(recoverDead) == 0 || recoverDead[0]) {
 			pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-			if pid <= 0 || pid == os.Getpid() || !pidAlive(pid) {
+			// A creator may not have written its PID yet. Neither an empty
+			// identity nor our own live PID proves that a lock is abandoned.
+			if pid > 0 && !pidAlive(pid) {
 				os.Remove(lockPath)
 				continue
 			}

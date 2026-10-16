@@ -26,6 +26,8 @@ type HookInput struct {
 	Cwd       string
 	Source    string
 	SessionID string
+	ToolUseID string // the host's operation identity, shared by its pre/post payloads
+	TurnID    string // Codex additionally scopes operations to a turn
 	// AgentID is set when a subagent's thread fired the hook. Codex then
 	// still gives the parent's session_id: agent_id is the subagent's own
 	// thread, the id its MCP calls carry.
@@ -332,6 +334,8 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 		Cwd        string          `json:"cwd"`
 		Source     string          `json:"source"`
 		SessionID  string          `json:"session_id"`
+		ToolUseID  string          `json:"tool_use_id"`
+		TurnID     string          `json:"turn_id"`
 		AgentID    string          `json:"agent_id"`
 		Transcript string          `json:"transcript_path"`
 		Model      string          `json:"model"`
@@ -347,7 +351,11 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 	if err := json.Unmarshal([]byte(strings.TrimPrefix(string(raw), "\uFEFF")), &m); err != nil {
 		return in
 	}
-	in.Event, in.ToolName, in.Cwd, in.Source, in.SessionID = m.Event, m.ToolName, m.Cwd, m.Source, filepath.Base(m.SessionID)
+	in.Event, in.ToolName, in.Cwd, in.Source = m.Event, m.ToolName, m.Cwd, m.Source
+	if m.SessionID != "" {
+		in.SessionID = filepath.Base(m.SessionID)
+	}
+	in.ToolUseID, in.TurnID = m.ToolUseID, m.TurnID
 	in.Model = m.Model
 	if m.AgentID != "" {
 		in.AgentID = filepath.Base(m.AgentID)
@@ -480,6 +488,36 @@ func MarkOverview(root, kind, data string) {
 	}
 	now := time.Now()
 	_ = os.Chtimes(f, now, now)
+}
+
+var overviewMarkMu sync.Mutex
+
+// MutateOverviewMark serializes a read/modify/write at the canonical state
+// location. It neither changes lock domains nor reclaims an existing lock;
+// an interrupted owner must be repaired rather than risking stale reapers.
+// A callback error or identical text leaves the mark untouched. The callback
+// may use Index.Batch, but must not recursively mutate another overview mark.
+func MutateOverviewMark(root, kind string, fn func(string) (string, error)) error {
+	overviewMarkMu.Lock()
+	defer overviewMarkMu.Unlock()
+	p := overviewMarkFile(root, kind)
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	unlock, err := lock(p, false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	b, err := os.ReadFile(p)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	next, err := fn(string(b))
+	if err != nil || next == string(b) {
+		return err
+	}
+	return AtomicWrite(p, []byte(next))
 }
 
 // OverviewMark returns when root's mark of the given kind was written and its
