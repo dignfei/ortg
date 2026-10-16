@@ -390,6 +390,90 @@ func finalHookWire(t *testing.T, root, host string, active bool) string {
 	}
 	return string(out)
 }
+
+// This follows the public wire path that obtains a generation from Status
+// and submits directly, without relying on a prior final inspection or Stop.
+func TestFinalReviewPendingStatusSubmission(t *testing.T) {
+	for _, host := range []string{"claude", "codex"} {
+		t.Run(host, func(t *testing.T) {
+			t.Setenv("ORTG_AGENT", host)
+			root := finalFixture(t)
+			call := func(name string, args map[string]any) updateMCPReply {
+				return nativeMCP(t, root, map[string]any{"method": "tools/call", "params": map[string]any{"name": name, "arguments": args, "_meta": map[string]any{"threadId": testMCPSession}}})[0]
+			}
+			status := call("ortg_status", map[string]any{})
+			if status.Result.IsError || strings.Contains(status.Result.Content[0].Text, finalReviewInstruction) {
+				t.Fatal("no-obligation Status must remain concise")
+			}
+			finalWrite(t, root, testMCPSession, "", "pending-status", "value.go", "package sample\nconst Value = 4\n")
+			before, _ := json.Marshal(finalSaved(t, root, testMCPSession))
+			var fromStatus string
+			for i := 0; i < 2; i++ {
+				pending := call("ortg_status", map[string]any{})
+				if pending.Result.IsError {
+					t.Fatal("Status failed")
+				}
+				text := pending.Result.Content[0].Text
+				if !strings.Contains(text, finalReviewPending) || strings.Count(text, finalReviewInstruction) != 1 {
+					t.Fatal("pending Status did not deliver the shared final guidance exactly once")
+				}
+				_, tail, ok := strings.Cut(text, "generation=")
+				if !ok {
+					t.Fatal("Status nonce missing")
+				}
+				quoted, err := strconv.QuotedPrefix(tail)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fromStatus, err = strconv.Unquote(quoted)
+				if err != nil {
+					t.Fatal(err)
+				}
+				after, _ := json.Marshal(finalSaved(t, root, testMCPSession))
+				if !bytes.Equal(before, after) {
+					t.Fatal("Status delivery changed final generation/declaration/Stop markers")
+				}
+			}
+			listed := nativeMCP(t, root, map[string]any{"method": "tools/list"})[0]
+			found := false
+			for _, tool := range listed.Result.Tools {
+				if tool.Name == "ortg_review" {
+					found = true
+					for _, wireText := range []string{tool.Description, tool.InputSchema.Properties["report"].Description} {
+						for _, need := range []string{"显式条件", "真实断言", "未验证", "计数"} {
+							if !strings.Contains(wireText, need) {
+								t.Fatalf("client descriptor did not carry assertion guidance %q", need)
+							}
+						}
+					}
+				}
+			}
+			if !found {
+				t.Fatal("review descriptor missing")
+			}
+			if wire := finalHookWire(t, root, host, true); strings.TrimSpace(wire) != "{}" {
+				t.Fatal("active Stop must remain quiet after pending Status")
+			}
+			submitted := call("ortg_review", map[string]any{"final": true, "generation": fromStatus, "report": []string{"按公开任务静态核对当前常量；运行断言尚未执行，保持未验证。"}})
+			if submitted.Result.IsError || !strings.Contains(submitted.Result.Content[0].Text, finalReviewRecorded) {
+				t.Fatal("direct same-generation declaration from Status failed")
+			}
+			f := finalSaved(t, root, testMCPSession)
+			if f.Reviewed != fromStatus || f.Prompted != "" {
+				t.Fatal("Status/submit consumed Stop opportunity or failed to preserve identity")
+			}
+			reviewed := call("ortg_status", map[string]any{})
+			if reviewed.Result.IsError || !strings.Contains(reviewed.Result.Content[0].Text, finalReviewDone) || strings.Contains(reviewed.Result.Content[0].Text, finalReviewInstruction) {
+				t.Fatal("reviewed Status must stay concise")
+			}
+			plan := call("ortg_review", map[string]any{"final": false})
+			if plan.Result.IsError || plan.Result.Content[0].Text != reviewEmpty || finalSaved(t, root, testMCPSession).Reviewed != fromStatus {
+				t.Fatal("final=false changed default plan Review or final state")
+			}
+		})
+	}
+}
+
 func TestFinalReviewNativeDelivery(t *testing.T) {
 	for _, host := range []string{"claude", "codex"} {
 		t.Run(host, func(t *testing.T) {
@@ -415,7 +499,7 @@ func TestFinalReviewNativeDelivery(t *testing.T) {
 			if err := json.Unmarshal([]byte(wire), &envelope); err != nil {
 				t.Fatal(err)
 			}
-			if envelope.Decision != "block" || !strings.Contains(envelope.Reason, g) || !strings.Contains(envelope.Reason, "ortg_review") {
+			if envelope.Decision != "block" || !strings.Contains(envelope.Reason, g) || !strings.Contains(envelope.Reason, "ortg_review") || !strings.Contains(envelope.Reason, strings.TrimSpace(finalReviewInstruction)) {
 				t.Fatalf("final text did not cross actual CLI envelope: %s", wire)
 			}
 			if wire := finalHookWire(t, root, host, true); strings.TrimSpace(wire) != "{}" {
@@ -428,7 +512,7 @@ func TestFinalReviewNativeDelivery(t *testing.T) {
 				return nativeMCP(t, root, map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_review", "arguments": args, "_meta": map[string]any{"threadId": sid}}})[0]
 			}
 			inspect := call(map[string]any{"final": true}, testMCPSession)
-			if inspect.Result.IsError || !strings.Contains(inspect.Result.Content[0].Text, g) {
+			if inspect.Result.IsError || !strings.Contains(inspect.Result.Content[0].Text, g) || !strings.Contains(inspect.Result.Content[0].Text, finalReviewInstruction) {
 				t.Fatal("native final inspection missing current generation")
 			}
 			wrong := call(map[string]any{"final": true, "generation": g, "report": []string{"unverified"}}, "other-neutral-context")

@@ -5553,6 +5553,9 @@ func finalStatus() string {
 		return ""
 	}
 	head, _, _ := strings.Cut(text, "\n")
+	if strings.Contains(head, "（"+finalReviewPending+"）") {
+		return "\n" + head + "\n" + finalReviewInstruction
+	}
 	return "\n" + head + "\n"
 }
 

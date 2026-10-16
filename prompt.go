@@ -141,7 +141,7 @@ var toolDescriptions = map[string]string{
 	"ortg_overview": "对账并返回纲要与全库计数摘要，完整路径清单用 ortg_status 按需查看。不带参数时整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回，超过时只返回纲要头与模块清单（不含条目正文）；再用 module（B 标签）取模块，module=\"*\" 取全部。同一会话只发上下文里还没有或已变动的条目，全都发过就只回计数摘要；上下文压缩或清空后自动重发；确实看不到时传 force=true 重发。一次超过单次上限时照发正文（可能被截断），开头提醒把模块拆细。本仓库启用了 ORTG（会话开始注入过 ORTG 纲要规则）时开工先调用。仓库没有 ortg.tsv 就是没启用 ORTG：不要调用 ortg 工具；只有用户明确要求创建（初始化）或对齐纲要时，才传 init=true 建表（根目录有 overview.txt 则先备份再整份导入，否则建空表；再首扫）。" + " " + taskOutlineRule,
 	"ortg_status":   "重新扫描并对账，只返回对账报告（无纲要/过期/观察变动/对齐各多少及路径），不返回纲要正文。被问到纲要是否对齐、有哪些文件要处理时用它——会话开始的报告只是当时的快照，不要引用。",
 	"ortg_update":   "提交当前文件纲要：用 path+outline 提交一个文件，或用 items 批量提交（每项为\"路径 完整纲要行\"，路径和文件名可含空格及括号，按纲要文件名与标签识别边界）。给了 items 就忽略 path/outline；空批、规范化后重复路径均拒绝。全批共用一个事务，任一项失败全部回滚并指出路径与原因；成功逐项报告，统一保存与刷新。每项仍校验格式、字典、Uses、Keys、API、角色与目录类型，前移指纹并清空目标纲要。全库初始化(build或旧兼容首次建设)按批前文档状态检查，不能同批补文档并首次提交源码；任务维护(task)只维护当前已读文件，未覆盖仍未知。全库建设成功后按批次最终状态提示阶段修订。批量只合并已阅读文件的完整当前纲要，不代替正文阅读与每文件改完立即提交；全库初始化仍按文档→修订→核心→修订→普通→最终修订流程。第三方库等不逐文件建纲要的目录，给目录本身写一行目录纲要：path 填目录，文件名以 / 结尾（vendored/[标签]: ...），B 标签填用到它的模块，它就随那个模块一起发送；目录本身放进 observe_dirs，其下文件就不再要求逐个写纲要。",
-	"ortg_review":   "可选 final=true：读取本上下文实写后的当前源码代际；用 generation 加非空 report 数组提交本代际审查声明（有效 UTF-8、合计至多4096字节）。这是模型声明，不是原生语义验收；源码或新识别失败使旧声明失效。默认参数仍核对改动计划（参数 rulings：对上一次核对给了正文的每条契约写一行「契约键：裁决」，缺了不收敛）：列出所有目标纲要（要改、新建、删除的文件）的现在→目标字段变化、不合格的目标行、Uses 依赖它们却还没有目标纲要的文件，并给出逐项核对清单。要改多个文件时，写完计划后调用；核对列出要补、要核实的地方时，补改后连续两次看到同一计划才解锁，计划全写 = 或核对没发现要补的地方时一次即解锁。只改一个文件不需要。只给自己核对用，不用给用户看。",
+	"ortg_review":   "可选 final=true：读取本上下文实写后的当前源码代际；用 generation 加非空 report 数组提交本代际审查声明（有效 UTF-8、合计至多4096字节）。这是模型声明，不是原生语义验收；源码或新识别失败使旧声明失效。" + " " + finalReviewContractGuide + " 默认参数仍核对改动计划（参数 rulings：对上一次核对给了正文的每条契约写一行「契约键：裁决」，缺了不收敛）：列出所有目标纲要（要改、新建、删除的文件）的现在→目标字段变化、不合格的目标行、Uses 依赖它们却还没有目标纲要的文件，并给出逐项核对清单。要改多个文件时，写完计划后调用；核对列出要补、要核实的地方时，补改后连续两次看到同一计划才解锁，计划全写 = 或核对没发现要补的地方时一次即解锁。只改一个文件不需要。只给自己核对用，不用给用户看。",
 	"ortg_target":   "写目标纲要（这个文件改完之后应有的纲要，用来指导接下来改代码；待核查、待实测的事项不是目标，不要写进来）：给 path 与 outline 写单个文件的目标纲要，delete=true 标记计划删除；或传 document 整份导入（高屋建瓴模式）。允许尚不存在的路径。改完代码后用 ortg_update 提交，目标纲要自动清空。只改实现、改完纲要不变时 outline 传 \"=\"（等于现在的纲要，不必抄整行）。一次改多个文件时用 items 一次传全部：每项 \"路径 目标纲要行\"，纲要行写 = 表示纲要不变，写 删除 表示计划删除。路径和文件名可含空格及括号，完整行按纲要文件名与标签识别边界，= 和 删除 从末尾识别。只改一个文件不需要写目标纲要。",
 	"ortg_align":    "人工已核对纲要对齐时调用：mode=all 前移全部文件指纹，mode=paths 只前移 paths。不改纲要文本。已确认的内容改动须提交新纲要，不能用对齐替代。",
 	"ortg_header":   "整块替换纲要头（必须含 #A/#B/#E 字典行），并可设置忽略目录、忽略文件、白名单、观察目录与目录标题（keep_files 压过忽略规则；dirs 为 \"目录=标题\" 列表，只作纲要里目录段的标题）。传了的列表整体替换，不传的字段保持原值。可选 mode=build 表示全库初始化，文档未齐时拒绝源码纲要；mode=task 表示部分纲要下的任务维护，只解除全部文档前置，其他校验与复审保留，未覆盖仍未知；空串恢复旧兼容行为，未传保持当前模式。模式持久化，不自动猜用户意图。" + " " + taskOutlineRule,
@@ -285,9 +285,10 @@ const gateTestEdit = "ortg: %s 是测试文件。改它的期望值前按证据�
 
 // Final review records a model declaration for a source generation, not
 // machine verification of the public task or unknown tests.
+const finalReviewContractGuide = "按原公开任务的显式条件（允许/禁止、特殊值、明确组合、输出含义），逐项对应最终实际消费入口，写出真实断言及结果，或未验证的依据；接口摘要、自测通过计数不能代替逐项依据。"
 const finalFlagDescription = "实写后的独立final阶段；不带generation/report时只读当前代际，默认false仍核对改前计划"
-const finalGenerationDescription = "final声明绑定的当前代际，必须来自本调用上下文的final回复"
-const finalReportDescription = "final审查声明，各项非空、合计至多4096字节UTF8；如实记录基于原公开任务与最终持久源码的验证及未验证边界"
+const finalGenerationDescription = "final声明绑定的当前代际，必须来自本调用上下文的Status或final回复"
+const finalReportDescription = "final审查声明，各项非空、合计至多4096字节UTF8。" + " " + finalReviewContractGuide
 const finalReviewNone = "ortg: 本调用上下文没有已归属的源码实写 final 审查义务；这不表示其他上下文或整个任务已验收。"
 const finalReviewNoSession = "final 审查需要宿主提供当前会话身份，不能按整个仓库代替本调用上下文"
 const finalReviewBadReport = "final 提交需要当前 generation 和非空 report；各项须非空，整份 report 须为有效 UTF-8 且不超过 4096 字节，不作截断"
@@ -298,7 +299,7 @@ const finalReviewDone = "已有本代际声明"
 const finalReviewHead = "ortg: 最终源码审查，generation=%q（%s）。这与改前计划 Review、纲要对齐和测试启动分开：\n"
 const finalReviewPath = "- %s\n"
 const finalReviewCount = "已跟踪 %d 个源码路径，本次列出 %d 个，另 %d 个因展示上限未列；未列路径仍绑定此代际。\n"
-const finalReviewInstruction = "回看本会话原公开任务、最终持久源码及必要调用方/消费者，独立核对公开接口要求的最终结果或后置状态；如实区分已验证与未验证，局部检查通过不代表整个公开任务满足。用 ortg_review final=true、上述 generation 和非空 report 数组提交审查声明；不要只重述计划。report 是模型的核查说明，不是原生语义验证或未知测试全通过证明。源码新变动或新识别失败会使旧声明失效。\n"
+const finalReviewInstruction = finalReviewContractGuide + "仅核对任务明确的条件，不扩为所有参数组合或全库测试，不猜任务未规定的错误文案。report上限4096字节，放不下时明确已核对范围及其余未验证边界，不截断后声称全覆盖。用 ortg_review final=true、上述 generation 和非空 report 数组提交本代际声明。report 是模型的核查说明，不是原生语义验证或未知测试全通过证明。源码新变动或新识别失败会使旧声明失效。\n"
 const finalReviewRecorded = "ortg: 已记录当前代际的 final 审查声明"
 const finalReviewAccepted = finalReviewRecorded + "（%s）。这是本上下文的模型报告，不代表原生验证了语义正确或测试全通过。"
 const finalFailureUnknown = "ortg: 此失败结果缺少宿主操作身份，本次保守使 final 声明失效；无法区分重放与同输出新运行，不把它当新增测试执行证据。"
