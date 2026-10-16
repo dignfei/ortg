@@ -134,6 +134,7 @@ func TestOverviewRuleDelivery(t *testing.T) {
 					t.Fatal(err)
 				}
 				base.MarkOverview(root, sentMark(testMCPSession), string(wire))
+				base.MarkOverview(root, "disc-"+sessionKey(testMCPSession), "") // legacy hook receipt
 				short := get("ST", testMCPSession)
 				check(short, true)
 				if !strings.HasSuffix(short, overviewShortFooter) || strings.Contains(short, outline) {

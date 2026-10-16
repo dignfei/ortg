@@ -2632,6 +2632,7 @@ func TestDisciplineOncePerContext(t *testing.T) {
 		t.Fatalf("the subagent too gets it once:\n%s", out)
 	}
 	HookReply("session", base.HookInput{Cwd: root, SessionID: "s1", Source: "compact", TranscriptPath: tr})
+	os.WriteFile(tr, []byte(`{"type":"user"}`+"\n"+`{"type":"system","subtype":"compact_boundary","timestamp":"`+time.Now().UTC().Format(time.RFC3339Nano)+`"}`+"\n"), 0o644)
 	if out := edit("s1", ""); !full(out) {
 		t.Fatalf("after the session's compaction the text goes out again:\n%s", out)
 	}
@@ -2682,6 +2683,12 @@ func TestResumeKeepsContext(t *testing.T) {
 		if ctx, _ := HookReplyFull("session", base.HookInput{Cwd: root, SessionID: "s1", Source: src}); !full(ctx) {
 			t.Fatalf("%s gets the rules and the fetch note:\n%s", src, ctx)
 		}
+	}
+	// The existing context has actually received the current discipline.
+	useCallSession(base.Args{"_meta": map[string]any{"threadId": "s1"}})
+	t.Cleanup(func() { useCallSession(nil) })
+	if _, err := Overview("", false); err != nil {
+		t.Fatal(err)
 	}
 	ctx, user := HookReplyFull("session", base.HookInput{Cwd: root, SessionID: "s1", Source: "resume"})
 	if ctx != resumeNote || !strings.HasPrefix(user, "ortg 对账：") {

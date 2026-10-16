@@ -17,6 +17,7 @@ func TestCodexSessionCountsDelivery(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	t.Setenv("ORTG_AGENT", "codex")
 	var smallSize int
+	t.Cleanup(func() { useCallSession(nil) })
 	for _, count := range []int{1, 4096} {
 		root := t.TempDir()
 		t.Chdir(root)
@@ -35,6 +36,7 @@ func TestCodexSessionCountsDelivery(t *testing.T) {
 			t.Fatal(err)
 		}
 		session := fmt.Sprintf("counts-%d", count)
+		useCallSession(base.Args{"_meta": map[string]any{"threadId": session}})
 		ctx, user := HookReplyFull("session", base.HookInput{Cwd: root, Source: "startup", SessionID: session})
 		var wire bytes.Buffer
 		base.WriteHookOutput(&wire, "codex", "SessionStart", ctx, user)

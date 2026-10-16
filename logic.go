@@ -617,7 +617,7 @@ func Overview(module string, force bool) (string, error) {
 	defer overviewMu.Unlock()
 	c := sentFor(x.Root())
 	defer saveSent(x.Root(), c)
-	rules := overviewDiscipline(c)
+	rules := overviewDiscipline(root, c)
 	first := "" // a fresh table: the docs come before any outline
 	if headerUnwritten(x.Header()) {
 		first = headerFirstText(x) + "\n\n"
@@ -948,25 +948,68 @@ func noteTranscript(root, session, transcript string) {
 
 func disciplineText() string { return updateDiscipline + " " + impactRules }
 
+// Claude's MCP environment can keep the previous session id after /clear.
+// Its own recorded transcript identifies the same context for both processes.
+func disciplineMarks(sid, transcript string) []string {
+	var marks []string
+	if sid != "" {
+		marks = append(marks, "disc-"+sessionKey(sid))
+	}
+	if transcript != "" {
+		marks = append(marks, "disc-t"+sessionKey(transcript))
+	}
+	return marks
+}
+
+// disciplineKnown shares actual rule delivery between Overview and hooks.
+// Legacy empty receipts carry no content identity; a valid saved Rules field
+// still proves delivery. Startup invalidates only rule knowledge, without
+// changing the saved outline or permissions. Check all resets before accepting
+// a receipt under either identity.
+func disciplineKnown(root, sid, transcript, fingerprint string, c *sentCache, resetAt time.Time) bool {
+	var sentAt time.Time
+	for _, mark := range disciplineMarks(sid, transcript) {
+		at, content := base.OverviewMark(root, mark)
+		if content == "reset" && at.After(resetAt) {
+			resetAt = at
+		}
+		if content == fingerprint && at.After(sentAt) {
+			sentAt = at
+		}
+	}
+	return sentAt.After(resetAt) || c != nil && c.rules == fingerprint && c.born.After(resetAt)
+}
+
 // Overview carries the current rules even when no host edit hook runs.
-// Its existing context cache persists the content fingerprint across servers.
-func overviewDiscipline(c *sentCache) string {
+func overviewDiscipline(root string, c *sentCache) string {
 	full := disciplineText()
 	fingerprint := fmt.Sprintf("%x", sha1.Sum([]byte(full)))
-	if c.rules == fingerprint {
+	resetAt, _ := lastReset(root)
+	transcript := ""
+	if base.Host() != "codex" && (callSession.fromEnv || callSession.subagent) {
+		transcript = claudeTranscript(root)
+		if callSession.subagent && transcript != "" {
+			transcript = base.SubagentTranscript(transcript, c.sid)
+		}
+	}
+	known := disciplineKnown(root, c.sid, transcript, fingerprint, c, resetAt)
+	c.rules = fingerprint
+	if known {
 		return ""
 	}
-	c.rules = fingerprint
+	if c.sid != "" {
+		for _, mark := range disciplineMarks(c.sid, transcript) {
+			base.MarkOverview(root, mark, fingerprint)
+		}
+	}
 	return full + "\n"
 }
 
-// disciplineFor is the outline discipline a hook adds to a notice: in full
-// the first time a context gets one (with impactRules), afterwards one line
-// pointing back to it. The context is the subagent's when agent_id is set.
-// The full text goes out again once that context lost it: a session start,
-// clear or compaction resets the injected marks (ResetInjected), and a
-// Claude Code compaction — whose hook cannot say which context compacted —
-// shows in the context's own transcript after the text was last sent.
+// disciplineFor adds the current discipline once per context, including on
+// resume after its content changes. Hook receipts are separate from Sent:
+// writing Sent here would overwrite a running MCP server's permission cache.
+// Claude compaction is checked in this context's own transcript because a
+// session hook can report a child's compaction using the parent's session id.
 func disciplineFor(root string, in base.HookInput) string {
 	key := in.SessionID
 	if in.AgentID != "" {
@@ -976,20 +1019,27 @@ func disciplineFor(root string, in base.HookInput) string {
 	if key == "" {
 		return full
 	}
-	mark := "disc-" + sessionKey(key)
-	first := base.InjectOnce(key, "discipline")
-	if !first && in.TranscriptPath != "" {
+	fingerprint := fmt.Sprintf("%x", sha1.Sum([]byte(full)))
+	resetAt, _ := base.OverviewMark(root, "reset-s"+sessionKey(key))
+	transcript := ""
+	if in.TranscriptPath != "" {
 		tr := in.TranscriptPath
 		if in.AgentID != "" {
 			tr = base.SubagentTranscript(tr, in.AgentID)
 		}
-		sent, _ := base.OverviewMark(root, mark)
-		first = base.LastCompactAt(tr).After(sent)
+		if at := base.LastCompactAt(tr); at.After(resetAt) {
+			resetAt = at
+		}
+		if base.Host() != "codex" {
+			transcript = tr
+		}
 	}
-	if !first {
+	if disciplineKnown(root, key, transcript, fingerprint, loadSent(root, key), resetAt) {
 		return disciplineSeen
 	}
-	base.MarkOverview(root, mark, "")
+	for _, mark := range disciplineMarks(key, transcript) {
+		base.MarkOverview(root, mark, fingerprint)
+	}
 	return full
 }
 
@@ -1038,7 +1088,7 @@ type sentCache struct {
 	// shown, the contracts and fallback entries quoted in full, the affected
 	// files named, and whether the conflict text and the checklist went out.
 	plan  planSeen
-	rules string // fingerprint of the complete discipline last sent by Overview
+	rules string // fingerprint of the complete discipline known to this context
 }
 
 // planSeen is what the reviews of one plan have shown; the zero value is a
@@ -6077,6 +6127,22 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			// A new conversation: a saved cache describes another context.
 			// Servers already running keep theirs — another session's.
 			base.MarkOverview(root, "start", "")
+			key := in.SessionID
+			if agent != "" {
+				key = agent
+			}
+			if key != "" {
+				transcript := ""
+				if base.Host() != "codex" && in.TranscriptPath != "" {
+					transcript = in.TranscriptPath
+					if agent != "" {
+						transcript = base.SubagentTranscript(transcript, agent)
+					}
+				}
+				for _, mark := range disciplineMarks(key, transcript) {
+					base.MarkOverview(root, mark, "reset")
+				}
+			}
 			base.PruneOverviewMarks(root, []string{"reset-s", "reset-p", "sent-s"}, staleMarkAge)
 		}
 		if agent != "" {
@@ -6098,22 +6164,27 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			ch <- res{s, err}
 		}()
 		resumed := in.Source == "resume"
+		resume := resumeNote
+		if resumed {
+			if rules := disciplineFor(root, in); rules != disciplineSeen {
+				resume = resumeRulesNote + "\n\n" + rules
+			}
+		}
 		select {
 		case r := <-ch:
 			if r.err != nil {
 				if resumed {
-					return resumeNote, ""
+					return resume, ""
 				}
 				return rulesText(), ""
 			}
 			if resumed {
-				// The context still holds the rules and the outline: no rules,
-				// no "fetch first", no "report first" again — only the report
-				// when files wait on the user's call.
+				// Keep the outline and permissions. The current discipline is
+				// supplemented above only when its delivery is not known.
 				if r.s.needsDecision() {
-					return resumeNote + "\n\n" + r.s.sessionReport(), "ortg 对账：" + r.s.oneLine()
+					return resume + "\n\n" + r.s.sessionReport(), "ortg 对账：" + r.s.oneLine()
 				}
-				return resumeNote, "ortg 对账：" + r.s.oneLine()
+				return resume, "ortg 对账：" + r.s.oneLine()
 			}
 			graph := ""
 			if x.GraphRefused() {
@@ -6123,7 +6194,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 				"ortg 对账：" + r.s.oneLine()
 		case <-time.After(4 * time.Second):
 			if resumed {
-				return resumeNote, ""
+				return resume, ""
 			}
 			return rulesText() + "\n\n" + sessionFetchNote, ""
 		}
