@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"ortg/base"
 )
 
 func TestEntryFamilyDelivery(t *testing.T) {
@@ -14,13 +16,14 @@ func TestEntryFamilyDelivery(t *testing.T) {
 	if msg, failed := nativeUpdate(t, root, map[string]any{"path": "a.go", "outline": updateLine("a.go", "fixture")}); failed {
 		t.Fatal(msg)
 	}
-	check := func(stage string, r updateMCPReply) {
+	checkText := func(stage, text string) {
 		t.Helper()
-		if r.Result.IsError || len(r.Result.Content) != 1 {
-			t.Fatalf("%s native reply: %+v", stage, r)
-		}
-		text := r.Result.Content[0].Text
 		for _, requirement := range []string{
+			"公开契约涉及可选、尽力或非致命的附带步骤时",
+			"明确主操作结果、附带失败及恢复边界",
+			"经本次涉及的全部公共入口验证，已明确可恢复的附带失败不改变已成功主操作的约定结果",
+			"保留取消、退出等控制流语义",
+			"未核实的边界保持未知，不将可选直接等同于失败可忽略",
 			"相关默认重试、缓存及异常转换的行为和信号归属纳入 API/Constraints 和目标计划",
 			"公开生产者→适配/中间层→实际调用方→可观察消费者的任务相关路径",
 			"依据可见配置、依赖实现或测试核对实际生效的默认行为",
@@ -40,6 +43,13 @@ func TestEntryFamilyDelivery(t *testing.T) {
 			}
 		}
 	}
+	check := func(stage string, r updateMCPReply) {
+		t.Helper()
+		if r.Result.IsError || len(r.Result.Content) != 1 {
+			t.Fatalf("%s native reply: %+v", stage, r)
+		}
+		checkText(stage, r.Result.Content[0].Text)
+	}
 	replies := nativeMCP(t, root,
 		map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_overview", "arguments": map[string]any{}}},
 		map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_gate", "arguments": map[string]any{"tool": "Edit", "path": filepath.Join(root, "a.go"), "dir": root}}},
@@ -50,4 +60,6 @@ func TestEntryFamilyDelivery(t *testing.T) {
 		map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_review", "arguments": map[string]any{}}},
 	)
 	check("review checklist", replies[1])
+	writeFile(t, filepath.Join(root, "a.go"), "updated fixture")
+	checkText("edit hook", HookReply("post", base.HookInput{Cwd: root, SessionID: "entry-contract-hook", ToolName: "Edit", FilePath: filepath.Join(root, "a.go")}))
 }
