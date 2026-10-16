@@ -14,6 +14,7 @@ import (
 )
 
 func TestShellLiteralAccess(t *testing.T) {
+	useTestMCPSession(t)
 	t.Setenv("TMPDIR", t.TempDir())
 	root := t.TempDir()
 	os.Mkdir(filepath.Join(root, "nested"), 0o755)
@@ -80,6 +81,7 @@ func TestShellLiteralAccess(t *testing.T) {
 	if _, err := Overview("", false); err != nil {
 		t.Fatal(err)
 	}
+	finishRules(t)
 	for _, cmd := range []string{"sed -i s/a/b/ a.go", "echo hi > a.go", `python -c "from pathlib import Path; Path('a.go').write_text('package b')"`, `python -c "open('a.go', encoding='utf-8', mode='w').write('package b')"`, `bash -c 'printf x' > a.go`} {
 		_, writes := gateTargets(x, "Bash", "", "", cmd)
 		if !slices.Contains(writes, "a.go") {
@@ -188,6 +190,7 @@ func TestPairedWriteAlignment(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			useTestMCPSession(t)
 			t.Setenv("ORTG_STATE_DIR", t.TempDir())
 			t.Setenv("ORTG_AGENT", "codex")
 			root := updateRepo(t, "a.go", "b.go")
@@ -210,6 +213,7 @@ func TestPairedWriteAlignment(t *testing.T) {
 			if _, err := Overview("", false); err != nil {
 				t.Fatal(err)
 			}
+			finishRules(t)
 			if tc.planned {
 				if _, err := Target("a.go", "=", false, ""); err != nil {
 					t.Fatal(err)

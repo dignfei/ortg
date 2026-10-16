@@ -234,12 +234,9 @@ func (s summary) countsReport() string {
 	return report
 }
 
-// sessionReport keeps Codex's fixed-size hook channel independent of the
+// sessionReport keeps both hosts' bounded hook channels independent of the
 // inventory. Status still carries the complete report on demand.
 func (s summary) sessionReport() string {
-	if base.Host() != "codex" {
-		return s.report()
-	}
 	return s.countsReport()
 }
 
@@ -617,7 +614,7 @@ func Overview(module string, force bool) (string, error) {
 	defer overviewMu.Unlock()
 	c := sentFor(x.Root())
 	defer saveSent(x.Root(), c)
-	rules := overviewDiscipline(root, c)
+	rules := overviewDiscipline(root)
 	first := "" // a fresh table: the docs come before any outline
 	if headerUnwritten(x.Header()) {
 		first = headerFirstText(x) + "\n\n"
@@ -961,69 +958,163 @@ func disciplineMarks(sid, transcript string) []string {
 	return marks
 }
 
-// disciplineKnown shares actual rule delivery between Overview and hooks.
-// Legacy empty receipts carry no content identity; a valid saved Rules field
-// still proves delivery. Startup invalidates only rule knowledge, without
-// changing the saved outline or permissions. Check all resets before accepting
-// a receipt under either identity.
-func disciplineKnown(root, sid, transcript, fingerprint string, c *sentCache, resetAt time.Time) bool {
-	var sentAt time.Time
+// Only the bounded MCP page protocol can complete a rule receipt. Old hook
+// fingerprints and Sent.Rules prove neither a complete page chain nor its ack.
+func disciplineKnown(root, sid, transcript, fingerprint string, resetAt time.Time) bool {
+	mark, resetAt := ruleIdentity(root, sid, transcript, resetAt)
+	_, data := base.OverviewMark(root, mark)
+	var state ruleDelivery
+	return mark != "" && json.Unmarshal([]byte(data), &state) == nil && state.Done &&
+		state.Fingerprint == fingerprint && state.Born.After(resetAt)
+}
+
+func ruleIdentity(root, sid, transcript string, resetAt time.Time) (string, time.Time) {
+	mark := ""
 	for _, mark := range disciplineMarks(sid, transcript) {
 		at, content := base.OverviewMark(root, mark)
 		if content == "reset" && at.After(resetAt) {
 			resetAt = at
 		}
-		if content == fingerprint && at.After(sentAt) {
-			sentAt = at
-		}
 	}
-	return sentAt.After(resetAt) || c != nil && c.rules == fingerprint && c.born.After(resetAt)
+	if marks := disciplineMarks(sid, transcript); len(marks) > 0 {
+		mark = "rules-" + marks[len(marks)-1] // Separate progress from hook reset marks.
+	}
+	return mark, resetAt
 }
 
-// Overview carries the current rules even when no host edit hook runs.
-func overviewDiscipline(root string, c *sentCache) string {
-	full := disciplineText()
-	fingerprint := fmt.Sprintf("%x", sha1.Sum([]byte(full)))
+func rulePayload() string { return rulesText() + "\n" + disciplineText() }
+
+func ruleFingerprint() string {
+	return "rules-mcp-v1:" + fmt.Sprintf("%x", sha1.Sum([]byte(rulePayload())))
+}
+
+func mcpRuleIdentity(root string) (string, string, time.Time) {
+	sid, transcript := "", ""
+	if len(callSession.ids) > 0 {
+		sid = callSession.ids[0]
+	}
 	resetAt, _ := lastReset(root)
-	transcript := ""
 	if base.Host() != "codex" && (callSession.fromEnv || callSession.subagent) {
 		transcript = claudeTranscript(root)
 		if callSession.subagent && transcript != "" {
-			transcript = base.SubagentTranscript(transcript, c.sid)
+			transcript = base.SubagentTranscript(transcript, sid)
 		}
 	}
-	known := disciplineKnown(root, c.sid, transcript, fingerprint, c, resetAt)
-	c.rules = fingerprint
-	if known {
-		return ""
-	}
-	if c.sid != "" {
-		for _, mark := range disciplineMarks(c.sid, transcript) {
-			base.MarkOverview(root, mark, fingerprint)
-		}
-	}
-	return full + "\n"
+	return sid, transcript, resetAt
 }
 
-// disciplineFor adds the current discipline once per context, including on
-// resume after its content changes. Hook receipts are separate from Sent:
-// writing Sent here would overwrite a running MCP server's permission cache.
-// Claude compaction is checked in this context's own transcript because a
-// session hook can report a child's compaction using the parent's session id.
+func mcpRulesKnown(root string) bool {
+	sid, transcript, resetAt := mcpRuleIdentity(root)
+	return disciplineKnown(root, sid, transcript, ruleFingerprint(), resetAt)
+}
+
+// Ordinary overviews preserve their outline scope and cache. Rules travel
+// separately so a large outline cannot bury their middle in a host preview.
+func overviewDiscipline(root string) string {
+	if mcpRulesKnown(root) {
+		return ""
+	}
+	return rulesNeeded + "\n"
+}
+
+const rulePageMax = 4096
+const ruleBodyMax = 3072 // Reserve the rest for the UTF-8 envelope and cursor.
+
+type ruleDelivery struct {
+	Fingerprint string
+	Born        time.Time
+	Next        int
+	Cursor      string
+	Previous    string
+	Done        bool
+}
+
+// RulesTool sends a bounded page, or accepts the cursor returned after the
+// final page. Its isolated mark never rewrites Sent or write/final proofs.
+func RulesTool(cursor string, force bool) (string, error) {
+	root := repoRoot()
+	if Disabled("") {
+		return disabledReply, nil
+	}
+	if !tableExists() {
+		return noTableReply, nil
+	}
+	sid, transcript, resetAt := mcpRuleIdentity(root)
+	mark, resetAt := ruleIdentity(root, sid, transcript, resetAt)
+	if mark == "" {
+		return "", errors.New(rulesNoSession)
+	}
+	full, fingerprint := rulePayload(), ruleFingerprint()
+	var pages []string
+	for rest := full; rest != ""; {
+		n := min(len(rest), ruleBodyMax)
+		for n < len(rest) && !utf8.RuneStart(rest[n]) {
+			n--
+		}
+		pages = append(pages, rest[:n])
+		rest = rest[n:]
+	}
+	out := ""
+	render := func(page int, next string) string {
+		return fmt.Sprintf(rulesPageHead, fingerprint, page+1, len(pages)) + pages[page] +
+			fmt.Sprintf(rulesPageEnd, page+1, next)
+	}
+	err := base.MutateOverviewMark(root, mark, func(data string) (string, error) {
+		var state ruleDelivery
+		valid := json.Unmarshal([]byte(data), &state) == nil && state.Fingerprint == fingerprint &&
+			state.Born.After(resetAt) && state.Next >= 0 && state.Next <= len(pages)
+		if valid && !force && !state.Done && state.Next > 0 && cursor == state.Previous {
+			out = render(state.Next-1, state.Cursor)
+			return data, nil // A lost response can be retried without skipping a page.
+		}
+		if cursor == "" {
+			if valid && state.Done && !force {
+				out = rulesComplete
+				return data, nil
+			}
+			state = ruleDelivery{Fingerprint: fingerprint, Born: time.Now()}
+		} else if force || !valid || cursor != state.Cursor {
+			return "", errors.New(rulesBadCursor)
+		}
+		if state.Next == len(pages) {
+			state.Done = true
+			out = rulesComplete
+		} else {
+			page := state.Next
+			state.Next++
+			state.Previous = cursor
+			state.Cursor = fmt.Sprintf("%x", sha1.Sum([]byte(root+"\x00"+mark+"\x00"+fingerprint+state.Born.Format(time.RFC3339Nano)+strconv.Itoa(state.Next))))
+			out = render(page, state.Cursor)
+			if len(out) > rulePageMax {
+				return "", errors.New(rulesPageOverflow)
+			}
+		}
+		b, err := json.Marshal(state)
+		return string(b), err
+	})
+	if err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// Hooks only point to MCP. An emitted hook may be truncated before the model
+// sees it, so it must not complete a rule receipt or overwrite a warm Sent.
 func disciplineFor(root string, in base.HookInput) string {
 	key := in.SessionID
 	if in.AgentID != "" {
 		key = in.AgentID
 	}
-	full := disciplineText()
 	if key == "" {
-		return full
+		return rulesNeeded
 	}
-	fingerprint := fmt.Sprintf("%x", sha1.Sum([]byte(full)))
 	resetAt, _ := base.OverviewMark(root, "reset-s"+sessionKey(key))
 	transcript := ""
-	if in.TranscriptPath != "" {
-		tr := in.TranscriptPath
+	tr := in.TranscriptPath
+	if tr == "" && base.Host() != "codex" {
+		_, tr = base.OverviewMark(root, "transcript-s"+sessionKey(in.SessionID))
+	}
+	if tr != "" {
 		if in.AgentID != "" {
 			tr = base.SubagentTranscript(tr, in.AgentID)
 		}
@@ -1034,13 +1125,10 @@ func disciplineFor(root string, in base.HookInput) string {
 			transcript = tr
 		}
 	}
-	if disciplineKnown(root, key, transcript, fingerprint, loadSent(root, key), resetAt) {
+	if disciplineKnown(root, key, transcript, ruleFingerprint(), resetAt) {
 		return disciplineSeen
 	}
-	for _, mark := range disciplineMarks(key, transcript) {
-		base.MarkOverview(root, mark, fingerprint)
-	}
-	return full
+	return rulesNeeded
 }
 
 // markCompact records a compaction a hook reports. Codex names the
@@ -1088,7 +1176,7 @@ type sentCache struct {
 	// shown, the contracts and fallback entries quoted in full, the affected
 	// files named, and whether the conflict text and the checklist went out.
 	plan  planSeen
-	rules string // fingerprint of the complete discipline known to this context
+	rules string // legacy Sent.Rules value; never proves a completed MCP receipt
 }
 
 // planSeen is what the reviews of one plan have shown; the zero value is a
@@ -1269,6 +1357,9 @@ func gateCall(x *base.Index, tool, path, dir, command string) string {
 		// the plan for them has been written and checked to a fixpoint.
 		if c.header == "" {
 			return base.PreToolDecision(gateWriteUnloaded, true)
+		}
+		if !mcpRulesKnown(x.Root()) {
+			return base.PreToolDecision(rulesNeeded, true)
 		}
 		_, targeted := planSnapshot(x)
 		var unplanned []string
@@ -5552,6 +5643,9 @@ func finalReview(generation string, report []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if !inspect && !mcpRulesKnown(x.Root()) {
+		return "", errors.New(rulesNeeded)
+	}
 	out := finalReviewNone
 	var invalid error
 	err = withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
@@ -6073,7 +6167,17 @@ func HookReply(event string, in base.HookInput) string {
 // HookReplyFull answers a hook event: the first string is context for the
 // model, the second is a one-liner shown to the user (only the session
 // reconcile and a corrupt-table stop produce one).
-func HookReplyFull(event string, in base.HookInput) (string, string) {
+func HookReplyFull(event string, in base.HookInput) (context, userMessage string) {
+	defer func() {
+		if event == "session" || event == "subagent" {
+			// Reserve envelope space using JSON-escaped bytes, including unusual
+			// paths/errors. Neither host should spill a SessionStart rule notice.
+			b, _ := json.Marshal([]string{context, userMessage})
+			if len(b) > 3072 {
+				context, userMessage = rulesNeeded+"\n"+sessionFetchNote, ""
+			}
+		}
+	}()
 	start := in.Cwd
 	if start == "" {
 		start, _ = os.Getwd()
@@ -6133,8 +6237,11 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			}
 			if key != "" {
 				transcript := ""
-				if base.Host() != "codex" && in.TranscriptPath != "" {
+				if base.Host() != "codex" {
 					transcript = in.TranscriptPath
+					if transcript == "" {
+						_, transcript = base.OverviewMark(root, "transcript-s"+sessionKey(in.SessionID))
+					}
 					if agent != "" {
 						transcript = base.SubagentTranscript(transcript, agent)
 					}
@@ -6176,7 +6283,7 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 				if resumed {
 					return resume, ""
 				}
-				return rulesText(), ""
+				return rulesNeeded, ""
 			}
 			if resumed {
 				// Keep the outline and permissions. The current discipline is
@@ -6190,16 +6297,16 @@ func HookReplyFull(event string, in base.HookInput) (string, string) {
 			if x.GraphRefused() {
 				graph = fmt.Sprintf(graphRefusedNote, x.Root())
 			}
-			return rulesText() + "\n\n" + r.s.sessionReport() + "\n" + graph + sessionFetchNote + sessionReportNote,
+			return rulesNeeded + "\n\n" + r.s.sessionReport() + "\n" + graph + sessionFetchNote + sessionReportNote,
 				"ortg 对账：" + r.s.oneLine()
 		case <-time.After(4 * time.Second):
 			if resumed {
 				return resume, ""
 			}
-			return rulesText() + "\n\n" + sessionFetchNote, ""
+			return rulesNeeded + "\n\n" + sessionFetchNote, ""
 		}
 	case "subagent":
-		return rulesText(), ""
+		return rulesNeeded, ""
 	case "compact":
 		// PostCompact is the moment the context loses the outline on both
 		// hosts. Codex only fires SessionStart(compact) lazily, at the next

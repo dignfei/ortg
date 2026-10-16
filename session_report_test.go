@@ -48,10 +48,10 @@ func TestCodexSessionCountsDelivery(t *testing.T) {
 		if err := json.Unmarshal(wire.Bytes(), &envelope); err != nil {
 			t.Fatal(err)
 		}
-		if envelope.Specific.Context != ctx || !strings.HasPrefix(ctx, rulesText()+"\n\n") ||
+		if wire.Len() > 4096 || envelope.Specific.Context != ctx || !strings.HasPrefix(ctx, rulesNeeded+"\n\n") ||
 			!strings.Contains(ctx, sessionFetchNote+sessionReportNote) ||
 			!strings.Contains(ctx, fmt.Sprintf("无纲要 %d", count)) || strings.Contains(ctx, paths[0]) {
-			t.Fatalf("startup must carry all rules and counts, without enumerating paths: %d bytes", wire.Len())
+			t.Fatalf("startup must carry a bounded rule notice and counts, without enumerating paths: %d bytes", wire.Len())
 		}
 		if count == 1 {
 			smallSize = wire.Len()
@@ -80,6 +80,7 @@ func TestCodexSessionCountsDelivery(t *testing.T) {
 		if _, prompt := HookReplyFull("prompt", base.HookInput{Cwd: root, SessionID: session}); prompt != "" {
 			t.Fatal("decision options repeated")
 		}
+		finishRules(t)
 		resume, _ := HookReplyFull("session", base.HookInput{Cwd: root, Source: "resume", SessionID: session})
 		if !strings.HasPrefix(resume, resumeNote) || strings.Contains(resume, paths[0]) ||
 			strings.Contains(resume, sessionFetchNote) || !strings.Contains(resume, decisionText) {
@@ -94,8 +95,8 @@ func TestCodexSessionCountsDelivery(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		for _, source := range []string{"compact", "clear"} {
 			reset, _ := HookReplyFull("session", base.HookInput{Cwd: root, Source: source, SessionID: session})
-			if !strings.HasPrefix(reset, rulesText()+"\n\n") || strings.Contains(reset, paths[0]) {
-				t.Fatal("context reset must send complete rules with counts")
+			if !strings.HasPrefix(reset, rulesNeeded+"\n\n") || strings.Contains(reset, paths[0]) {
+				t.Fatal("context reset must send a rule notice with counts")
 			}
 			if out, err := Gate("Read", filepath.Join(root, paths[0]), "", "", ""); err != nil || !strings.Contains(out, deniedMark) {
 				t.Fatalf("reset must re-arm the unloaded gate: %q, %v", out, err)
@@ -103,12 +104,13 @@ func TestCodexSessionCountsDelivery(t *testing.T) {
 			if resent, err := Overview("", false); err != nil || !strings.Contains(resent, filepath.Base(paths[0])) {
 				t.Fatalf("reset must re-send entries: %v", err)
 			}
+			finishRules(t)
 			time.Sleep(10 * time.Millisecond)
 		}
 		t.Setenv("ORTG_AGENT", "claude")
 		claude, _ := HookReplyFull("session", base.HookInput{Cwd: root, Source: "startup", SessionID: "claude-" + session})
-		if !strings.Contains(claude, paths[0]) || !strings.Contains(claude, paths[len(paths)-1]) {
-			t.Fatal("non-Codex session report changed")
+		if strings.Contains(claude, paths[0]) || strings.Contains(claude, paths[len(paths)-1]) || !strings.Contains(claude, rulesNeeded) || len(claude) > 2048 {
+			t.Fatal("Claude hook must keep its complete inventory in Status")
 		}
 		t.Setenv("ORTG_AGENT", "codex")
 		if count == 1 {

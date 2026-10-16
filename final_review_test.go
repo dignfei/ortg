@@ -30,6 +30,7 @@ func finalFixture(t *testing.T) string {
 			t.Fatal(err)
 		}
 	}
+	finishRules(t)
 	return root
 }
 func finalSaved(t *testing.T, root, sid string) finalReviewState {

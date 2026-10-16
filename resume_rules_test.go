@@ -2,14 +2,16 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
-	"time"
+	"unicode/utf8"
 
 	"ortg/base"
 )
@@ -103,176 +105,333 @@ func resumeRulesMCP(t *testing.T, root string) func(string, map[string]any) stri
 	}
 }
 
+var ruleCursorRE = regexp.MustCompile(`rules="([0-9a-f]+)"`)
+
+func rulePage(t *testing.T, text string) (string, string) {
+	t.Helper()
+	if len(text) > rulePageMax || !utf8.ValidString(text) {
+		t.Fatal("invalid or oversized native rule page", len(text))
+	}
+	_, body, ok := strings.Cut(text, "\n---规则正文---\n")
+	if !ok {
+		t.Fatal("missing rule page head", text)
+	}
+	body, _, ok = strings.Cut(body, "\n---规则正文结束---\n")
+	if !ok {
+		t.Fatal("missing rule page tail")
+	}
+	m := ruleCursorRE.FindStringSubmatch(text)
+	if len(m) != 2 {
+		t.Fatal("missing continuation", text)
+	}
+	return body, m[1]
+}
+
+// Exercise the actual public page API and the extra completion call. These
+// helpers do not create a receipt or replace any production function.
+func collectRules(t *testing.T, call func(string, map[string]any) string) string {
+	t.Helper()
+	var body strings.Builder
+	out := call("ortg_overview", map[string]any{"rules": ""})
+	if out == rulesComplete {
+		return ""
+	}
+	for i := 0; i < 64; i++ {
+		page, next := rulePage(t, out)
+		body.WriteString(page)
+		out = call("ortg_overview", map[string]any{"rules": next})
+		if out == rulesComplete {
+			return body.String()
+		}
+	}
+	t.Fatal("rule pagination did not terminate")
+	return ""
+}
+func finishRules(t *testing.T) {
+	t.Helper()
+	call := func(_ string, a map[string]any) string {
+		s, e := RulesTool(a["rules"].(string), false)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return s
+	}
+	collectRules(t, call)
+}
+func ruleRequest(args map[string]any, sid string) map[string]any {
+	p := map[string]any{"name": "ortg_overview", "arguments": args}
+	if sid != "" {
+		p["_meta"] = map[string]any{"threadId": sid}
+	}
+	return map[string]any{"method": "tools/call", "params": p}
+}
 func TestResumeRuleDelivery(t *testing.T) {
 	for _, host := range []string{"claude", "codex"} {
-		for _, first := range []string{"hook", "overview"} {
-			for _, previous := range []string{"missing", "changed", "current"} {
-				t.Run(host+"/"+first+"/"+previous, func(t *testing.T) {
-					t.Setenv("ORTG_AGENT", host)
-					root := updateRepo(t, "a.go")
-					if _, err := scanWithHeader(); err != nil {
-						t.Fatal(err)
+		for _, legacy := range []string{"", fmt.Sprintf("%x", sha1.Sum([]byte(disciplineText())))} {
+			t.Run(host+"/"+fmt.Sprint(len(legacy)), func(t *testing.T) {
+				t.Setenv("ORTG_AGENT", host)
+				root := updateRepo(t, "a.go")
+				scanWithHeader()
+				Update("a.go", updateLine("a.go", "neutral source"))
+				seed := resumeRulesMCP(t, root)
+				seed("ortg_overview", nil)
+				_, saved := base.OverviewMark(root, sentMark(testMCPSession))
+				var cache map[string]any
+				json.Unmarshal([]byte(saved), &cache)
+				cache["Rules"] = fmt.Sprintf("%x", sha1.Sum([]byte(disciplineText())))
+				cache["Reviews"] = 2
+				cache["Planned"] = map[string]bool{"a.go": true}
+				cache["Solo"] = map[string]bool{"pending.go": true}
+				cache["FutureField"] = map[string]int{"kept": 7}
+				wire, _ := json.Marshal(cache)
+				base.MarkOverview(root, sentMark(testMCPSession), string(wire))
+				mark := "disc-" + sessionKey(testMCPSession)
+				base.MarkOverview(root, mark, legacy)
+				proofs := `{"Before":{},"Pending":{},"Final":{},"future":"neutral"}`
+				for _, m := range []string{"writes", failedTestsMark(testMCPSession)} {
+					base.MarkOverview(root, m, proofs)
+				}
+				source, _ := os.ReadFile(filepath.Join(root, "a.go"))
+				mcp := resumeRulesMCP(t, root)
+				hook := func() string {
+					return resumeRulesHook(t, root, "session", map[string]any{"cwd": root, "session_id": testMCPSession, "source": "resume"})
+				}
+				for i := 0; i < 2; i++ {
+					out := hook()
+					if len(out) > 2048 || !strings.Contains(out, rulesNeeded) || strings.Contains(out, entryContractRule) {
+						t.Fatal("hook must only request bounded MCP delivery", out)
 					}
-					outline := updateLine("a.go", "neutral fixture")
-					if _, err := Update("a.go", outline); err != nil {
-						t.Fatal(err)
+				}
+				if _, value := base.OverviewMark(root, mark); value != legacy {
+					t.Fatal("hook completed a legacy attempt")
+				}
+				// A real write gate sees the old loaded outline but must not consume its
+				// existing plan or solo grants while the page protocol is incomplete.
+				out := mcp("ortg_gate", map[string]any{"tool": "Edit", "path": filepath.Join(root, "a.go")})
+				if !strings.Contains(out, deniedMark) || !strings.Contains(out, "rules=") {
+					t.Fatal("write was allowed before rule completion", out)
+				}
+				delivered := collectRules(t, mcp)
+				if delivered != rulePayload() {
+					t.Fatal("page chain lost or changed rule bytes")
+				}
+				if !strings.Contains(delivered, "公开契约决定的比较标准") || !strings.Contains(delivered, "三条硬规则") || !strings.Contains(delivered, finalSourceRule) {
+					t.Fatal("incomplete normative rule set")
+				}
+				if got := hook(); got != resumeNote {
+					t.Fatal("completed rules repeated on resume", got)
+				}
+				if out := mcp("ortg_overview", map[string]any{"rules": ""}); out != rulesComplete {
+					t.Fatal("completed context restarted without force")
+				}
+				if _, after := base.OverviewMark(root, sentMark(testMCPSession)); after != string(wire) {
+					t.Fatal("rules changed Sent/permissions/unknown fields")
+				}
+				for _, m := range []string{"writes", failedTestsMark(testMCPSession)} {
+					if _, v := base.OverviewMark(root, m); v != proofs {
+						t.Fatal("rules changed unrelated proofs", m)
 					}
-					// The earlier context really received an outline. Reproduce the
-					// legacy receipt and saved rule identities without resetting it.
-					seed := resumeRulesMCP(t, root)
-					seed("ortg_overview", nil)
-					_, saved := base.OverviewMark(root, sentMark(testMCPSession))
-					var cache map[string]any
-					if err := json.Unmarshal([]byte(saved), &cache); err != nil {
-						t.Fatal(err)
-					}
-					if previous == "missing" {
-						delete(cache, "Rules")
-					} else if previous == "changed" {
-						cache["Rules"] = "previous neutral rules"
-					}
-					cache["Reviews"], cache["LastReview"] = 2, "neutral-plan"
-					cache["Planned"], cache["Solo"] = map[string]bool{"a.go": true}, map[string]bool{"unsubmitted.go": true}
-					cache["Denied"], cache["FutureField"] = true, map[string]any{"preserved": 7}
-					wire, _ := json.Marshal(cache)
-					base.MarkOverview(root, sentMark(testMCPSession), string(wire))
-					base.MarkOverview(root, "disc-"+sessionKey(testMCPSession), "")
-					base.InjectOnce(testMCPSession, "discipline")
-					marks := []string{"writes", failedTestsMark(testMCPSession)}
-					for _, mark := range marks {
-						base.MarkOverview(root, mark, `{"Before":{},"Pending":{},"Final":{},"future":"neutral"}`)
-					}
-					mcp := resumeRulesMCP(t, root)
-					mcp("ortg_gate", map[string]any{"tool": "Read", "path": filepath.Join(root, "a.go")})
-					check := func(stage, text string, full bool) {
-						t.Helper()
-						want := 0
-						if full {
-							want = 1
-						}
-						if strings.Count(text, "纲要行纪律：") != want || strings.Count(text, "任务依赖闭环：") != want {
-							t.Fatalf("%s full=%v:\n%s", stage, full, text)
-						}
-					}
-					get := func() string { return mcp("ortg_overview", map[string]any{"module": "ST"}) }
-					payload := map[string]any{"cwd": root, "session_id": testMCPSession, "source": "resume"}
-					resume := func(wantFull bool) {
-						t.Helper()
-						_, before := base.OverviewMark(root, sentMark(testMCPSession))
-						text := resumeRulesHook(t, root, "session", payload)
-						check("resume", text, wantFull)
-						if !wantFull && text != resumeNote || wantFull && !strings.HasPrefix(text, resumeRulesNote) {
-							t.Fatalf("resume note: %s", text)
-						}
-						_, after := base.OverviewMark(root, sentMark(testMCPSession))
-						if before != after {
-							t.Fatal("resume rewrote saved outline/permissions/unknown fields")
-						}
-						for _, mark := range marks {
-							if _, value := base.OverviewMark(root, mark); value != `{"Before":{},"Pending":{},"Final":{},"future":"neutral"}` {
-								t.Fatal("resume changed unrelated state", mark)
-							}
-						}
-					}
-					if first == "overview" {
-						check("overview first", get(), previous != "current")
-						resume(false)
-					} else {
-						resume(previous != "current")
-					}
-					resume(false)
-					short := get()
-					check("warm MCP after hook", short, false)
-					if strings.Contains(short, outline) || !strings.HasSuffix(short, overviewShortFooter) {
-						t.Fatal("rule delivery invalidated the outline cache")
-					}
-					writeFile(t, filepath.Join(root, "a.go"), "package fixture // edited")
-					check("edit after resume", resumeRulesHook(t, root, "post", map[string]any{
-						"cwd": root, "session_id": testMCPSession, "tool_name": "Edit", "tool_input": map[string]any{"file_path": filepath.Join(root, "a.go")},
-					}), false)
-				})
-			}
+				}
+				if after, _ := os.ReadFile(filepath.Join(root, "a.go")); !bytes.Equal(source, after) {
+					t.Fatal("rule transfer changed source")
+				}
+				short := mcp("ortg_overview", nil)
+				if !strings.HasSuffix(short, overviewShortFooter) || strings.Contains(short, updateLine("a.go", "neutral source")) || strings.Contains(short, rulesNeeded) {
+					t.Fatal("rule completion changed outline delivery", short)
+				}
+			})
 		}
 	}
 }
+func TestRuleCursorBoundaries(t *testing.T) {
+	t.Setenv("ORTG_AGENT", "codex")
+	useTestMCPSession(t)
+	root := updateRepo(t, "a.go")
+	scanWithHeader()
+	Update("a.go", updateLine("a.go", "neutral source"))
+	if out, err := Gate("Bash", "", "", `await tools.mcp__ortg__ortg_overview({rules:""})`, ""); err != nil || strings.Contains(out, deniedMark) {
+		t.Fatal("code-mode rule fetch was gated", out, err)
+	}
+	// Code-mode calls to our own tools pass the hook even before any pages.
+	if out, err := gateHook("mcp__plugin_ortg_ortg__ortg_overview", "", "", "", "", "neutral-use"); err != nil || out != "" {
+		t.Fatal("rules fetch deadlocked its own gate", out, err)
+	}
+	mcp := resumeRulesMCP(t, root)
+	first := mcp("ortg_overview", map[string]any{"rules": ""})
+	body, cursor := rulePage(t, first)
+	seen := len(body)
+	mark := "rules-disc-" + sessionKey(testMCPSession)
+	_, saved := base.OverviewMark(root, mark)
+	if retry := mcp("ortg_overview", map[string]any{"rules": ""}); retry != first {
+		t.Fatal("first-page retry changed the page or cursor")
+	}
+	if _, after := base.OverviewMark(root, mark); after != saved {
+		t.Fatal("first-page retry changed progress")
+	}
+	// Native validation must reject an invented cursor, a different context,
+	// mixed outline/rule requests and malformed optional values.
+	for _, request := range []map[string]any{
+		ruleRequest(map[string]any{"rules": strings.Repeat("0", 40)}, testMCPSession),
+		ruleRequest(map[string]any{"rules": cursor}, "other-neutral-context"),
+		ruleRequest(map[string]any{"rules": cursor, "force": true}, testMCPSession),
+		ruleRequest(map[string]any{"rules": "", "module": "ST"}, testMCPSession),
+		ruleRequest(map[string]any{"rules": nil}, testMCPSession),
+	} {
+		r := nativeMCP(t, root, request)[0]
+		if !r.Result.IsError && len(r.Error) == 0 {
+			t.Fatal("invalid rule request accepted", r)
+		}
+	}
+	if _, after := base.OverviewMark(root, mark); after != saved {
+		t.Fatal("rejection changed current progress")
+	}
+	// Last page emission still does not complete the receipt: stop immediately
+	// before the final cursor and inspect state through the public hook.
+	var state ruleDelivery
+	json.Unmarshal([]byte(saved), &state)
+	for seen < len(rulePayload()) {
+		input := cursor
+		out := mcp("ortg_overview", map[string]any{"rules": cursor})
+		_, beforeRetry := base.OverviewMark(root, mark)
+		if retry := mcp("ortg_overview", map[string]any{"rules": input}); retry != out {
+			t.Fatal("continuation retry lost its exact page/cursor")
+		}
+		if _, after := base.OverviewMark(root, mark); after != beforeRetry {
+			t.Fatal("continuation retry advanced twice")
+		}
+		var page string
+		page, cursor = rulePage(t, out)
+		seen += len(page)
+		_, saved = base.OverviewMark(root, mark)
+		json.Unmarshal([]byte(saved), &state)
+	}
+	if state.Done || mcpRulesKnown(root) {
+		t.Fatal("last page was treated as a consumed receipt")
+	}
+	if out := mcp("ortg_overview", map[string]any{"rules": cursor}); out != rulesComplete {
+		t.Fatal("final ack failed")
+	}
+	if out := mcp("ortg_overview", map[string]any{"rules": cursor}); out != rulesComplete {
+		t.Fatal("same final ack was not idempotent")
+	}
+	forced := mcp("ortg_overview", map[string]any{"rules": "", "force": true})
+	_, newCursor := rulePage(t, forced)
+	if newCursor == cursor || mcpRulesKnown(root) {
+		t.Fatal("force reused a completed chain")
+	}
+	// Changed rule generation and own compaction each reject outstanding cursors.
+	for _, change := range []string{"generation", "compact"} {
+		if change == "generation" {
+			_, data := base.OverviewMark(root, mark)
+			json.Unmarshal([]byte(data), &state)
+			state.Fingerprint = "rules-mcp-v0:neutral"
+			wire, _ := json.Marshal(state)
+			base.MarkOverview(root, mark, string(wire))
+		} else {
+			resumeRulesHook(t, root, "session", map[string]any{"cwd": root, "session_id": testMCPSession, "source": "compact"})
+		}
+		r := nativeMCP(t, root, ruleRequest(map[string]any{"rules": newCursor}, testMCPSession))[0]
+		if !r.Result.IsError {
+			t.Fatal("old cursor survived", change)
+		}
+		page := mcp("ortg_overview", map[string]any{"rules": ""})
+		_, newCursor = rulePage(t, page)
+	}
+	collectRules(t, mcp)
 
+}
 func TestResumeRuleContextBoundaries(t *testing.T) {
-	for _, host := range []string{"claude", "codex"} {
-		t.Run(host, func(t *testing.T) {
-			t.Setenv("ORTG_AGENT", host)
-			root := updateRepo(t, "a.go")
-			scanWithHeader()
-			Update("a.go", updateLine("a.go", "neutral fixture"))
-			in := base.HookInput{Cwd: root, SessionID: "neutral-parent"}
-			if got := disciplineFor(root, in); got != disciplineText() {
-				t.Fatal("initial context did not get current rules")
-			}
-			child := in
-			child.AgentID = "neutral-child"
-			if got := disciplineFor(root, child); got != disciplineText() || disciplineFor(root, in) != disciplineSeen {
-				t.Fatal("parent and child rule receipts crossed")
-			}
-			for _, source := range []string{"clear", "compact", "startup"} {
-				HookReply("session", base.HookInput{Cwd: root, SessionID: in.SessionID, AgentID: child.AgentID, Source: source})
-				if disciplineFor(root, child) != disciplineText() || disciplineFor(root, in) != disciplineSeen {
-					t.Fatal("child reset changed the parent", source)
-				}
-			}
-			if host == "claude" {
-				tr := filepath.Join(t.TempDir(), "parent.jsonl")
-				writeFile(t, tr, `{"type":"user"}`+"\n")
-				in.TranscriptPath, child.TranscriptPath = tr, tr
-				HookReply("session", base.HookInput{Cwd: root, SessionID: in.SessionID, Source: "compact", TranscriptPath: tr})
-				writeFile(t, base.SubagentTranscript(tr, child.AgentID), fmt.Sprintf("{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"timestamp\":%q}\n", time.Now().UTC().Format(time.RFC3339Nano)))
-				if disciplineFor(root, in) != disciplineSeen || disciplineFor(root, child) != disciplineText() {
-					t.Fatal("ambiguous compact did not use each context's own transcript")
-				}
-			}
-			unknown := base.HookInput{Cwd: root}
-			if disciplineFor(root, unknown) != disciplineText() || disciplineFor(root, unknown) != disciplineText() {
-				t.Fatal("unknown session must remain conservative")
-			}
-			other := updateRepo(t, "b.go")
-			scanWithHeader()
-			in.Cwd = other
-			if disciplineFor(other, in) != disciplineText() {
-				t.Fatal("rule receipts crossed repository roots")
-			}
-		})
+	t.Setenv("ORTG_AGENT", "codex")
+	useTestMCPSession(t)
+	root := updateRepo(t, "a.go")
+	scanWithHeader()
+	finishRules(t)
+	parent := callSession
+	callSession.ids = []string{"neutral-child"}
+	if mcpRulesKnown(root) {
+		t.Fatal("child inherited parent receipt")
+	}
+	finishRules(t)
+	markReset(root, "", "neutral-child", "compact")
+	if mcpRulesKnown(root) {
+		t.Fatal("child compact retained its chain")
+	}
+	callSession = parent
+	if !mcpRulesKnown(root) {
+		t.Fatal("child compact reset parent")
+	}
+	other := updateRepo(t, "b.go")
+	scanWithHeader()
+	if mcpRulesKnown(other) {
+		t.Fatal("receipt crossed repository roots")
+	}
+	callSession.ids = nil
+	callSession.fromEnv = false
+	if _, e := RulesTool("", false); e == nil {
+		t.Fatal("unknown context completed a chain")
 	}
 }
-
 func TestClaudeResumeRuleAfterClear(t *testing.T) {
 	t.Setenv("ORTG_AGENT", "claude")
 	root := updateRepo(t, "a.go")
-	if _, err := scanWithHeader(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Update("a.go", updateLine("a.go", "neutral fixture")); err != nil {
-		t.Fatal(err)
-	}
-	mcp := resumeRulesMCP(t, root) // Claude environment id, no thread metadata
-	if text := mcp("ortg_overview", nil); !strings.Contains(text, disciplineText()) {
-		t.Fatal("initial context did not receive rules")
-	}
-	tr := filepath.Join(t.TempDir(), "after-clear.jsonl")
+	scanWithHeader()
+	Update("a.go", updateLine("a.go", "neutral source"))
+	mcp := resumeRulesMCP(t, root)
+	collectRules(t, mcp)
+	tr := filepath.Join(t.TempDir(), "neutral.jsonl")
 	writeFile(t, tr, `{"type":"user"}`+"\n")
-	payload := map[string]any{"cwd": root, "session_id": "neutral-after-clear", "source": "clear", "transcript_path": tr}
+	payload := map[string]any{"cwd": root, "session_id": "neutral-new-sid", "source": "clear", "transcript_path": tr}
 	resumeRulesHook(t, root, "session", payload)
-	if text := mcp("ortg_overview", nil); !strings.Contains(text, disciplineText()) {
-		t.Fatal("warm Claude server did not recognize /clear with its old environment id")
-	}
+	collectRules(t, mcp)
 	payload["source"] = "resume"
-	if text := resumeRulesHook(t, root, "session", payload); text != resumeNote {
-		t.Fatalf("resume duplicated the actual post-clear delivery: %s", text)
+	if out := resumeRulesHook(t, root, "session", payload); out != resumeNote {
+		t.Fatal("old MCP SID/new hook SID did not meet at own transcript", out)
 	}
-	// An older transcript receipt cannot override a newer startup for the
-	// same session even when that startup omits its transcript path.
-	resumeRulesHook(t, root, "session", map[string]any{"cwd": root, "session_id": "neutral-after-clear", "source": "startup"})
-	if text := resumeRulesHook(t, root, "session", payload); !strings.Contains(text, disciplineText()) {
-		t.Fatal("an old transcript receipt bypassed a newer session reset")
+	delete(payload, "transcript_path")
+	if out := resumeRulesHook(t, root, "session", payload); out != resumeNote {
+		t.Fatal("same context without transcript path forgot its completed rules", out)
 	}
-	if text := mcp("ortg_overview", nil); strings.Contains(text, disciplineText()) {
-		t.Fatal("warm old-id server duplicated the hook delivery")
+	// Startup without its path must invalidate that session's own prior transcript.
+	resumeRulesHook(t, root, "session", map[string]any{"cwd": root, "session_id": "neutral-new-sid", "source": "startup"})
+	if out := resumeRulesHook(t, root, "session", payload); !strings.Contains(out, rulesNeeded) {
+		t.Fatal("old transcript overrode newer startup")
+	}
+	if body := collectRules(t, mcp); body != rulePayload() {
+		t.Fatal("warm old-id server did not resend after startup")
+	}
+}
+
+func TestRuleFinalDeclarationGate(t *testing.T) {
+	t.Setenv("ORTG_AGENT", "codex")
+	root := finalFixture(t)
+	if _, err := Overview("", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RulesTool("", true); err != nil {
+		t.Fatal(err)
+	}
+	finalWrite(t, root, testMCPSession, "", "neutral-change", "value.go", "package sample\nconst Value = 2\n")
+	if _, err := finalReview("", nil); err != nil {
+		t.Fatal("inspection should remain available", err)
+	}
+	generation := finalGeneration(finalSaved(t, root, testMCPSession))
+	_, before := base.OverviewMark(root, "writes")
+	_, sent := base.OverviewMark(root, sentMark(testMCPSession))
+	if out, err := Gate("Edit", filepath.Join(root, "value.go"), "", "", ""); err != nil || !strings.Contains(out, deniedMark) {
+		t.Fatal("write escaped incomplete rule transfer", out, err)
+	}
+	if _, after := base.OverviewMark(root, sentMark(testMCPSession)); after != sent {
+		t.Fatal("refused rule gate consumed permission state")
+	}
+	r := nativeMCP(t, root, map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_review", "arguments": map[string]any{"final": true, "generation": generation, "report": []string{"Static source checked; behavior unverified."}}, "_meta": map[string]any{"threadId": testMCPSession}}})[0]
+	if !r.Result.IsError || !strings.Contains(r.Result.Content[0].Text, rulesNeeded) {
+		t.Fatal("final declaration bypassed incomplete rules", r)
+	}
+	if _, after := base.OverviewMark(root, "writes"); after != before {
+		t.Fatal("rejected declaration changed Before/Pending/Final")
+	}
+	finishRules(t)
+	if _, err := finalReview(generation, []string{"Static source checked; behavior unverified."}); err != nil {
+		t.Fatal(err)
 	}
 }

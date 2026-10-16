@@ -926,27 +926,20 @@ func TestPromptHookCarriesChoices(t *testing.T) {
 // raises the budget. Claude does not understand that directive and must not be
 // shown it.
 func TestRulesCarryCodexBudgetOnlyUnderCodex(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
-	root := t.TempDir()
-	os.WriteFile(filepath.Join(root, "a.go"), []byte("package a"), 0o644)
-	t.Chdir(root)
-	if _, err := scanWithHeader(); err != nil {
-		t.Fatal(err)
-	}
-	in := base.HookInput{Cwd: root, SessionID: "s1"}
-
-	t.Setenv("ORTG_AGENT", "codex")
-	for _, ev := range []string{"session", "subagent"} {
-		out := HookReply(ev, in)
-		if !strings.Contains(out, "@exec") || !strings.Contains(out, "max_output_tokens") {
-			t.Fatalf("codex %s rules missing the budget directive: %q", ev, out)
+	root := updateRepo(t, "a.go")
+	scanWithHeader()
+	in := base.HookInput{Cwd: root, SessionID: testMCPSession}
+	for _, host := range []string{"codex", "claude"} {
+		t.Setenv("ORTG_AGENT", host)
+		for _, event := range []string{"session", "subagent"} {
+			out := HookReply(event, in)
+			if !strings.Contains(out, rulesNeeded) || strings.Contains(out, "@exec") {
+				t.Fatal("hook must only point to MCP", out)
+			}
 		}
-	}
-
-	t.Setenv("ORTG_AGENT", "claude")
-	for _, ev := range []string{"session", "subagent"} {
-		if out := HookReply(ev, in); strings.Contains(out, "@exec") {
-			t.Fatalf("claude %s rules must not carry the codex directive: %q", ev, out)
+		body := collectRules(t, resumeRulesMCP(t, root))
+		if strings.Contains(body, "max_output_tokens") != (host == "codex") {
+			t.Fatal("host-specific budget directive lost or leaked", host)
 		}
 	}
 }
@@ -1526,6 +1519,7 @@ func TestChangedFields(t *testing.T) {
 }
 
 func TestWriteGatePlan(t *testing.T) {
+	useTestMCPSession(t)
 	t.Setenv("TMPDIR", t.TempDir())
 	root := t.TempDir()
 	for _, p := range []string{"a.go", "b.go", "c.go"} {
@@ -1545,6 +1539,7 @@ func TestWriteGatePlan(t *testing.T) {
 		t.Fatalf("a write before the outline is loaded must be refused: %q", got)
 	}
 	Overview("", false)
+	finishRules(t)
 	c := filepath.Join(root, "c.go")
 	// One file outside any plan is a single-file change: it passes, with a
 	// reminder the first time.
@@ -1607,7 +1602,7 @@ func TestWriteGatePlan(t *testing.T) {
 		t.Fatalf("the unlock outlives the target ortg_update cleared: %q", got)
 	}
 	time.Sleep(10 * time.Millisecond)
-	base.MarkOverview(root, "reset", "")
+	markReset(root, testMCPSession, "", "compact")
 	if got := gate("Edit", a, ""); !strings.Contains(got, deny) {
 		t.Fatalf("after a reset the plan must be made and checked again: %q", got)
 	}
@@ -2195,6 +2190,7 @@ func TestTargetSameShorthand(t *testing.T) {
 // Writing a planned test file is allowed, once with a reminder not to bend a
 // guard test's expectation to the new code.
 func TestGateTestFileReminder(t *testing.T) {
+	useTestMCPSession(t)
 	t.Setenv("TMPDIR", t.TempDir())
 	root := t.TempDir()
 	os.MkdirAll(filepath.Join(root, "tests"), 0o755)
@@ -2208,6 +2204,7 @@ func TestGateTestFileReminder(t *testing.T) {
 	Update("a.go", "a.go[7 L ST T]: Role:存储 | Uses:- | API:Save | Constraints:-")
 	Update("tests/a_test.go", "a_test.go[3 L ST T]: Role:测a | Uses:a.go | API:- | Constraints:-")
 	Overview("", false)
+	finishRules(t)
 	Target("a.go", "=", false, "")
 	Target("tests/a_test.go", "=", false, "")
 	Review()
@@ -2600,64 +2597,29 @@ func TestClaudeSubagentSession(t *testing.T) {
 // clear or compaction of the session — or a compaction its transcript shows
 // — sends the text again. The impact note no longer repeats the rules.
 func TestDisciplineOncePerContext(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
-	root := t.TempDir()
-	a := filepath.Join(root, "a.go")
-	os.WriteFile(a, []byte("package a"), 0o644)
-	t.Chdir(root)
-	if _, err := scanWithHeader(); err != nil {
-		t.Fatal(err)
+	t.Setenv("ORTG_AGENT", "codex")
+	useTestMCPSession(t)
+	root := updateRepo(t, "a.go")
+	scanWithHeader()
+	Update("a.go", updateLine("a.go", "neutral source"))
+	edit := func() string {
+		return HookReply("post", base.HookInput{Cwd: root, SessionID: testMCPSession, ToolName: "Edit", FilePath: filepath.Join(root, "a.go")})
 	}
-	Update("a.go", "a.go[7 L ST T]: Role:a | Uses:- | API:- | Constraints:-")
-	tr := filepath.Join(t.TempDir(), "s1.jsonl")
-	os.WriteFile(tr, []byte(`{"type":"user"}`+"\n"), 0o644)
-	edit := func(session, agent string) string {
-		time.Sleep(10 * time.Millisecond)
-		os.WriteFile(a, []byte("package a // "+time.Now().String()), 0o644)
-		return HookReply("post", base.HookInput{ToolName: "Edit", FilePath: a, Cwd: root, SessionID: session, AgentID: agent, TranscriptPath: tr})
+	for i := 0; i < 2; i++ {
+		if out := edit(); !strings.Contains(out, rulesNeeded) || strings.Contains(out, entryContractRule) {
+			t.Fatal("hook attempt must not become delivery", out)
+		}
 	}
-	full := func(out string) bool {
-		return strings.Count(out, "纲要行纪律：") == 1 && strings.Count(out, "任务依赖闭环：") == 1 && strings.Count(out, "多入口契约：") == 1 && strings.Count(out, "逐项对照该集合") == 1 && strings.Contains(out, "未执行项保留未验证") && strings.Count(out, "相关仓库相对路径及关联理由") == 1 && strings.Count(out, "工厂或装饰器返回可调用对象时") == 1 && strings.Contains(out, "Signature.bind 不得相对公开契约额外收窄合法调用") && strings.Contains(out, "未执行的调用形状保留未验证") && strings.Count(out, "公开接口对同一参数规定多种值形态或重载时") == 1 && strings.Contains(out, "API/Constraints 和目标计划") && strings.Contains(out, "不能仅凭容器类型一律拆分") && strings.Contains(out, "未验证形态保持未知") && strings.Contains(out, "公开反例须转为实际断言后复验") && strings.Contains(out, "不扩为无关形态、全组合或全库测试") && strings.Count(out, "最短必要链") == 1 && strings.Contains(out, "“不要求完整子系统”不等于“禁止必要 helper”") && strings.Contains(out, "显式禁止须遵守") && strings.Contains(out, "不凭假想外围流程扩展恢复范围") && strings.Contains(out, "含函数对象传递/注册，不能只搜调用括号")
+	finishRules(t)
+	if out := edit(); !strings.Contains(out, disciplineSeen) || strings.Contains(out, entryContractRule) {
+		t.Fatal("completed rules should use a short pointer", out)
 	}
-	if out := edit("s1", ""); !full(out) || strings.Contains(out, disciplineSeen) {
-		t.Fatalf("the first edit carries the discipline once, nothing doubled:\n%s", out)
+	HookReply("session", base.HookInput{Cwd: root, SessionID: testMCPSession, Source: "compact"})
+	if out := edit(); !strings.Contains(out, rulesNeeded) {
+		t.Fatal("own compact did not rearm rules", out)
 	}
-	if out := edit("s1", ""); strings.Contains(out, "纲要行纪律：") || strings.Contains(out, "任务依赖闭环：") || strings.Contains(out, "逐项对照该集合") || strings.Contains(out, "工厂或装饰器返回可调用对象时") || strings.Contains(out, "公开接口对同一参数规定多种值形态或重载时") || !strings.Contains(out, disciplineSeen) || !strings.Contains(out, "已改动") {
-		t.Fatalf("later edits point back to it:\n%s", out)
-	}
-	if out := edit("s1", "sub-1"); !full(out) {
-		t.Fatalf("a subagent is its own context:\n%s", out)
-	}
-	if out := edit("s1", "sub-1"); !strings.Contains(out, disciplineSeen) {
-		t.Fatalf("the subagent too gets it once:\n%s", out)
-	}
-	HookReply("session", base.HookInput{Cwd: root, SessionID: "s1", Source: "compact", TranscriptPath: tr})
-	os.WriteFile(tr, []byte(`{"type":"user"}`+"\n"+`{"type":"system","subtype":"compact_boundary","timestamp":"`+time.Now().UTC().Format(time.RFC3339Nano)+`"}`+"\n"), 0o644)
-	if out := edit("s1", ""); !full(out) {
-		t.Fatalf("after the session's compaction the text goes out again:\n%s", out)
-	}
-	// A Claude subagent's compaction shows only in its transcript.
-	time.Sleep(10 * time.Millisecond)
-	sub := base.SubagentTranscript(tr, "sub-1")
-	os.MkdirAll(filepath.Dir(sub), 0o755)
-	os.WriteFile(sub, []byte(`{"type":"system","subtype":"compact_boundary","timestamp":"`+time.Now().UTC().Format(time.RFC3339Nano)+`"}`+"\n"), 0o644)
-	if out := edit("s1", "sub-1"); !full(out) {
-		t.Fatalf("a compaction in the subagent's transcript sends it again:\n%s", out)
-	}
-	if out := edit("s1", "sub-1"); !strings.Contains(out, disciplineSeen) {
-		t.Fatalf("then once more only the pointer:\n%s", out)
-	}
-	// A Codex subagent's compaction names it (agent_id): its marks re-arm.
-	edit("s1", "sub-2")
-	if out := edit("s1", "sub-2"); !strings.Contains(out, disciplineSeen) {
-		t.Fatalf("sub-2 settled:\n%s", out)
-	}
-	HookReply("session", base.HookInput{Cwd: root, SessionID: "s1", AgentID: "sub-2", Source: "compact"})
-	if out := edit("s1", "sub-2"); !full(out) {
-		t.Fatalf("a named subagent's compaction sends it the text again:\n%s", out)
-	}
-	if strings.Contains(impactNote, "任务依赖闭环") || strings.Contains(impactNote, "多入口契约") {
-		t.Fatal("the impact note carries no fixed rules")
+	if strings.Contains(impactNote, entryContractRule) {
+		t.Fatal("impact reminder inlines rules")
 	}
 }
 
@@ -2677,7 +2639,7 @@ func TestResumeKeepsContext(t *testing.T) {
 	}
 	Update("a.go", "a.go[7 L ST T]: Role:a | Uses:- | API:- | Constraints:-")
 	full := func(ctx string) bool {
-		return strings.Contains(ctx, "三条硬规则") && strings.Contains(ctx, sessionFetchNote) && strings.Contains(ctx, sessionReportNote)
+		return strings.Contains(ctx, rulesNeeded) && strings.Contains(ctx, sessionFetchNote) && strings.Contains(ctx, sessionReportNote)
 	}
 	for _, src := range []string{"startup", "compact", "clear"} {
 		if ctx, _ := HookReplyFull("session", base.HookInput{Cwd: root, SessionID: "s1", Source: src}); !full(ctx) {
@@ -2690,6 +2652,7 @@ func TestResumeKeepsContext(t *testing.T) {
 	if _, err := Overview("", false); err != nil {
 		t.Fatal(err)
 	}
+	finishRules(t)
 	ctx, user := HookReplyFull("session", base.HookInput{Cwd: root, SessionID: "s1", Source: "resume"})
 	if ctx != resumeNote || !strings.HasPrefix(user, "ortg 对账：") {
 		t.Fatalf("an aligned resume gets one line, the user the summary:\n%q\n%q", ctx, user)
@@ -2697,7 +2660,7 @@ func TestResumeKeepsContext(t *testing.T) {
 	time.Sleep(1100 * time.Millisecond)
 	os.WriteFile(a, []byte("package a // changed"), 0o644)
 	ctx, _ = HookReplyFull("session", base.HookInput{Cwd: root, SessionID: "s1", Source: "resume"})
-	if !strings.HasPrefix(ctx, resumeNote) || !strings.Contains(ctx, "a.go") || full(ctx) || strings.Contains(ctx, "三条硬规则") {
+	if !strings.HasPrefix(ctx, resumeNote) || !strings.Contains(ctx, "过期 1") || strings.Contains(ctx, "a.go") || full(ctx) || strings.Contains(ctx, "三条硬规则") {
 		t.Fatalf("a resume with files to decide on adds the report, still no rules:\n%s", ctx)
 	}
 }
@@ -3474,6 +3437,7 @@ func TestRemovedTestedNames(t *testing.T) {
 // leaves a dependent out still needs a fix and two
 // reviews in a row of the same plan.
 func TestReviewConvergesAtOnce(t *testing.T) {
+	useTestMCPSession(t)
 	t.Setenv("TMPDIR", t.TempDir())
 	root := t.TempDir()
 	for _, p := range []string{"a.go", "b.go", "c.go", "d.go"} {
@@ -3488,6 +3452,7 @@ func TestReviewConvergesAtOnce(t *testing.T) {
 	Update("c.go", "c.go[7 L CL T]: Role:c | Uses:- | API:- | Constraints:-")
 	Update("d.go", "d.go[7 L CL T]: Role:d | Uses:- | API:- | Constraints:-")
 	Overview("", false)
+	finishRules(t)
 	gate := func(p string) string { got, _ := Gate("Edit", filepath.Join(root, p), "", "", ""); return got }
 
 	// All "=": the outlines stay, so there is nothing to weigh.
@@ -3866,6 +3831,7 @@ func TestTestpathsScope(t *testing.T) {
 // broad run the write gate refuses never ran; version-gate configuration
 // follows ordinary write planning; a stale refusal still names live gates.
 func TestVersionGateFlow(t *testing.T) {
+	useTestMCPSession(t)
 	t.Setenv("TMPDIR", t.TempDir())
 	gate := "def pytest_collection_modifyitems(config, items):\n    if dep_version >= parse_version(\"2\"):\n        marker = pytest.mark.skip(reason=\"doctest output changed\")\n        for item in items:\n            if isinstance(item, DoctestItem):\n                item.add_marker(marker)\n"
 	root, git := gitRepo(t, map[string]string{"a.py": "x = 1\n", "b.py": "y = 1\n", "conftest.py": gate})
@@ -3878,6 +3844,7 @@ func TestVersionGateFlow(t *testing.T) {
 	}
 	Update("conftest.py", "conftest.py[3 T ST T]: Role:测试配置 | Uses:- | API:- | Constraints:-")
 	Overview("", false)
+	finishRules(t)
 	past := time.Now().Add(-time.Minute)
 	edit := func(p, body string) {
 		os.WriteFile(filepath.Join(root, p), []byte(body), 0o644)

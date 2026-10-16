@@ -123,6 +123,7 @@ func runMCP(args []string) error {
 		{Name: "ortg_overview", Description: toolDescription("ortg_overview"),
 			Props: map[string]base.Prop{"module": {Type: "string", Description: "只看这个模块(纲要行 B 标签)；\"*\" 取全部；留空按整份预算给整份或模块清单"},
 				"force": {Type: "boolean", Description: "本会话已发过的条目也重发；只在上下文里确实看不到它们时用"},
+				"rules": {Type: "string", Description: rulesArgumentDescription},
 				"init":  {Type: "boolean", Description: "仓库还没有 ortg.tsv 时建表；只在用户明确要求创建（初始化）或对齐纲要时传 true"}},
 			// Claude Code saves an MCP result above 50000 chars to a file and
 			// shows the model a 2KB preview unless the tool declares a larger
@@ -134,6 +135,18 @@ func runMCP(args []string) error {
 				f, err := a.Bool("force")
 				if err != nil {
 					return "", err
+				}
+				if _, present := a["rules"]; present {
+					cursor, ok := a["rules"].(string)
+					if !ok {
+						return "", fmt.Errorf("%s", rulesBadType)
+					}
+					_, module := a["module"]
+					_, init := a["init"]
+					if module || init {
+						return "", fmt.Errorf("%s", rulesMixedArgs)
+					}
+					return RulesTool(cursor, f)
 				}
 				init, err := a.Bool("init")
 				if err != nil {
