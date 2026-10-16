@@ -59,6 +59,14 @@ const resumeNote = "ortg: 会话已恢复——之前注入的 ORTG 规则与已
 const sessionReportNote = "第一次回复用户时，先用一句话报告上面的对账结果（对齐/过期/无纲要各多少），再谈正事。"
 const sessionFetchNote = "开工前先调用 ortg_overview（不带参数）取纲要（超过整份预算时先给纲要头与模块清单，再按问题取相关模块）。"
 const sessionCountsReport = "## 对账报告\n%s · 已清除 %d\n此处只列全库计数；完整路径清单用 ortg_status 按需查看。"
+
+// A path index, not document contents or evidence of a behavioral contract.
+const policyCandidatesHead = "\nortg: 项目政策候选（按标准路径名从活跃认知库存发现，未读取正文）。仅在与原任务相关时读正文，核实规范、示例及适用边界并写事实纲要；候选或已有摘要不证明行为契约，不扩大任务，也不要求补齐全库文档：\n"
+const policyCandidateLine = "- %s（%s）\n"
+const policyCandidateKnown = "已有纲要（摘要）"
+const policyCandidateUnknown = "无纲要（未知）"
+const policyCandidatesCount = "本次列出 %d 条，另 %d 条候选因条数或字节上限未列；路径完整引用、不截断。\n"
+
 const taskDependenciesHead = "ortg: 下面是本次已交付条目的直接 Uses 中待核验的本地依赖（只看一跳，不递归或展开目录）。相关者须读公开源码及可见测试，补缺或修订真实纲要；与任务无关者按证据说明。没有纲要或纲要过期表示认知未确认，不表示源码必错；这是线索，不是全库初始化门禁或正式修复范围限制：\n"
 const taskDependencyLine = "- %s → %s（%s）\n"
 const taskDependenciesMore = "另有 %d 条尚未提示的一跳待核验依赖本次未展开；再取本范围可续取，也可按相关模块缩小范围核验，不要求补齐全库。\n"

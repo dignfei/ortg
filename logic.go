@@ -306,6 +306,82 @@ func taskDependencyHints(x *base.Index, c *sentCache, roots []base.Row, s summar
 	return b.String()
 }
 
+// Standard documentation entry points only: no body reads or filesystem
+// discovery beyond the active inventory already reconciled by Overview.
+func policyDocumentPath(rel string) bool {
+	p := strings.ToLower(rel)
+	ext := path.Ext(p)
+	if ext != ".md" && ext != ".rst" && ext != ".txt" {
+		return false
+	}
+	standard := func(stem string) bool {
+		stem = strings.NewReplacer("-", "_", " ", "_").Replace(stem)
+		stem = strings.TrimSuffix(stem, "_guide")
+		switch stem {
+		case "contribute", "contributing", "hacking", "development", "developer", "developers", "coding_standards", "coding_guidelines", "coding_style":
+			return true
+		}
+		return false
+	}
+	parts := strings.Split(strings.TrimSuffix(p, ext), "/")
+	name := parts[len(parts)-1]
+	if len(parts) == 1 {
+		return standard(name)
+	}
+	if len(parts) == 2 && parts[0] == ".github" {
+		return name == "contributing" || name == "contribute"
+	}
+	if parts[0] != "doc" && parts[0] != "docs" {
+		return false
+	}
+	if len(parts) == 2 {
+		return standard(name)
+	}
+	return len(parts) == 3 && standard(parts[1]) &&
+		(standard(name) || name == "index" || name == "readme" || name == "guide")
+}
+
+func policyCandidates(x *base.Index) string {
+	if x.Config().Mode != "task" {
+		return ""
+	}
+	var rows []base.Row
+	for _, r := range x.Rows() {
+		if !r.Ignored && !r.Deleted && r.Exists && !isDirRow(r.Outline) &&
+			!x.Excluded(r.Path, reconcileOpts) && !x.Observed(r.Path, reconcileOpts) && policyDocumentPath(r.Path) {
+			rows = append(rows, r)
+		}
+	}
+	return renderPolicyCandidates(rows)
+}
+
+func renderPolicyCandidates(rows []base.Row) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	rows = slices.Clone(rows)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Path < rows[j].Path })
+	var b strings.Builder
+	b.WriteString(policyCandidatesHead)
+	// Reserve the longest possible count line before considering any entry.
+	reserve := len(fmt.Sprintf(policyCandidatesCount, 8, len(rows)))
+	shown := 0
+	for _, r := range rows {
+		status := policyCandidateKnown
+		if r.Outline == "" {
+			status = policyCandidateUnknown
+		}
+		line := fmt.Sprintf(policyCandidateLine, strconv.Quote(r.Path), status)
+		if shown == 8 || b.Len()+len(line)+reserve > 2048 {
+			continue
+		}
+		b.WriteString(line)
+		shown++
+	}
+	fmt.Fprintf(&b, policyCandidatesCount, shown, len(rows)-shown)
+	return b.String()
+}
+
 // ---- repository access ----
 
 func repoRoot() string {
@@ -578,7 +654,27 @@ func Overview(module string, force bool) (string, error) {
 		b.WriteString("# " + note + "\n\n")
 	}
 	lim := limits()
-	rendered := x.Render(opts)
+	policy := policyCandidates(x)
+	policyKey := "policy-candidates:" + fmt.Sprintf("%x", sha1.Sum([]byte(policy)))
+	for key := range c.nagged {
+		if strings.HasPrefix(key, "policy-candidates:") && key != policyKey {
+			delete(c.nagged, key)
+		}
+	}
+	if !force && c.nagged[policyKey] {
+		policy = ""
+	}
+	finish := func(footer string) string {
+		// Account for the actual reply, including its closing line. A deferred
+		// payload stays unsent so a later fitting call can still deliver it.
+		if policy != "" && outlineSize(b.String()+policy+footer) <= lim.max {
+			b.WriteString(policy)
+			c.nagged[policyKey] = true
+		}
+		b.WriteString(footer)
+		return b.String()
+	}
+	rendered := x.Render(opts) + policy
 	size, tokens := outlineSize(rendered), estTokens(rendered)
 	over := ""
 	if size > lim.whole {
@@ -603,11 +699,12 @@ func Overview(module string, force bool) (string, error) {
 		if headerFresh {
 			b.WriteString(gateOverview(x))
 		}
-		b.WriteString("\n" + s.countsReport() + "\n" + rules + overviewModulesFooter)
-		return b.String(), nil
+		b.WriteString("\n" + s.countsReport() + "\n" + rules)
+		return finish(overviewModulesFooter), nil
 	}
 	if len(fresh) == 0 && !headerFresh {
-		return first + fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.countsReport() + "\n" + rules + taskDependencyHints(x, c, cand, s) + overviewShortFooter, nil
+		b.WriteString(fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.countsReport() + "\n" + rules + taskDependencyHints(x, c, cand, s))
+		return finish(overviewShortFooter), nil
 	}
 	sub := opts
 	set := make(map[string]bool, len(fresh))
@@ -617,7 +714,7 @@ func Overview(module string, force bool) (string, error) {
 	sub.Include = func(r base.Row) bool { return set[r.Path] }
 	sub.OmitHeader = !headerFresh
 	body := x.Render(sub)
-	if n := outlineSize(body); n > lim.max-lim.margin {
+	if n := outlineSize(body + policy); n > lim.max-lim.margin {
 		// Sent anyway: even a truncated part lets the model work out how to
 		// split the module. The warning leads so a preview still carries it,
 		// and nothing is recorded as sent, since the host may have cut it.
@@ -640,8 +737,7 @@ func Overview(module string, force bool) (string, error) {
 	if whole {
 		scope = "整份" // "以上是整份的纲要"
 	}
-	b.WriteString("\n" + fmt.Sprintf(overviewPartFooter, scope))
-	return b.String(), nil
+	return finish("\n" + fmt.Sprintf(overviewPartFooter, scope)), nil
 }
 
 // gateOverview is the version-gate note that goes out with the header, ""
