@@ -3056,8 +3056,20 @@ segments:
 				}
 			}
 		} else {
-			for _, p := range mentioned(strings.Join(w, " ")) {
-				add(p)
+			var names []string
+			paths := map[string]bool{}
+			for _, word := range w {
+				if a, ok := resolve(word); ok {
+					if rel, inside := inRepo(a); inside {
+						names = append(names, rel)
+						paths[rel] = true
+					}
+				}
+			}
+			for _, p := range mentioned(strings.Join(names, " ")) {
+				if paths[p] {
+					add(p)
+				}
 			}
 		}
 		switch verb {
@@ -3487,6 +3499,9 @@ func shellSegments(cmd string) []shellSegment {
 			}
 			i = j
 			inWord = true
+		case r == '<' && (i == 0 || rs[i-1] != '<') && (i+1 == len(rs) || rs[i+1] != '<' && rs[i+1] != '&'):
+			flushWord()
+			cur.words = append(cur.words, "<") // cat<file: keep the file as its own word
 		case r == '|':
 			if i+1 < len(rs) && rs[i+1] == '|' {
 				i++

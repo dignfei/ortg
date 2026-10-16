@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -87,5 +88,72 @@ func TestShellLiteralAccess(t *testing.T) {
 		if out, _ := Gate("Bash", "", "", cmd, ""); !strings.Contains(out, deniedMark) || !strings.Contains(out, "ortg_review") {
 			t.Errorf("unchecked plan write allowed for %q: %s", cmd, out)
 		}
+	}
+}
+
+func TestShellPathIdentity(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	root, other := t.TempDir(), t.TempDir()
+	for _, dir := range []string{root, other} {
+		if err := os.Mkdir(filepath.Join(dir, "nested"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range []string{"nested/server.go", "shared.go", "two words.go"} {
+			if err := os.WriteFile(filepath.Join(dir, p), []byte("package fixture\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	x, err := base.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name, command, want string
+		missing, wrapper    bool
+	}{
+		{name: "missing relative", command: "cat server.go", missing: true},
+		{name: "external nested", command: "cat " + strconv.Quote(filepath.Join(other, "nested/server.go"))},
+		{name: "external root", command: "cat " + strconv.Quote(filepath.Join(other, "shared.go"))},
+		{name: "external cd", command: "cd " + strconv.Quote(other) + " && cat shared.go"},
+		{name: "root", command: "cat shared.go", want: "shared.go"},
+		{name: "nested", command: "cat nested/server.go", want: "nested/server.go"},
+		{name: "nested cd", command: "cd nested && cat server.go", want: "nested/server.go"},
+		{name: "parent", command: "cd nested && cat ../shared.go", want: "shared.go"},
+		{name: "internal absolute", command: "cat " + strconv.Quote(filepath.Join(root, "nested/server.go")), want: "nested/server.go"},
+		{name: "attached input", command: "cat <nested/server.go", want: "nested/server.go"},
+		{name: "unspaced input", command: "cat<nested/server.go", want: "nested/server.go"},
+		{name: "input fd", command: "cat 0<nested/server.go", want: "nested/server.go"},
+		{name: "external input", command: "cat<" + strconv.Quote(filepath.Join(other, "nested/server.go"))},
+		{name: "quoted space", command: `cat "two words.go"`, want: "two words.go"},
+		{name: "escaped space", command: `cat two\ words.go`, want: "two words.go"},
+		{name: "unknown wrapper nested", command: `const r = await tools.exec_command({cmd:"cat server.go",workdir:` + strconv.Quote(other) + `});text(r.output);`, wrapper: true},
+		{name: "unknown wrapper root", command: `const r = await tools.exec_command({cmd:"cat shared.go",workdir:` + strconv.Quote(other) + `});text(r.output);`, wrapper: true},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !tc.wrapper {
+				out, err := exec.Command("bash", "-c", tc.command).CombinedOutput()
+				if (err != nil) != tc.missing {
+					t.Fatalf("public command: missing=%v, err=%v: %s", tc.missing, err, out)
+				}
+			}
+			paths, _ := gateTargets(x, "Bash", "", "", tc.command)
+			if got := strings.Join(paths, ","); got != tc.want {
+				t.Errorf("pre paths %q, want %q", got, tc.want)
+			}
+			out := HookReply("post", base.HookInput{Cwd: root, SessionID: fmt.Sprintf("path-identity-%d", i), ToolName: "Bash", Command: tc.command})
+			if tc.want == "" {
+				if strings.Contains(out, "尚无纲要") {
+					t.Errorf("unread repository file prompted: %s", out)
+				}
+			} else if !strings.Contains(out, tc.want+" 尚无纲要") {
+				t.Errorf("missing exact file reminder for %s: %s", tc.want, out)
+			}
+		})
 	}
 }
