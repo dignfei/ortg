@@ -55,6 +55,9 @@ func TestMain(m *testing.M) {
 	if os.Getenv("ORTG_TEST_STATE_DIR") != "" {
 		os.Exit(m.Run())
 	}
+	// Run from inside a Claude Code session, the tests would inherit its
+	// session id; tests that need one set it themselves.
+	os.Unsetenv("CLAUDE_CODE_SESSION_ID")
 	state, err := os.MkdirTemp("", "ortg-state-test")
 	if err != nil {
 		panic(err)
@@ -2268,6 +2271,63 @@ func TestTargetItems(t *testing.T) {
 	}
 	if _, err := TargetItems([]string{"x.go"}); err == nil {
 		t.Fatal("every item failing fails the call")
+	}
+}
+
+// A resumed Claude Code session can get an MCP server whose environment
+// names a new session id, while its hooks keep the conversation's id and
+// transcript: the transcript the host recorded names the context, so the
+// resumed server finds what was sent instead of starting over. A /clear in
+// the same host moves the hooks to a new transcript, and that context starts
+// fresh.
+func TestClaudeResumeNewEnvSession(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("ORTG_STATE_DIR", t.TempDir())
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "a.go"), []byte("package a"), 0o644)
+	t.Chdir(root)
+	if _, err := scanWithHeader(); err != nil {
+		t.Fatal(err)
+	}
+	Update("a.go", "a.go[7 L ST T]: Role:存储 | Uses:- | API:Save | Constraints:-")
+	t.Cleanup(func() { callSession.ids, callSession.fromEnv, callSession.subagent = nil, false, false })
+	dir := t.TempDir()
+	conv := filepath.Join(dir, "conv-1.jsonl")
+	os.WriteFile(conv, nil, 0o644)
+	read := func() string { got, _ := Gate("Read", filepath.Join(root, "a.go"), "", "", ""); return got }
+	newProcess := func(envID string) {
+		overviewMu.Lock()
+		overviewSent = map[string]*sentCache{}
+		overviewMu.Unlock()
+		t.Setenv("CLAUDE_CODE_SESSION_ID", envID)
+		useCallSession(base.Args{})
+	}
+
+	newProcess("conv-1")
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "conv-1", TranscriptPath: conv, Source: "startup"})
+	useCallSession(base.Args{})
+	if out, _ := Overview("", false); !strings.Contains(out, "Role:存储") {
+		t.Fatalf("first fetch sends the outline:\n%s", out)
+	}
+
+	// Resumed: a new server whose environment names another session.
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "conv-1", TranscriptPath: conv, Source: "resume"})
+	newProcess("fresh-2")
+	if got := read(); got != "" {
+		t.Fatalf("a resumed session with a new environment id must not be refused a read: %q", got)
+	}
+	if out, _ := Overview("", false); strings.Contains(out, "Role:存储") {
+		t.Fatalf("a resumed session with a new environment id must not be resent the outline:\n%s", out)
+	}
+
+	// /clear in the same host: the hooks name a new session and transcript.
+	cleared := filepath.Join(dir, "conv-3.jsonl")
+	os.WriteFile(cleared, nil, 0o644)
+	time.Sleep(10 * time.Millisecond)
+	HookReply("session", base.HookInput{Cwd: root, SessionID: "conv-3", TranscriptPath: cleared, Source: "clear"})
+	useCallSession(base.Args{})
+	if got := read(); !strings.Contains(got, "permissionDecision") {
+		t.Fatalf("a cleared context has loaded nothing: %q", got)
 	}
 }
 

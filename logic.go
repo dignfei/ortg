@@ -808,6 +808,17 @@ func useCallSession(a base.Args) {
 			callSession.ids, callSession.fromEnv, callSession.subagent = []string{p.agent}, false, true
 		}
 	}
+	if callSession.fromEnv && !callSession.subagent {
+		// A resumed Claude Code session may start this server with a new
+		// session id in the environment while its hooks and transcript keep
+		// the conversation's: the transcript this host recorded names the
+		// context, and the environment's id still counts for its resets.
+		if tr := claudeTranscript(repoRoot()); tr != "" {
+			if tid := strings.TrimSuffix(filepath.Base(tr), ".jsonl"); tid != "" && tid != callSession.ids[0] {
+				callSession.ids = []string{tid, callSession.ids[0]}
+			}
+		}
+	}
 }
 
 // staleMarkAge is how long per-session and per-process marks are kept: a
