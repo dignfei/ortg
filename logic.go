@@ -740,6 +740,9 @@ func Overview(module string, force bool) (string, error) {
 // gateOverview is the version-gate note that goes out with the header, ""
 // when the repository has no gate in force.
 func gateOverview(x *base.Index) string {
+	if x.Config().Mode == "task" {
+		return "" // task validation follows its actual dependencies, not every test gate
+	}
 	var live []versionGate
 	for _, g := range requiredGates(x) {
 		if !g.Lifted {
@@ -1314,7 +1317,7 @@ func Gate(tool, path, dir, command, agent string) (string, error) {
 	broad, commit := false, false
 	if tool == "Bash" {
 		broad, commit = testRunKind(command, x.Root())
-		if commit && !broad {
+		if commit && (!broad || x.Config().Mode == "task") {
 			if s := verifyCommit(x, stagesChanges(command, x.Root())); s != "" {
 				return s, nil
 			}
@@ -1440,7 +1443,11 @@ func gateCall(x *base.Index, tool, path, dir, command string) string {
 	return ""
 }
 
-// verifyCommit keeps a commit from landing code no broad test run has seen.
+// verifyCommit gives task work one scope check per HEAD; it cannot infer
+// the task's dependency closure or certify that its validation ran. Other
+// modes keep the broad-run policy below.
+//
+// It keeps a commit from landing code no broad test run has seen.
 // Targeted runs (one file, -k, a subdirectory, the collection config
 // overridden) miss what a change breaks elsewhere — a name another package's
 // tests import, a check the whole suite runs on every component — and a
@@ -1457,7 +1464,11 @@ func gateCall(x *base.Index, tool, path, dir, command string) string {
 // point stages nothing — no staging of its own, none run in between — it is
 // refused once more, or only what was staged before would land.
 func verifyCommit(x *base.Index, stages bool) string {
-	gates := requiredGates(x)
+	task := x.Config().Mode == "task"
+	var gates []versionGate
+	if !task {
+		gates = requiredGates(x)
+	}
 	overviewMu.Lock()
 	defer overviewMu.Unlock()
 	if sentFor(x.Root()).header == "" {
@@ -1478,7 +1489,11 @@ func verifyCommit(x *base.Index, stages bool) string {
 	}
 	v := loadVerify(x.Root())
 	sha, _, _ := x.HeadCommit()
-	if v.Denied[sha] {
+	key := sha
+	if task {
+		key = "task:" + sha // a scope reminder never acknowledges a broad-run gate
+	}
+	if v.Denied[key] {
 		switch v.Restage[sha] {
 		case restageOwed:
 			if !stages {
@@ -1492,13 +1507,13 @@ func verifyCommit(x *base.Index, stages bool) string {
 			delete(v.Restage, sha)
 			saveVerify(x.Root(), v)
 		}
-		if keys := v.DeniedGates[sha]; len(keys) > 0 {
+		if keys := v.DeniedGates[key]; len(keys) > 0 {
 			for _, k := range keys {
 				if v.GateRuns[k].IsZero() {
 					v.GateRuns[k] = time.Now() // acknowledged
 				}
 			}
-			delete(v.DeniedGates, sha)
+			delete(v.DeniedGates, key)
 			saveVerify(x.Root(), v)
 		}
 		return ""
@@ -1514,12 +1529,12 @@ func verifyCommit(x *base.Index, stages bool) string {
 		}
 	}
 	stale := newest.After(v.BroadRun)
-	if !stale && len(pending) == 0 {
+	if !task && !stale && len(pending) == 0 {
 		return ""
 	}
-	v.Denied[sha] = true
+	v.Denied[key] = true
 	for _, g := range pending {
-		v.DeniedGates[sha] = append(v.DeniedGates[sha], g.key())
+		v.DeniedGates[key] = append(v.DeniedGates[key], g.key())
 	}
 	if stages {
 		v.Restage[sha] = restageOwed
@@ -1530,6 +1545,9 @@ func verifyCommit(x *base.Index, stages bool) string {
 			s += "\n" + gateVerifyWhole
 		}
 		return base.PreToolDecision(s, true)
+	}
+	if task {
+		return deny(gateVerifyTask)
 	}
 	switch {
 	case !stale:
@@ -4068,7 +4086,11 @@ func Review(rulings ...string) (string, error) {
 	}
 	if !pl.Checklist {
 		pl.Checklist = true
-		b.WriteString(reviewChecklist)
+		if x.Config().Mode == "task" {
+			b.WriteString(reviewTaskChecklist)
+		} else {
+			b.WriteString(reviewChecklist)
+		}
 	}
 	given, missing := matchRulings(bound, rulings)
 	// A plan with something to fix or weigh converges only once two reviews
