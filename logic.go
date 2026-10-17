@@ -2025,7 +2025,7 @@ func pytestCollectionCommand(cmd string, depth int) string {
 	return string(b)
 }
 
-func recordTestResult(root, session, cwd, cmd, output string) bool {
+func recordTestResult(root, session, cwd, cmd, output string, exitCode ...*int) bool {
 	if session == "" {
 		return false
 	}
@@ -2055,11 +2055,15 @@ func recordTestResult(root, session, cwd, cmd, output string) bool {
 	if invocations == 0 {
 		return false
 	}
+	exitFailed := len(exitCode) > 0 && exitCode[0] != nil && *exitCode[0] != 0
 	summaries := pytestSummaries(output)
-	if len(summaries) == 0 {
+	if len(summaries) == 0 && !exitFailed {
 		return false
 	}
-	last := summaries[len(summaries)-1]
+	var last pytestSummary
+	if len(summaries) > 0 {
+		last = summaries[len(summaries)-1]
+	}
 	terminalSummary := last.complete && strings.TrimSpace(output[last.end:]) == ""
 	terminal := terminalSummary && !pytestOutputTruncated(output)
 	start := 0
@@ -2095,6 +2099,10 @@ func recordTestResult(root, session, cwd, cmd, output string) bool {
 		if c["failed"]+c["error"]+c["errors"] > 0 {
 			failures = append(failures, s.text)
 		}
+	}
+	exitOnly := exitFailed && len(failures) == 0
+	if exitOnly {
+		failures = append(failures, fmt.Sprintf(failedTestExitSummary, *exitCode[0]))
 	}
 	if len(failures) == 0 {
 		if !terminal || len(summaries) != invocations || counts["passed"] == 0 {
@@ -2146,7 +2154,12 @@ func recordTestResult(root, session, cwd, cmd, output string) bool {
 		}
 		old, exists := v.Runs[key]
 		collectionErrors = collectionErrors || old.CollectionErrors
-		if exists {
+		if exitOnly {
+			// Keep real historical IDs, but a process failure has unknown test
+			// scope and cannot be settled by passing just those nodes.
+			nodes = append([]string(nil), old.FailedNodeIDs...)
+			signature = ""
+		} else if exists {
 			if collectionErrors || old.Signature == "" || old.Signature != signature || len(old.FailedNodeIDs) == 0 || len(nodes) == 0 {
 				nodes = nil // never upgrade an earlier unknown failure to a partial proof
 			} else {
@@ -5770,8 +5783,7 @@ func finalReviewStopNoteBudget(root string, in base.HookInput, budget int) strin
 	return out
 }
 
-// Existing pytest recognition/clearance stays unchanged. Only its recognized
-// failure event invalidates an already existing final declaration.
+// A recognized pytest failure invalidates an existing final declaration.
 func finalFailureNote(root string, in base.HookInput) string {
 	context, key := writeIdentity(in)
 	if context == "" {
@@ -6489,7 +6501,7 @@ func fileHookReply(event string, in base.HookInput, x *base.Index, rel string) s
 func shellNote(x *base.Index, in base.HookInput, cwd string) string {
 	session, cmd, output, background := in.SessionID, in.Command, in.ToolOutput, in.Background
 	failureWarning := ""
-	if recordTestResult(x.Root(), session, cwd, cmd, output) {
+	if recordTestResult(x.Root(), session, cwd, cmd, output, in.ToolExitCode) {
 		failureWarning = finalFailureNote(x.Root(), in)
 	}
 	if words, _ := scanTestRun(cmd, x.Root()); words != nil && (background || detachedCommand(cmd)) {

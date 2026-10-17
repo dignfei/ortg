@@ -631,6 +631,53 @@ func TestReadHookInputToolOutput(t *testing.T) {
 	}
 }
 
+func TestReadHookInputExitCode(t *testing.T) {
+	outer := "Wall time: 0.01 seconds\nExit code: 1\nOutput:\n"
+	unified := "Chunk ID: neutral\nWall time: 0.01 seconds\nProcess exited with code 1\nFinal output:\n"
+	for _, tc := range []struct {
+		name     string
+		response any
+		want     string
+	}{
+		{"structured zero wins", map[string]any{"exit_code": 0, "output": outer + "1 passed in 0.1s"}, "0"},
+		{"structured nonzero", map[string]any{"exit_code": 2, "stdout": "1 passed in 0.1s"}, "2"},
+		{"missing", map[string]any{"stdout": "1 passed in 0.1s"}, ""},
+		{"null", map[string]any{"exit_code": nil, "stdout": "ok"}, ""},
+		{"invalid field keeps output", map[string]any{"exit_code": "1", "stdout": "ok"}, ""},
+		{"fraction is unknown", map[string]any{"exit_code": 1.5, "stdout": "ok"}, ""},
+		{"stdout is program text", map[string]any{"stdout": outer + "1 passed in 0.1s"}, ""},
+		{"stderr cannot override zero", map[string]any{"exit_code": 0, "stderr": outer + "1 passed in 0.1s"}, "0"},
+		{"text envelope", outer + "1 passed in 0.1s", "1"},
+		{"unified envelope", unified + "1 passed in 0.1s", "1"},
+		{"exit first", "Exit code: 1\nWall time: 0.01 seconds\nOutput:\n1 passed in 0.1s", "1"},
+		{"object output envelope", map[string]any{"output": unified + "1 passed in 0.1s"}, "1"},
+		{"CRLF", strings.ReplaceAll(outer, "\n", "\r\n") + "ok", "1"},
+		{"large body", outer + strings.Repeat("x", toolOutputMax+1), "1"},
+		{"plain printed code", "Exit code: 1\n1 passed in 0.1s", ""},
+		{"nested envelope", "program output\n" + outer + "1 passed in 0.1s", ""},
+		{"body cannot override zero", strings.Replace(outer, "Exit code: 1", "Exit code: 0", 1) + unified, "0"},
+		{"incomplete envelope", "Wall time: 0.01 seconds\nExit code: 1\n1 passed in 0.1s", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(map[string]any{"tool_response": tc.response})
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := ReadHookInput(bytes.NewReader(b), time.Second)
+			got := ""
+			if in.ToolExitCode != nil {
+				got = strconv.Itoa(*in.ToolExitCode)
+			}
+			if got != tc.want {
+				t.Fatalf("exit status %q, want %q", got, tc.want)
+			}
+			if in.ToolOutput == "" {
+				t.Fatal("status parsing discarded tool output")
+			}
+		})
+	}
+}
+
 // Color codes are removed from ToolOutput: a test runner forced to color its
 // output wraps every summary word in them.
 func TestToolOutputStripsColor(t *testing.T) {

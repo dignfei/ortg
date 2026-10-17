@@ -41,6 +41,8 @@ type HookInput struct {
 	// A host may already have cut a long output (Claude Code keeps its head
 	// when it spills the rest to a file), so a summary line can be missing.
 	ToolOutput string
+	// ToolExitCode is nil when the host did not provide a recognizable status.
+	ToolExitCode *int
 	// Background is a Bash call's run_in_background (Claude Code): the
 	// command keeps running after the call returns.
 	Background bool
@@ -268,35 +270,63 @@ func isApplyPatchTool(name string) bool {
 }
 
 // toolOutput reads a tool_response: a string as is (Codex), or an object's
-// stdout and stderr (Claude Code's Bash) or its output field; colors are
-// removed and only the tail is kept.
-func toolOutput(raw json.RawMessage) string {
+// stdout and stderr (Claude Code's Bash) or its output field. Exit status is
+// taken before truncation, from a structured field or an outer text envelope,
+// never from stdout/stderr or the envelope's output body.
+func toolOutput(raw json.RawMessage) (string, *int) {
 	if len(raw) == 0 {
-		return ""
+		return "", nil
 	}
 	var out string
+	var code *int
+	envelope := true
 	if json.Unmarshal(raw, &out) != nil {
 		var o struct {
-			Stdout string `json:"stdout"`
-			Stderr string `json:"stderr"`
-			Output string `json:"output"`
+			Stdout   string          `json:"stdout"`
+			Stderr   string          `json:"stderr"`
+			Output   string          `json:"output"`
+			ExitCode json.RawMessage `json:"exit_code"`
 		}
 		if json.Unmarshal(raw, &o) != nil {
-			return ""
+			return "", nil
+		}
+		var parsed *int
+		if json.Unmarshal(o.ExitCode, &parsed) == nil {
+			code = parsed
 		}
 		out = o.Stdout
 		if o.Stderr != "" {
 			out += "\n" + o.Stderr
 		}
+		envelope = out == ""
 		if out == "" {
 			out = o.Output
 		}
 	}
 	out = ansiRe.ReplaceAllString(out, "")
+	if code == nil && envelope {
+		code = envelopeExitCode(out)
+	}
 	if len(out) > toolOutputMax {
 		out = out[len(out)-toolOutputMax:]
 	}
-	return out
+	return out, code
+}
+
+var exitEnvelopes = []*regexp.Regexp{
+	regexp.MustCompile(`\A(?:Chunk ID: [^\s]+\r?\n)?Wall time: [0-9]+(?:\.[0-9]+)? seconds\r?\n(?:Process exited with code|Exit code:) (-?[0-9]+)\r?\n(?:Final output:|Output:)(?:\r?\n|\z)`),
+	regexp.MustCompile(`\AExit code: (-?[0-9]+)\r?\nWall time: [0-9]+(?:\.[0-9]+)? seconds\r?\nOutput:(?:\r?\n|\z)`),
+}
+
+func envelopeExitCode(out string) *int {
+	for _, re := range exitEnvelopes {
+		if m := re.FindStringSubmatch(out); m != nil {
+			if code, err := strconv.Atoi(m[1]); err == nil {
+				return &code
+			}
+		}
+	}
+	return nil
 }
 
 // ReadHookInput reads the JSON payload with a timeout: after timeout without
@@ -361,7 +391,7 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 		in.AgentID = filepath.Base(m.AgentID)
 	}
 	in.TranscriptPath = m.Transcript
-	in.ToolOutput = toolOutput(m.Response)
+	in.ToolOutput, in.ToolExitCode = toolOutput(m.Response)
 	in.FilePath = m.Input.FilePath
 	if in.FilePath == "" {
 		in.FilePath = m.Input.NotebookPath

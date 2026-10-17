@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -67,6 +68,92 @@ func finalDeclare(t *testing.T, root string) string {
 	}
 	return g
 }
+
+func TestFailedTestsExplicitExit(t *testing.T) {
+	const command = "python -m pytest -q tests"
+	const passed = "=== 1 passed in 0.01s ==="
+	const failed = "=== 1 failed in 0.01s ==="
+	for _, tc := range []struct {
+		name, command string
+		response      any
+		fresh, stale  bool
+		remaining     int
+	}{
+		{"passed zero", command, map[string]any{"stdout": passed, "exit_code": 0}, false, false, 0},
+		{"passed nonzero", command, map[string]any{"stdout": passed, "exit_code": 1}, false, true, 1},
+		{"passed unknown", command, map[string]any{"stdout": passed}, false, false, 0},
+		{"failed zero", command, map[string]any{"stdout": failed, "exit_code": 0}, false, true, 1},
+		{"stderr failed zero", command, map[string]any{"stdout": passed, "stderr": failed, "exit_code": 0}, false, true, 1},
+		{"ordinary nonzero", "python -c 'raise SystemExit(1)'", map[string]any{"stdout": failed, "exit_code": 1}, false, false, 1},
+		{"exit first envelope", command, "Exit code: 1\nWall time: 0.01 seconds\nOutput:\n" + passed, false, true, 1},
+		{"unified envelope", command, "Chunk ID: neutral\nWall time: 0.01 seconds\nProcess exited with code 1\nFinal output:\n" + passed, false, true, 1},
+		{"no summary nonzero", command, map[string]any{"stdout": "aborted", "exit_code": 2}, false, true, 1},
+		{"no summary unknown", command, map[string]any{"stdout": "aborted"}, false, false, 1},
+		{"fresh nonzero", command, map[string]any{"stdout": passed, "exit_code": 1}, true, true, 1},
+		{"fresh ordinary nonzero", "false", map[string]any{"exit_code": 1}, true, false, 0},
+		{"printed envelope", command, map[string]any{"stdout": "Exit code: 1\nWall time: 0.01 seconds\nOutput:\n" + passed}, false, false, 0},
+		{"outer zero wins", command, "Wall time: 0.01 seconds\nExit code: 0\nOutput:\nExit code: 1\n" + passed, false, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ORTG_STATE_DIR", t.TempDir())
+			root := finalFixture(t)
+			finalWrite(t, root, testMCPSession, "", "write", "value.go", "package sample\nconst Value = 2\n")
+			if !tc.fresh {
+				HookReply("post", base.HookInput{Cwd: root, SessionID: testMCPSession, ToolName: "Bash", ToolUseID: "initial-failure", Command: command, ToolOutput: failed})
+			}
+			old := finalDeclare(t, root)
+			raw, err := json.Marshal(map[string]any{"cwd": root, "session_id": testMCPSession, "tool_name": "Bash", "tool_use_id": "rerun", "turn_id": "neutral-turn", "tool_input": map[string]any{"command": tc.command}, "tool_response": tc.response})
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := base.ReadHookInput(bytes.NewReader(raw), time.Second)
+			HookReply("post", in)
+			f := finalSaved(t, root, testMCPSession)
+			g := finalGeneration(f)
+			if got := len(loadFailedTests(root, testMCPSession).Runs); got != tc.remaining || (f.Reviewed != g) != tc.stale {
+				t.Fatalf("remaining=%d, final stale=%v; want %d, %v", got, f.Reviewed != g, tc.remaining, tc.stale)
+			}
+			HookReply("post", in)
+			if finalGeneration(finalSaved(t, root, testMCPSession)) != g {
+				t.Fatal("duplicate failure post advanced the generation")
+			}
+			if tc.stale {
+				if _, err := finalReview(old, []string{"old declaration"}); err == nil {
+					t.Fatal("old generation was accepted after failed rerun")
+				}
+			}
+		})
+	}
+	t.Run("selection and known nodes", func(t *testing.T) {
+		t.Setenv("ORTG_STATE_DIR", t.TempDir())
+		root := finalFixture(t)
+		zero, one := 0, 1
+		const cmd = "pytest -v tests"
+		const id = "tests/test_value.py::test_value"
+		header := "=== test session starts ===\nplatform linux -- Python 3.11, pytest-8.0, pluggy-1.0 -- /usr/bin/python\nrootdir: " + root + "\ncollecting ... collected 3 items\n"
+		failedOutput := header + id + " FAILED [33%]\ntests/test_value.py::test_other PASSED [66%]\ntests/test_value.py::test_last PASSED [100%]\n=== FAILURES ===\n=== short test summary info ===\nFAILED " + id + " - AssertionError\n=== 1 failed, 2 passed in 0.2s ===\n"
+		recordTestResult(root, testMCPSession, root, cmd, failedOutput, &one)
+		key := root + "\x00" + cmd
+		if r := loadFailedTests(root, testMCPSession).Runs[key]; r.Signature == "" || strings.Join(r.FailedNodeIDs, "") != id {
+			t.Fatalf("fixture did not establish real failed-node proof: %+v", r)
+		}
+		recordTestResult(root, testMCPSession, root, cmd, passed, &one)
+		r := loadFailedTests(root, testMCPSession).Runs[key]
+		if strings.Join(r.FailedNodeIDs, "") != id || r.Signature != "" || len(r.Selected) != 1 || r.Selected[0] != 3 {
+			t.Fatalf("nonzero rerun lost history or fabricated complete scope: %+v", r)
+		}
+		recordTestResult(root, testMCPSession, root, "pytest -v "+id, strings.Replace(header, "3 items", "1 item", 1)+id+" PASSED [100%]\n"+passed, &zero)
+		recordTestResult(root, testMCPSession, root, cmd, passed, &zero)
+		if len(loadFailedTests(root, testMCPSession).Runs) != 1 {
+			t.Fatal("partial node or reduced-count pass cleared process failure")
+		}
+		recordTestResult(root, testMCPSession, root, cmd, "=== 3 passed in 0.2s ===", &zero)
+		if len(loadFailedTests(root, testMCPSession).Runs) != 0 {
+			t.Fatal("complete original-scope pass did not clear record")
+		}
+	})
+}
+
 func TestFinalReviewGenerations(t *testing.T) {
 	root := finalFixture(t)
 	if f := finalSaved(t, root, testMCPSession); len(f.Files) != 0 {
