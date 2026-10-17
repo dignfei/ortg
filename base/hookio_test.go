@@ -332,6 +332,31 @@ func TestCodexContextWindow(t *testing.T) {
 	}
 }
 
+func TestCodexToolOutputLimit(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	for _, c := range []struct {
+		config string
+		want   int
+	}{
+		{"", 0},
+		{"tool_output_token_limit = 500_000 # explicit\n", 500000},
+		{"tool_output_token_limit = 1024\n", 1024},
+		{"tool_output_token_limit = -1\n", 0},
+		{"tool_output_token_limit = '500000'\n", 0},
+		{"tool_output_token_limit = 500000junk\n", 0},
+		{"tool_output_token_limit = 999999999999999999999\n", 0},
+		{"[projects.neutral]\ntool_output_token_limit = 500000\n", 0},
+	} {
+		if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(c.config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := CodexToolOutputLimit(); got != c.want {
+			t.Fatalf("config %q: got %d, want %d", c.config, got, c.want)
+		}
+	}
+}
+
 // MCP environments may omit CODEX_HOME although their host has it. Use real
 // parent processes: /proc/environ describes the environment at process start.
 func TestCodexContextWindowParent(t *testing.T) {
@@ -339,14 +364,14 @@ func TestCodexContextWindowParent(t *testing.T) {
 		if explicit := os.Getenv("ORTG_TEST_WINDOW_EXPLICIT"); explicit != "" {
 			os.Setenv("CODEX_HOME", explicit)
 		}
-		os.Stdout.WriteString(strconv.Itoa(CodexContextWindow()))
+		os.Stdout.WriteString(fmt.Sprintf("%d/%d", CodexContextWindow(), CodexToolOutputLimit()))
 		os.Exit(0)
 	}
 	if _, err := os.Stat("/proc/self/environ"); err != nil {
 		t.Skip("no /proc")
 	}
 	profile, explicit := t.TempDir(), t.TempDir()
-	if err := os.WriteFile(filepath.Join(profile, "config.toml"), []byte("model = 'm1'\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(profile, "config.toml"), []byte("model = 'm1'\ntool_output_token_limit = 500000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(profile, "models_cache.json"), []byte(`{"models":[{"slug":"m1","context_window":272000,"max_context_window":872000,"effective_context_window_percent":95}]}`), 0o600); err != nil {
@@ -357,16 +382,16 @@ func TestCodexContextWindowParent(t *testing.T) {
 	}
 	for _, c := range []struct {
 		name, override string
-		want           int
+		want           string
 	}{
-		{"filtered home", "", 258400},
-		{"explicit home wins", explicit, 300000},
+		{"filtered home", "", "258400/500000"},
+		{"explicit home wins", explicit, "300000/0"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cmd := exec.Command("sh", "-c", `unset CODEX_HOME; "$0" -test.run=^TestCodexContextWindowParent$`, os.Args[0])
 			cmd.Env = append(os.Environ(), "CODEX_HOME="+profile, "ORTG_TEST_WINDOW_HELPER=1", "ORTG_TEST_WINDOW_EXPLICIT="+c.override)
-			if out, err := cmd.CombinedOutput(); err != nil || string(out) != strconv.Itoa(c.want) {
-				t.Fatalf("window = %q, error %v; want %d", out, err, c.want)
+			if out, err := cmd.CombinedOutput(); err != nil || string(out) != c.want {
+				t.Fatalf("window/output = %q, error %v; want %s", out, err, c.want)
 			}
 		})
 	}

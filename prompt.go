@@ -61,8 +61,8 @@ const rulesNoSession = "ortg: 本次调用没有可靠的上下文标识，不�
 const rulesBadCursor = "ortg: 规则 cursor 不属于本上下文的当前连续页链，或内容/上下文已重置；用 ortg_overview rules=\"\" force=true 从首段重新获取，不沿用旧 cursor。"
 const rulesMixedArgs = "ortg: rules 规则分页不能与 module 或 init 同传；空串取首段，省略 rules 才是普通纲要调用。"
 const rulesBadType = "ortg: rules 必须是字符串；空串取首段，null 不代表空串或省略。"
-const rulesArgumentDescription = "规则分页 cursor；省略为普通纲要，空串取首段，核对完整标题/收尾后逐段回传返回的 cursor，末段后的回传确认完成；缺文以空串和force=true重取。每页最多4096 UTF-8字节，不与module/init同传。"
-const rulesPageOverflow = "ortg: 规则页超过固定 UTF-8 预算，本段未记录；请报告此错误。"
+const rulesArgumentDescription = "规则分页 cursor；省略为普通纲要，空串取首段，核对完整标题/收尾后逐段回传返回的 cursor，末段后的回传确认完成；缺文以空串和force=true重取。每页按可信宿主预算，未知时最多4096 UTF-8字节，不与module/init同传。"
+const rulesPageOverflow = "ortg: 规则页超过当前宿主预算，本段未记录；用 rules=\"\" force=true 重取，预算不足时先检查宿主配置。"
 const rulesPageHead = "ORTG %s · 规则第 %d/%d 段\n---规则正文---\n"
 const rulesPageEnd = "\n---规则正文结束---\n以上是规则第 %d 段。确认本段从标题到此收尾完整且没有截断提示，再单独调用 ortg_overview rules=%q；末段也须回传 cursor 才确认完成。若缺文，用 rules=\"\" force=true 重取。\n"
 const rulesComplete = "ortg: 规则分页已确认：原生 MCP 已按序输出全部当前规则段，并收到完成 cursor；不证明宿主完整消费、语义理解或任务通过。已有纲要与许可继续沿用；尚未取纲要时再普通调用 ortg_overview。\n以上是规则分页确认。"
@@ -149,7 +149,7 @@ var headerTemplate = `#====项目纲要====
 const targetModeText = `高屋建瓴模式：本轮只改目标纲要、纲要头、忽略规则与目录描述，不改代码；请输出完整目标纲要而非差异。`
 
 var toolDescriptions = map[string]string{
-	"ortg_overview": "可选 rules 字符串走独立规则分页：省略 rules 是普通纲要，rules=空串取首段，后续逐段回传返回的 cursor，末段后的 cursor 确认整链；每段最多4096 UTF-8字节。须看到本段完整标题/收尾且没有截断提示才续取；缺文用 rules=空串 force=true 重来。分页不与 module/init 混用，不改变纲要已发或写入许可；旧hook回执不算完成。对账并返回纲要与全库计数摘要，完整路径清单用 ortg_status 按需查看。不带参数时整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回，超过时只返回纲要头与模块清单（不含条目正文）；再用 module（B 标签）取模块，module=\"*\" 取全部。同一会话只发上下文里还没有或已变动的条目，全都发过就只回计数摘要；上下文压缩或清空后自动重发；确实看不到时传 force=true 重发。一次超过单次上限时照发正文（可能被截断），开头提醒把模块拆细。本仓库启用了 ORTG（会话开始注入过 ORTG 纲要规则）时开工先调用。仓库没有 ortg.tsv 就是没启用 ORTG：不要调用 ortg 工具；只有用户明确要求创建（初始化）或对齐纲要时，才传 init=true 建表（根目录有 overview.txt 则先备份再整份导入，否则建空表；再首扫）。" + " " + taskOutlineRule,
+	"ortg_overview": "可选 rules 字符串走独立规则分页：省略 rules 是普通纲要，rules=空串取首段，后续逐段回传返回的 cursor，末段后的 cursor 确认整链；每段按可信宿主预算，未知时最多4096 UTF-8字节。须看到本段完整标题/收尾且没有截断提示才续取；缺文用 rules=空串 force=true 重来。分页不与 module/init 混用，不改变纲要已发或写入许可；旧hook回执不算完成。对账并返回纲要与全库计数摘要，完整路径清单用 ortg_status 按需查看。不带参数时整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回，超过时只返回纲要头与模块清单（不含条目正文）；再用 module（B 标签）取模块，module=\"*\" 取全部。同一会话只发上下文里还没有或已变动的条目，全都发过就只回计数摘要；上下文压缩或清空后自动重发；确实看不到时传 force=true 重发。一次超过单次上限时照发正文（可能被截断），开头提醒把模块拆细。本仓库启用了 ORTG（会话开始注入过 ORTG 纲要规则）时开工先调用。仓库没有 ortg.tsv 就是没启用 ORTG：不要调用 ortg 工具；只有用户明确要求创建（初始化）或对齐纲要时，才传 init=true 建表（根目录有 overview.txt 则先备份再整份导入，否则建空表；再首扫）。" + " " + taskOutlineRule,
 	"ortg_status":   "重新扫描并对账，只返回对账报告（无纲要/过期/观察变动/对齐各多少及路径），不返回纲要正文。被问到纲要是否对齐、有哪些文件要处理时用它——会话开始的报告只是当时的快照，不要引用。",
 	"ortg_update":   "提交当前文件纲要：用 path+outline 提交一个文件，或用 items 批量提交（每项为\"路径 完整纲要行\"，路径和文件名可含空格及括号，按纲要文件名与标签识别边界）。给了 items 就忽略 path/outline；空批、规范化后重复路径均拒绝。全批共用一个事务，任一项失败全部回滚并指出路径与原因；成功逐项报告，统一保存与刷新。每项仍校验格式、字典、Uses、Keys、API、角色与目录类型，前移指纹并清空目标纲要。全库初始化(build或旧兼容首次建设)按批前文档状态检查，不能同批补文档并首次提交源码；任务维护(task)只维护当前已读文件，未覆盖仍未知。全库建设成功后按批次最终状态提示阶段修订。批量只合并已阅读文件的完整当前纲要，不代替正文阅读与每文件改完立即提交；全库初始化仍按文档→修订→核心→修订→普通→最终修订流程。第三方库等不逐文件建纲要的目录，给目录本身写一行目录纲要：path 填目录，文件名以 / 结尾（vendored/[标签]: ...），B 标签填用到它的模块，它就随那个模块一起发送；目录本身放进 observe_dirs，其下文件就不再要求逐个写纲要。",
 	"ortg_review":   "可选 final=true：读取本上下文实写后的当前源码代际；用 generation 加非空 report 数组提交本代际审查声明（有效 UTF-8、合计至多4096字节）。这是模型声明，不是原生语义验收；源码或新识别失败使旧声明失效。" + " " + finalReviewContractGuide + " 默认参数仍核对改动计划（参数 rulings：对上一次核对给了正文的每条契约写一行「契约键：裁决」，缺了不收敛）：列出所有目标纲要（要改、新建、删除的文件）的现在→目标字段变化、不合格的目标行、Uses 依赖它们却还没有目标纲要的文件，并给出逐项核对清单。要改多个文件时，写完计划后调用；核对列出要补、要核实的地方时，补改后连续两次看到同一计划才解锁，计划全写 = 或核对没发现要补的地方时一次即解锁。只改一个文件不需要。只给自己核对用，不用给用户看。",

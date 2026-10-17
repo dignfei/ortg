@@ -109,7 +109,8 @@ var ruleCursorRE = regexp.MustCompile(`rules="([0-9a-f]+)"`)
 
 func rulePage(t *testing.T, text string) (string, string) {
 	t.Helper()
-	if len(text) > rulePageMax || !utf8.ValidString(text) {
+	fits, _ := ruleReplyFits(repoRoot())
+	if !fits(text) || !utf8.ValidString(text) {
 		t.Fatal("invalid or oversized native rule page", len(text))
 	}
 	_, body, ok := strings.Cut(text, "\n---规则正文---\n")
@@ -125,6 +126,127 @@ func rulePage(t *testing.T, text string) (string, string) {
 		t.Fatal("missing continuation", text)
 	}
 	return body, m[1]
+}
+
+func TestRuleReplyBudgets(t *testing.T) {
+	t.Setenv("ORTG_AGENT", "codex")
+	useTestMCPSession(t)
+	for _, c := range []struct {
+		name, config string
+		pages        int
+	}{
+		{"large", "tool_output_token_limit = 500000\nmodel_context_window = 258400\n", 1},
+		{"small output", "tool_output_token_limit = 1024\nmodel_context_window = 258400\n", 7},
+		{"small context", "tool_output_token_limit = 500000\nmodel_context_window = 3000\n", 0},
+		{"unknown output", "model_context_window = 258400\n", 7},
+		{"unknown context", "tool_output_token_limit = 500000\n", 7},
+		{"unknown", "", 7},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("CODEX_HOME", home)
+			writeFile(t, filepath.Join(home, "config.toml"), c.config)
+			root := updateRepo(t, "a.go")
+			scanWithHeader()
+			mcp := resumeRulesMCP(t, root)
+			out := mcp("ortg_overview", map[string]any{"rules": ""})
+			body, count := "", 0
+			for strings.Contains(out, "---规则正文---") {
+				page, cursor := rulePage(t, out)
+				body += page
+				count++
+				if mcpRulesKnown(root) {
+					t.Fatal("page emission completed the receipt before ACK")
+				}
+				out = mcp("ortg_overview", map[string]any{"rules": cursor})
+			}
+			if out != rulesComplete || body != rulePayload() || c.pages > 0 && count != c.pages || count == 0 {
+				t.Fatalf("pages=%d want=%d body bytes=%d: %s", count, c.pages, len(body), out)
+			}
+			t.Logf("pages=%d calls=%d body_bytes=%d", count, count+1, len(body))
+		})
+	}
+}
+
+func TestRuleBudgetChangesKeepGeometry(t *testing.T) {
+	t.Setenv("ORTG_AGENT", "codex")
+	useTestMCPSession(t)
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	config := func(output int) {
+		writeFile(t, filepath.Join(home, "config.toml"), fmt.Sprintf("tool_output_token_limit = %d\nmodel_context_window = 258400\n", output))
+	}
+	config(1024)
+	root := updateRepo(t, "a.go")
+	scanWithHeader()
+	// Every call is a new actual MCP process, sharing only production state.
+	call := func(args map[string]any) updateMCPReply {
+		return nativeMCP(t, root, ruleRequest(args, testMCPSession))[0]
+	}
+	first := call(map[string]any{"rules": ""}).Result.Content[0].Text
+	body, cursor := rulePage(t, first)
+	mark := "rules-disc-" + sessionKey(testMCPSession)
+	_, old := base.OverviewMark(root, mark)
+	var state ruleDelivery
+	json.Unmarshal([]byte(old), &state)
+	state.BodyMax = 0 // A partial chain written by the original implementation.
+	wire, _ := json.Marshal(state)
+	base.MarkOverview(root, mark, string(wire))
+	config(500000)
+	if retry := call(map[string]any{"rules": ""}).Result.Content[0].Text; retry != first {
+		t.Fatal("budget increase or legacy geometry changed the previous response")
+	}
+	for len(body) < len(rulePayload()) {
+		out := call(map[string]any{"rules": cursor}).Result.Content[0].Text
+		page, next := rulePage(t, out)
+		if len(page) > ruleBodyMax {
+			t.Fatal("mid-chain budget increase changed geometry")
+		}
+		body, cursor = body+page, next
+	}
+	if body != rulePayload() || call(map[string]any{"rules": cursor}).Result.Content[0].Text != rulesComplete {
+		t.Fatal("legacy chain lost bytes or ACK")
+	}
+	large := call(map[string]any{"rules": "", "force": true}).Result.Content[0].Text
+	_, ack := rulePage(t, large)
+	_, old = base.OverviewMark(root, mark)
+	config(1024)
+	if r := call(map[string]any{"rules": ""}); !r.Result.IsError {
+		t.Fatal("replayed large response exceeded the reduced budget")
+	}
+	if _, after := base.OverviewMark(root, mark); after != old {
+		t.Fatal("budget rejection changed progress")
+	}
+	// A smaller budget does not erase rules already emitted safely: their
+	// short final ACK still completes, and a completed receipt stays valid.
+	if r := call(map[string]any{"rules": ack}); r.Result.IsError || r.Result.Content[0].Text != rulesComplete {
+		t.Fatal("budget reduction invalidated an already delivered final page", r)
+	}
+	if r := call(map[string]any{"rules": ""}); r.Result.IsError || r.Result.Content[0].Text != rulesComplete {
+		t.Fatal("budget change erased a completed receipt")
+	}
+	_, old = base.OverviewMark(root, mark)
+	config(1)
+	if r := call(map[string]any{"rules": ""}); !r.Result.IsError {
+		t.Fatal("completed receipt replay exceeded the reduced budget")
+	}
+	if _, after := base.OverviewMark(root, mark); after != old {
+		t.Fatal("completed replay rejection changed the receipt")
+	}
+	config(1024)
+	forced := call(map[string]any{"rules": "", "force": true}).Result.Content[0].Text
+	page, _ := rulePage(t, forced)
+	if len(page) > ruleBodyMax {
+		t.Fatal("force did not select the reduced budget")
+	}
+	_, old = base.OverviewMark(root, mark)
+	config(1)
+	if r := call(map[string]any{"rules": "", "force": true}); !r.Result.IsError {
+		t.Fatal("unfittable envelope accepted")
+	}
+	if _, after := base.OverviewMark(root, mark); after != old {
+		t.Fatal("unfittable envelope changed progress")
+	}
 }
 
 // Exercise the actual public page API and the extra completion call. These

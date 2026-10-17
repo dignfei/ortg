@@ -141,14 +141,9 @@ func Host() string {
 	return "claude"
 }
 
-// CodexContextWindow is the context window, in tokens, of the model Codex is
-// configured with: config.toml's model_context_window (Codex caps it at the
-// model's max_context_window) or else the model's context_window from
-// models_cache.json, times the share Codex really uses
-// (effective_context_window_percent). Linux also checks the nearest ancestor's
-// CODEX_HOME when Codex filters that variable from the MCP environment; an
-// explicit value here wins. 0 when the configuration cannot be read.
-func CodexContextWindow() int {
+// codexHome also checks the nearest ancestor's CODEX_HOME when Codex filters
+// that variable from the MCP environment; an explicit value here wins.
+func codexHome() string {
 	home := os.Getenv("CODEX_HOME")
 	if home == "" {
 		for _, pid := range Ancestors() {
@@ -167,11 +162,33 @@ func CodexContextWindow() int {
 	if home == "" {
 		h, err := os.UserHomeDir()
 		if err != nil {
-			return 0
+			return ""
 		}
 		home = filepath.Join(h, ".codex")
 	}
-	model, window := codexConfig(filepath.Join(home, "config.toml"))
+	return home
+}
+
+// CodexToolOutputLimit returns only an explicitly configured positive limit;
+// absent or invalid host configuration stays unknown (0).
+func CodexToolOutputLimit() int {
+	home := codexHome()
+	if home == "" {
+		return 0
+	}
+	_, _, output := codexConfig(filepath.Join(home, "config.toml"))
+	return output
+}
+
+// CodexContextWindow reads model_context_window or the model's cached window,
+// capped at max_context_window and scaled by effective_context_window_percent.
+// It returns 0 when configuration cannot be read.
+func CodexContextWindow() int {
+	home := codexHome()
+	if home == "" {
+		return 0
+	}
+	model, window, _ := codexConfig(filepath.Join(home, "config.toml"))
 	b, err := os.ReadFile(filepath.Join(home, "models_cache.json"))
 	if err != nil || model == "" {
 		return window
@@ -203,12 +220,12 @@ func CodexContextWindow() int {
 	return window
 }
 
-// codexConfig reads the top-level model and model_context_window keys of a
+// codexConfig reads the top-level model and budget keys of a
 // Codex config.toml: the lines before its first [table].
-func codexConfig(path string) (model string, window int) {
+func codexConfig(path string) (model string, window, output int) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return "", 0
+		return "", 0, 0
 	}
 	for _, l := range strings.Split(string(b), "\n") {
 		l = strings.TrimSpace(l)
@@ -228,9 +245,16 @@ func codexConfig(path string) (model string, window int) {
 			model = strings.Trim(v, `"'`)
 		case "model_context_window":
 			fmt.Sscan(v, &window)
+		case "tool_output_token_limit":
+			var err error
+			output, err = strconv.Atoi(strings.ReplaceAll(v, "_", ""))
+			if err != nil {
+				output = 0
+			}
+			output = max(0, output)
 		}
 	}
-	return model, window
+	return model, window, output
 }
 
 // ApplyPatchPaths extracts only apply_patch file-header lines.  Paths are

@@ -1026,10 +1026,45 @@ const ruleBodyMax = 3072 // Reserve the rest for the UTF-8 envelope and cursor.
 type ruleDelivery struct {
 	Fingerprint string
 	Born        time.Time
+	BodyMax     int // Zero keeps the original 3072-byte geometry on old chains.
 	Next        int
 	Cursor      string
 	Previous    string
 	Done        bool
+}
+
+func rulePages(full string, bodyMax int) []string {
+	var pages []string
+	for rest := full; rest != ""; {
+		n := min(len(rest), bodyMax)
+		for n > 0 && n < len(rest) && !utf8.RuneStart(rest[n]) {
+			n--
+		}
+		if n <= 0 {
+			return nil
+		}
+		pages = append(pages, rest[:n])
+		rest = rest[n:]
+	}
+	return pages
+}
+
+// Only explicit Codex output and context budgets allow a larger rule reply.
+// Unknown budgets retain the small envelope; known smaller caps still apply.
+func ruleReplyFits(root string) (func(string) bool, bool) {
+	output, window := 0, 0
+	if base.Host() == "codex" {
+		output, window = base.CodexToolOutputLimit(), contextWindow(root)
+	}
+	expand := output-output/20 > (rulePageMax+3)/4 && window > 0
+	cap := limits().max
+	if output > 0 {
+		cap = min(cap, output-output/20) // Keep 5% for host wrapping.
+	}
+	return func(text string) bool {
+		return (expand || len(text) <= rulePageMax) && outlineSize(text) <= cap &&
+			(window <= 0 || estTokens(text) <= window*wholeShareOfWindow/100)
+	}, expand
 }
 
 // RulesTool sends a bounded page, or accepts the cursor returned after the
@@ -1048,15 +1083,8 @@ func RulesTool(cursor string, force bool) (string, error) {
 		return "", errors.New(rulesNoSession)
 	}
 	full, fingerprint := rulePayload(), ruleFingerprint()
+	fits, expand := ruleReplyFits(root)
 	var pages []string
-	for rest := full; rest != ""; {
-		n := min(len(rest), ruleBodyMax)
-		for n < len(rest) && !utf8.RuneStart(rest[n]) {
-			n--
-		}
-		pages = append(pages, rest[:n])
-		rest = rest[n:]
-	}
 	out := ""
 	render := func(page int, next string) string {
 		return fmt.Sprintf(rulesPageHead, fingerprint, page+1, len(pages)) + pages[page] +
@@ -1064,22 +1092,62 @@ func RulesTool(cursor string, force bool) (string, error) {
 	}
 	err := base.MutateOverviewMark(root, mark, func(data string) (string, error) {
 		var state ruleDelivery
-		valid := json.Unmarshal([]byte(data), &state) == nil && state.Fingerprint == fingerprint &&
+		decoded := json.Unmarshal([]byte(data), &state) == nil
+		bodyMax := state.BodyMax
+		if bodyMax == 0 {
+			bodyMax = ruleBodyMax
+		}
+		if bodyMax > 0 && bodyMax <= max(len(full), ruleBodyMax) {
+			pages = rulePages(full, bodyMax)
+		}
+		valid := decoded && len(pages) > 0 && state.Fingerprint == fingerprint &&
 			state.Born.After(resetAt) && state.Next >= 0 && state.Next <= len(pages)
 		if valid && !force && !state.Done && state.Next > 0 && cursor == state.Previous {
 			out = render(state.Next-1, state.Cursor)
+			if !fits(out) {
+				return "", errors.New(rulesPageOverflow)
+			}
 			return data, nil // A lost response can be retried without skipping a page.
 		}
 		if cursor == "" {
 			if valid && state.Done && !force {
+				if !fits(rulesComplete) {
+					return "", errors.New(rulesPageOverflow)
+				}
 				out = rulesComplete
 				return data, nil
 			}
-			state = ruleDelivery{Fingerprint: fingerprint, Born: time.Now()}
+			// Freeze the selected geometry so config changes and process restarts
+			// cannot reinterpret a cursor as a different slice of the payload.
+			low, high, chosen := 1, min(ruleBodyMax, len(full)), 0
+			if expand {
+				high = len(full)
+			}
+			for low <= high {
+				candidate := low + (high-low)/2
+				pages = rulePages(full, candidate)
+				ok := len(pages) > 0
+				for i := range pages {
+					ok = ok && fits(render(i, strings.Repeat("0", 40)))
+				}
+				if ok {
+					chosen, low = candidate, candidate+1
+				} else {
+					high = candidate - 1
+				}
+			}
+			if chosen == 0 {
+				return "", errors.New(rulesPageOverflow)
+			}
+			pages = rulePages(full, chosen)
+			state = ruleDelivery{Fingerprint: fingerprint, Born: time.Now(), BodyMax: chosen}
 		} else if force || !valid || cursor != state.Cursor {
 			return "", errors.New(rulesBadCursor)
 		}
 		if state.Next == len(pages) {
+			if !fits(rulesComplete) {
+				return "", errors.New(rulesPageOverflow)
+			}
 			state.Done = true
 			out = rulesComplete
 		} else {
@@ -1088,7 +1156,7 @@ func RulesTool(cursor string, force bool) (string, error) {
 			state.Previous = cursor
 			state.Cursor = fmt.Sprintf("%x", sha1.Sum([]byte(root+"\x00"+mark+"\x00"+fingerprint+state.Born.Format(time.RFC3339Nano)+strconv.Itoa(state.Next))))
 			out = render(page, state.Cursor)
-			if len(out) > rulePageMax {
+			if !fits(out) {
 				return "", errors.New(rulesPageOverflow)
 			}
 		}
