@@ -26,6 +26,15 @@ go test ./...
 ln -sf "$PWD/build/ortg" /usr/local/bin/ortg   # 放进 PATH；之后重新编译不用再链
 ```
 
+Windows（PowerShell）构建出 `ortg.exe`，放进用户 PATH 后重开终端与 Codex：
+
+```powershell
+$env:CGO_ENABLED = "0"; go build -ldflags "-s -w" -o build\ortg.exe .
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$PWD\build", "User")
+```
+
+测试套件里有用例直接调用 `bash` 与 `python`，在 Linux、macOS 或 WSL 上运行。
+
 ## 安装为插件
 
 Claude Code（会话里 `/plugin …` 与命令行 `claude plugin …` 等价）：
@@ -96,6 +105,21 @@ Claude 与 Codex 的会话 hook 只发短规则通知，对账只列各状态计
 自定义 CODEX_HOME 时，env_vars 将实际配置目录转交给 MCP，避免宿主过滤环境后读错默认配置。Linux 上未转交时，ORTG 只沿当前进程祖先链取最近非空 CODEX_HOME；MCP 自身的显式值优先，无 /proc 或找不到时仍回退用户 ~/.codex。模型窗口上限与有效百分比的计算保持不变。
 
 插件接入不自动改用户配置；MCP 按所用宿主与接入方式配置。不要再把 hook 抄进任何 `settings.json`，也不要用 `claude mcp add` 单独注册 ortg：宿主不去重，多一份注册就是每条钩子跑两遍、两套同名工具。仓库里没有 `ortg.tsv` 时插件对该目录零动作。
+
+### Windows 上的 Codex
+
+安装步骤同上，在 PowerShell 里执行 `codex plugin marketplace add "$PWD"` 与 `codex plugin add ortg@ortg`；手动注册 MCP 时配置文件是 `%USERPROFILE%\.codex\config.toml`。hook 命令只有 `ortg hook --event …`，不含 POSIX 语法，Codex 交给 Windows 原生解释器直接运行；`.mcp.json` 的 `ortg` 同样按 PATH 找到 `ortg.exe`，所以不需要 `commandWindows` 覆盖。
+
+Codex 在 Windows 上用 PowerShell 执行命令，ORTG 按 PowerShell 识别读写：
+
+- 写入：`Set-Content`、`Add-Content`、`Out-File`、`Tee-Object`、`New-Item`、`Remove-Item`、`Clear-Content`、`Copy-Item`、`Move-Item`、`Rename-Item` 及其别名（含 cmd 的 `del`、`copy`、`move`、`ren`）与 `>` 重定向都计入写入门禁；路径取 `-Path`/`-LiteralPath`/`-FilePath`/`-Destination` 或位置参数，`-Value` 等内容参数不当成文件，`New-Item -ItemType Directory` 不算写文件。
+- 搜索：`Select-String`（含 `Get-ChildItem … | Select-String`）与 `findstr /s` 按代码搜索处理。
+- 目录：`Set-Location`、`Push-Location`、`Pop-Location` 与 `cd` 一样跟踪；`pwsh -Command …`、`powershell -Command …`、`cmd /c …` 包着的命令按里面的命令识别。
+- 语法：未加引号的 `src\main.go` 里的反斜杠是路径分隔符；双引号里反斜杠只转义 `"`、`\`、`$` 和反引号；命令开头单独的 `&` 是调用运算符，不是后台运行。
+
+纲要指纹按"CRLF 视作 LF"计算：`core.autocrlf` 检出的工作树与 Linux 上写下的 `ortg.tsv` 保持对齐，不会整库显示过期；旧表按原始字节记下的指纹照样认。Windows 不允许替换别的进程正打开的文件，`ortg.tsv` 落盘遇到并发读取时会重试约 1 秒。
+
+已知限制：判断后台整包测试是否还在跑（Stop 提醒）依赖 `/proc`，Windows 上不提醒；自定义 `CODEX_HOME` 只能经 `env_vars` 转交给 MCP，没有 Linux 那样沿祖先进程回退。Windows 支持按 Codex hooks 文档实现，经交叉编译和 Linux 上的单元测试验证，还没有在 Windows 实机上跑过整套流程。
 
 ## 初始化一个仓库
 

@@ -38,7 +38,15 @@ func AtomicWrite(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	err = os.Rename(tmp, path)
+	// Windows refuses to replace a file another process has open without
+	// delete sharing, which is how Go opens files for reading; hooks read
+	// the table without the lock, so wait out such a reader briefly.
+	for i := 0; err != nil && runtime.GOOS == "windows" && i < 20; i++ {
+		time.Sleep(50 * time.Millisecond)
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
 		return fmt.Errorf("rename to %s failed, temp kept at %s: %w", path, tmp, err)
 	}
 	return nil

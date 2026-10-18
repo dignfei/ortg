@@ -231,7 +231,7 @@ func (x *Index) Reconcile(opts ReconcileOptions) ([]Fact, error) {
 		r := x.t.get(rel)
 		f := Fact{Path: rel, Exists: true, IsNew: r == nil, OutlineEmpty: true}
 		if r != nil {
-			f.FingerprintChanged = r.CRC != fp.CRC
+			f.FingerprintChanged = !fp.matches(r.CRC)
 			f.OutlineEmpty = r.Outline == ""
 			f.OutlineOlderThanFile = !r.OutlineTime.After(fp.Mtime)
 			f.HasTarget, f.TargetDelete, f.Deleted = r.Target != "", r.TargetDelete, r.Deleted
@@ -256,7 +256,7 @@ func (x *Index) Reconcile(opts ReconcileOptions) ([]Fact, error) {
 		full := filepath.Join(x.root, filepath.FromSlash(r.Path))
 		if fp, err := fingerprintFile(full); err == nil {
 			x.disk[r.Path] = fp
-			f := Fact{Path: r.Path, Exists: true, FingerprintChanged: r.CRC != fp.CRC,
+			f := Fact{Path: r.Path, Exists: true, FingerprintChanged: !fp.matches(r.CRC),
 				OutlineEmpty: r.Outline == "", OutlineOlderThanFile: !r.OutlineTime.After(fp.Mtime),
 				HasTarget: r.Target != "", TargetDelete: r.TargetDelete, Deleted: r.Deleted}
 			facts = append(facts, f)
@@ -302,7 +302,7 @@ func (x *Index) Inspect(rel string) (Fact, bool) {
 	}
 	f.NeverSeen = r.CRC == 0 && r.Mtime.IsZero()
 	if err == nil {
-		f.FingerprintChanged = r.CRC != fp.CRC
+		f.FingerprintChanged = !fp.matches(r.CRC)
 		f.OutlineOlderThanFile = !r.OutlineTime.After(fp.Mtime)
 	}
 	return f, true

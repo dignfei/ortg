@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -1818,9 +1819,9 @@ func pytestNodeSignature(cmd, output string) (string, bool) {
 		return "", false
 	}
 	i := 1
-	if pythonRe.MatchString(filepath.Base(w[0])) && len(w) >= 3 && w[1] == "-m" && w[2] == "pytest" {
+	if pythonRe.MatchString(shellVerb(w[0])) && len(w) >= 3 && w[1] == "-m" && w[2] == "pytest" {
 		i = 3
-	} else if verb := filepath.Base(w[0]); verb != "pytest" && verb != "py.test" {
+	} else if verb := shellVerb(w[0]); verb != "pytest" && verb != "py.test" {
 		return "", false
 	}
 	sig := append([]string(nil), w[:i]...)
@@ -2122,7 +2123,7 @@ func recordTestResult(root, session, cwd, cmd, output string, exitCode ...*int) 
 		if len(w) == 0 {
 			continue
 		}
-		verb := filepath.Base(w[0])
+		verb := shellVerb(w[0])
 		if verb == "cd" || verb == "pushd" {
 			dir = cdTarget(dir, w[1:])
 			continue
@@ -2415,7 +2416,7 @@ func failedTestStopNoteBudget(root string, in base.HookInput, budget int) string
 func editsInPlace(command, file string) bool {
 	for _, seg := range expandedSegments(command, 0) {
 		w := unwrapCommand(dropRedirects(seg.words))
-		if len(w) == 0 || (filepath.Base(w[0]) != "sed" && filepath.Base(w[0]) != "perl") {
+		if len(w) == 0 || (shellVerb(w[0]) != "sed" && shellVerb(w[0]) != "perl") {
 			continue
 		}
 		inPlace, names := false, false
@@ -2771,8 +2772,8 @@ func scanTestRunIn(command, root, dir string, depth int) (broadWords []string, c
 		if len(w) == 0 {
 			continue
 		}
-		if depth < 3 && shellInterpreters[filepath.Base(w[0])] {
-			if script, ok := shellScriptArg(w[1:]); ok {
+		if depth < 3 {
+			if script, ok := shellScript(w); ok {
 				bw, c := scanTestRunIn(script, root, dir, depth+1)
 				if broadWords == nil {
 					broadWords = bw
@@ -2781,7 +2782,7 @@ func scanTestRunIn(command, root, dir string, depth int) (broadWords []string, c
 				continue
 			}
 		}
-		switch verb := filepath.Base(w[0]); verb {
+		switch verb := shellVerb(w[0]); verb {
 		case "cd", "pushd":
 			dir = cdTarget(dir, w[1:])
 		case "git":
@@ -2800,6 +2801,111 @@ func scanTestRunIn(command, root, dir string, depth int) (broadWords []string, c
 // shellInterpreters run the script given after -c.
 var shellInterpreters = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true}
 
+// backslashPaths reads an unquoted backslash before a path character as a
+// directory separator (src\main.go), not an escape: Codex on Windows runs
+// PowerShell, where the backslash is a path character and ` the escape.
+var backslashPaths = runtime.GOOS == "windows"
+
+// shellVerb is the command a word runs, as the parsers compare it: its base
+// name without a Windows .exe suffix, with PowerShell's location cmdlets
+// (any case) read as the cd, pushd and popd they act like.
+func shellVerb(w string) string {
+	v := filepath.Base(w)
+	if len(v) > 4 && strings.EqualFold(v[len(v)-4:], ".exe") {
+		v = v[:len(v)-4]
+	}
+	switch strings.ToLower(v) {
+	case "set-location", "chdir":
+		return "cd"
+	case "push-location":
+		return "pushd"
+	case "pop-location":
+		return "popd"
+	}
+	return v
+}
+
+// shellScript is the inline script an interpreter's words run: a POSIX
+// shell's -c script, PowerShell's -Command (the words after it, which
+// PowerShell joins into one script) or cmd's /c and /k.
+func shellScript(w []string) (string, bool) {
+	if len(w) < 2 {
+		return "", false
+	}
+	switch v := strings.ToLower(shellVerb(w[0])); {
+	case shellInterpreters[v]:
+		return shellScriptArg(w[1:])
+	case v == "powershell" || v == "pwsh":
+		for i, a := range w[1:] {
+			if a = strings.ToLower(a); a == "-c" || len(a) > 3 && strings.HasPrefix("-command", a) {
+				return strings.Join(w[i+2:], " "), i+2 < len(w)
+			}
+		}
+	case v == "cmd":
+		for i, a := range w[1:] {
+			if strings.EqualFold(a, "/c") || strings.EqualFold(a, "/k") {
+				return strings.Join(w[i+2:], " "), i+2 < len(w)
+			}
+		}
+	}
+	return "", false
+}
+
+// psValued are the PowerShell parameters, lower-cased, that take a value in
+// the cmdlets read here; any other -Name is a switch.
+var psValued = map[string]bool{"-path": true, "-literalpath": true, "-lp": true, "-pspath": true, "-filepath": true,
+	"-destination": true, "-value": true, "-encoding": true, "-itemtype": true, "-type": true, "-name": true,
+	"-newname": true, "-filter": true, "-include": true, "-exclude": true, "-pattern": true, "-inputobject": true,
+	"-stream": true, "-delimiter": true, "-width": true, "-credential": true, "-target": true}
+
+// psArgs splits a PowerShell command's arguments into named values (keyed by
+// the lower-cased parameter, -Name:value too) and positional ones; a comma
+// list gives several values. Redirections and cmd's /X switches are dropped.
+func psArgs(args []string) (named map[string][]string, pos []string) {
+	named = map[string][]string{}
+	list := func(v string) []string {
+		var out []string
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		t := strings.TrimLeft(a, "0123456789*&")
+		switch {
+		case strings.HasPrefix(t, ">") || strings.HasPrefix(a, "<"):
+			if t == ">" || t == ">>" || a == "<" {
+				i++ // the target is the next word
+			}
+		case len(a) > 1 && a[0] == '-' && (a[1] < '0' || a[1] > '9'):
+			if name, val, glued := strings.Cut(a, ":"); glued {
+				name = strings.ToLower(name)
+				named[name] = append(named[name], list(val)...)
+			} else if name = strings.ToLower(a); psValued[name] && i+1 < len(args) {
+				i++
+				named[name] = append(named[name], list(args[i])...)
+			}
+		case len(a) == 2 && a[0] == '/':
+		default:
+			pos = append(pos, list(a)...)
+		}
+	}
+	return named, pos
+}
+
+// psPaths is the values given to the first of names that has any.
+func psPaths(named map[string][]string, names ...string) []string {
+	for _, n := range names {
+		if v := named[n]; len(v) > 0 {
+			return v
+		}
+	}
+	return nil
+}
+
 // expandedSegments is shellSegments with each "sh -c <script>" (any shell
 // above, options before -c allowed) replaced by the segments of its script,
 // so a run wrapped for detaching (setsid nohup bash -c '…' &) reads as the
@@ -2808,8 +2914,8 @@ func expandedSegments(cmd string, depth int) []shellSegment {
 	var out []shellSegment
 	for _, seg := range shellSegments(cmd) {
 		w := unwrapCommand(dropRedirects(seg.words))
-		if depth < 3 && len(w) > 1 && shellInterpreters[filepath.Base(w[0])] {
-			if script, ok := shellScriptArg(w[1:]); ok {
+		if depth < 3 {
+			if script, ok := shellScript(w); ok {
 				out = append(out, expandedSegments(script, depth+1)...)
 				continue
 			}
@@ -2940,7 +3046,7 @@ func unwrapCommand(w []string) []string {
 			}
 			w = w[1:]
 			skipOpts(nil)
-		case pythonRe.MatchString(filepath.Base(a)) || a == "py":
+		case pythonRe.MatchString(shellVerb(a)) || a == "py":
 			for i := 1; i < len(w); i++ {
 				switch o := w[i]; {
 				case o == "-m" && i+1 < len(w):
@@ -3023,15 +3129,15 @@ func stagesIn(command, root, dir string, depth int) bool {
 		if len(w) == 0 {
 			continue
 		}
-		if depth < 3 && shellInterpreters[filepath.Base(w[0])] {
-			if script, ok := shellScriptArg(w[1:]); ok {
+		if depth < 3 {
+			if script, ok := shellScript(w); ok {
 				if stagesIn(script, root, dir, depth+1) {
 					return true
 				}
 				continue
 			}
 		}
-		switch filepath.Base(w[0]) {
+		switch shellVerb(w[0]) {
 		case "cd", "pushd":
 			dir = cdTarget(dir, w[1:])
 		case "git":
@@ -3360,7 +3466,7 @@ func shellTargetsIn(command, root string, inRepo func(string) (string, bool), me
 		switch {
 		case p == "" || strings.ContainsAny(p, "$`"):
 			return "", false
-		case strings.HasPrefix(p, "~/"):
+		case strings.HasPrefix(p, "~/") || backslashPaths && strings.HasPrefix(p, `~\`):
 			home, _ := os.UserHomeDir()
 			return filepath.Join(home, p[2:]), true
 		case filepath.IsAbs(p):
@@ -3394,6 +3500,21 @@ func shellTargetsIn(command, root string, inRepo func(string) (string, bool), me
 			writes = append(writes, rel)
 		}
 	}
+	// nested takes in what an interpreter's inline script touches, run from
+	// the directory the outer command line has reached.
+	nested := func(script string) {
+		t, ws := shellTargetsIn("cd "+strconv.Quote(dir)+"; "+script, root, inRepo, mentioned, depth+1)
+		for _, p := range t {
+			add(p)
+		}
+		for _, p := range ws {
+			if !wseen[p] {
+				wseen[p] = true
+				writes = append(writes, p)
+			}
+		}
+	}
+	pipeHead := "" // the first command of the current pipeline, lower-cased
 segments:
 	for _, seg := range shellSegments(command) {
 		w := seg.words
@@ -3403,7 +3524,10 @@ segments:
 		if len(w) == 0 {
 			continue
 		}
-		verb := filepath.Base(w[0])
+		verb := shellVerb(w[0])
+		if !seg.piped {
+			pipeHead = strings.ToLower(verb)
+		}
 		switch {
 		case verb == "cd" || verb == "pushd":
 			if verb == "pushd" {
@@ -3424,18 +3548,14 @@ segments:
 		if depth < 3 && shellInterpreters[verb] {
 			for i, a := range w[1:] {
 				if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 'c') && i+2 < len(w) {
-					t, ws := shellTargetsIn("cd "+strconv.Quote(dir)+"; "+w[i+2], root, inRepo, mentioned, depth+1)
-					for _, p := range t {
-						add(p)
-					}
-					for _, p := range ws {
-						if !wseen[p] {
-							wseen[p] = true
-							writes = append(writes, p)
-						}
-					}
+					nested(w[i+2])
 					continue segments
 				}
+			}
+		} else if depth < 3 {
+			if script, ok := shellScript(w); ok { // pwsh -Command, cmd /c
+				nested(script)
+				continue segments
 			}
 		}
 		if script, ok := shellPythonScript(w, seg.stdin); ok {
@@ -3487,6 +3607,41 @@ segments:
 				}
 			}
 		}
+		// PowerShell's and cmd's searches: Select-String reads the files it is
+		// given, or those a listing piped into it names; findstr /s recurses.
+		var searched []string
+		switch strings.ToLower(verb) {
+		case "select-string", "sls":
+			named, pos := psArgs(w[1:])
+			if len(named["-pattern"]) == 0 && len(pos) > 0 {
+				pos = pos[1:]
+			}
+			searched = append(psPaths(named, "-path", "-literalpath"), pos...)
+			if len(searched) == 0 && seg.piped && (pipeHead == "get-childitem" || pipeHead == "gci" || pipeHead == "dir" || pipeHead == "ls") {
+				searched = []string{"."}
+			}
+		case "findstr":
+			pattern := false
+			for _, a := range w[1:] {
+				switch l := strings.ToLower(a); {
+				case l == "/s":
+					searched = append(searched, ".")
+				case strings.HasPrefix(l, "/c:") || strings.HasPrefix(l, "/g:"):
+					pattern = true
+				case strings.HasPrefix(a, "/"):
+				case !pattern:
+					pattern = true // the first operand is the pattern
+				default:
+					searched = append(searched, a)
+				}
+			}
+		}
+		for _, p := range searched {
+			if here(p) {
+				add(".")
+				break
+			}
+		}
 	}
 	return touched, writes
 }
@@ -3494,7 +3649,7 @@ segments:
 // Inline Python is code, not shell operands. Literal filesystem calls are
 // candidates; printed strings, comments and unresolved dynamic paths are not.
 func shellPythonScript(words []string, stdin string) (string, bool) {
-	verb := filepath.Base(words[0])
+	verb := shellVerb(words[0])
 	if verb != "python" && !strings.HasPrefix(verb, "python3") && !strings.HasPrefix(verb, "python2") {
 		return "", false
 	}
@@ -3721,6 +3876,66 @@ func shellWrites(verb string, args []string, write func(string, bool), resolve f
 			write(dst, false)
 		}
 	}
+	// PowerShell cmdlets and their aliases (cmd's builtins of the same name
+	// read alike): the paths come from -Path/-LiteralPath or the first
+	// positions, never from -Value, so content is not taken for a file.
+	switch lv := strings.ToLower(verb); lv {
+	case "set-content", "add-content", "out-file", "tee-object", "new-item", "ni", "ac":
+		named, pos := psArgs(args)
+		if t := strings.ToLower(strings.Join(psPaths(named, "-itemtype", "-type"), "")); t == "directory" || t == "dir" {
+			return
+		}
+		targets := psPaths(named, "-path", "-literalpath", "-filepath")
+		if len(targets) == 0 && len(pos) > 0 {
+			targets = pos[:1]
+		}
+		if names := named["-name"]; len(names) > 0 {
+			if len(targets) == 0 {
+				targets = []string{"."}
+			}
+			targets = []string{filepath.Join(targets[0], names[0])}
+		}
+		for _, p := range targets {
+			write(p, false)
+		}
+	case "remove-item", "ri", "del", "erase", "rd", "clear-content", "clc":
+		named, pos := psArgs(args)
+		targets := psPaths(named, "-path", "-literalpath")
+		if len(targets) == 0 {
+			targets = pos
+		}
+		for _, p := range targets {
+			write(p, true)
+		}
+	case "copy-item", "cpi", "copy", "move-item", "mi", "move", "rename-item", "rni", "ren":
+		named, pos := psArgs(args)
+		srcs := psPaths(named, "-path", "-literalpath")
+		if len(srcs) == 0 && len(pos) > 0 {
+			srcs, pos = pos[:1], pos[1:]
+		}
+		dst := ""
+		if d := psPaths(named, "-destination", "-newname"); len(d) > 0 {
+			dst = d[0]
+		} else if len(pos) > 0 {
+			dst = pos[0]
+		}
+		rename := lv == "rename-item" || lv == "rni" || lv == "ren"
+		move := rename || lv == "move-item" || lv == "mi" || lv == "move"
+		for _, s := range srcs {
+			if move {
+				write(s, true)
+			}
+			switch {
+			case dst == "":
+			case rename:
+				write(filepath.Join(filepath.Dir(s), dst), false)
+			case isDir(dst):
+				write(filepath.Join(dst, filepath.Base(s)), false)
+			default:
+				write(dst, false)
+			}
+		}
+	}
 }
 
 // cdTarget is the directory a cd or pushd with args leads to from dir, or ""
@@ -3876,12 +4091,16 @@ func shellSegments(cmd string) []shellSegment {
 		}
 		cur = shellSegment{piped: piped}
 	}
+	var lastSep rune // the separator that ended the previous segment
 	rs := []rune(cmd)
 	for i := 0; i < len(rs); i++ {
 		r := rs[i]
 		switch {
 		case r == '\\' && i+1 < len(rs) && rs[i+1] == '\n':
 			i++ // a line continuation joins the lines, it is no word
+		case r == '\\' && i+1 < len(rs) && backslashPaths && (unicode.IsLetter(rs[i+1]) || unicode.IsDigit(rs[i+1]) || strings.ContainsRune("._-", rs[i+1])):
+			word.WriteRune(r) // a Windows path separator: src\main.go
+			inWord = true
 		case r == '\\' && i+1 < len(rs):
 			i++
 			word.WriteRune(rs[i])
@@ -3889,7 +4108,9 @@ func shellSegments(cmd string) []shellSegment {
 		case r == '\'' || r == '"':
 			j := i + 1
 			for j < len(rs) && rs[j] != r {
-				if r == '"' && rs[j] == '\\' && j+1 < len(rs) {
+				// In double quotes a backslash escapes only " \ $ and `;
+				// before anything else it is itself (a Windows path).
+				if r == '"' && rs[j] == '\\' && j+1 < len(rs) && strings.ContainsRune("\"\\$`", rs[j+1]) {
 					j++
 				}
 				word.WriteRune(rs[j])
@@ -3907,11 +4128,13 @@ func shellSegments(cmd string) []shellSegment {
 			} else {
 				flushSeg(true)
 			}
+			lastSep = r
 		case r == '&' && (i > 0 && (rs[i-1] == '>' || rs[i-1] == '<') || i+1 < len(rs) && rs[i+1] == '>'):
 			word.WriteRune(r) // part of a redirection: >&1, <&0, &>file
 			inWord = true
 		case r == '\n':
 			flushSeg(false) // flushes the last word, so a trailing <<EOF counts
+			lastSep = r
 			if len(heredocs) == 0 {
 				continue
 			}
@@ -3938,14 +4161,20 @@ func shellSegments(cmd string) []shellSegment {
 			i = k - 1
 		case r == '&' && (i == 0 || rs[i-1] != '&' && rs[i-1] != '|') && (i+1 == len(rs) || rs[i+1] != '&'):
 			flushWord()
-			if len(cur.words) == 0 && len(segs) > 0 {
-				segs[len(segs)-1].bg = true // "( … ) &": the group just closed
-			} else {
-				cur.bg = true
+			if len(cur.words) == 0 {
+				// "( … ) &" backgrounds the group just closed; elsewhere a lone
+				// & where a command starts is PowerShell's call operator.
+				if lastSep == ')' && len(segs) > 0 {
+					segs[len(segs)-1].bg = true
+				}
+				continue
 			}
+			cur.bg = true
 			flushSeg(false)
+			lastSep = r
 		case r == ';' || r == '&' || r == '(' || r == ')':
 			flushSeg(false)
+			lastSep = r
 		case unicode.IsSpace(r):
 			flushWord()
 		default:

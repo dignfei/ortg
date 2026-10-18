@@ -396,10 +396,10 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 		Response   json.RawMessage `json:"tool_response"`
 		StopHook   bool            `json:"stop_hook_active"`
 		Input      struct {
-			FilePath     string `json:"file_path"`
-			NotebookPath string `json:"notebook_path"`
-			Command      string `json:"command"`
-			Background   bool   `json:"run_in_background"`
+			FilePath     string          `json:"file_path"`
+			NotebookPath string          `json:"notebook_path"`
+			Command      json.RawMessage `json:"command"`
+			Background   bool            `json:"run_in_background"`
 		} `json:"tool_input"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimPrefix(string(raw), "\uFEFF")), &m); err != nil {
@@ -420,7 +420,7 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 	if in.FilePath == "" {
 		in.FilePath = m.Input.NotebookPath
 	}
-	in.Command = m.Input.Command
+	in.Command = commandText(m.Input.Command)
 	in.Background, in.StopHookActive = m.Input.Background, m.StopHook
 	if in.FilePath != "" {
 		in.FilePaths = append(in.FilePaths, in.FilePath)
@@ -445,6 +445,26 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 		in.FilePath = in.FilePaths[0]
 	}
 	return in
+}
+
+// commandText is a tool's command as one shell line: the string itself, or
+// an argv array joined with each word that needs it single-quoted, so the
+// shell parser sees the same words. Anything else reads as no command.
+func commandText(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var argv []string
+	if json.Unmarshal(raw, &argv) != nil {
+		return ""
+	}
+	for i, a := range argv {
+		if a == "" || strings.ContainsAny(a, " \t\n\"'\\$`|&;<>()*?[]{}~#") {
+			argv[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+		}
+	}
+	return strings.Join(argv, " ")
 }
 
 // WriteHookOutput writes text in the envelope the host expects for the event.

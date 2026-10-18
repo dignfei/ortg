@@ -1,6 +1,7 @@
 package base
 
 import (
+	"hash/crc32"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,5 +193,42 @@ func TestRuleNegationLastMatchWins(t *testing.T) {
 	}
 	if !keepsUnder("composetp", []string{"composetp/docker-compose.yml"}) {
 		t.Fatal("a real keep target must keep the walk inside the directory")
+	}
+}
+
+// A checkout that git converts to CRLF must keep the fingerprint an LF
+// checkout stored, and a row stored before normalisation (the raw CRC of a
+// CRLF file) must stay aligned too; a real edit still changes it.
+func TestFingerprintLineEndings(t *testing.T) {
+	dir := t.TempDir()
+	lf, crlf := filepath.Join(dir, "lf.go"), filepath.Join(dir, "crlf.go")
+	os.WriteFile(lf, []byte("package a\n\nfunc A() {}\n"), 0o644)
+	os.WriteFile(crlf, []byte("package a\r\n\r\nfunc A() {}\r\n"), 0o644)
+	a, _ := fingerprintFile(lf)
+	b, _ := fingerprintFile(crlf)
+	if a.CRC != b.CRC || a.CRC != a.Raw || b.Raw == b.CRC {
+		t.Fatalf("CRLF not read as LF: lf=%+v crlf=%+v", a, b)
+	}
+	if !b.matches(a.CRC) || !b.matches(b.Raw) {
+		t.Fatal("stored LF or raw CRLF fingerprint no longer matches")
+	}
+	os.WriteFile(crlf, []byte("package a\r\n\r\nfunc B() {}\r\n"), 0o644)
+	if c, _ := fingerprintFile(crlf); c.matches(a.CRC) || c.matches(b.Raw) {
+		t.Fatal("edited file still matches the old fingerprint")
+	}
+	// A lone CR is content, and a CR split from its LF across reads is not.
+	lone := filepath.Join(dir, "lone")
+	os.WriteFile(lone, []byte("a\rb"), 0o644)
+	if f, _ := fingerprintFile(lone); f.CRC != f.Raw {
+		t.Fatal("lone CR dropped")
+	}
+	h, want := crc32.NewIEEE(), crc32.ChecksumIEEE([]byte("x\ny\r"))
+	cr := hashLF(h, []byte("x\r"), false)
+	cr = hashLF(h, []byte("\ny\r"), cr)
+	if cr {
+		h.Write([]byte{'\r'})
+	}
+	if h.Sum32() != want {
+		t.Fatal("CRLF split across chunks hashed wrong")
 	}
 }

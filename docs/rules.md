@@ -139,6 +139,16 @@ Codex 的 `apply_patch`：载荷 `tool_name` 为 `apply_patch`，`tool_input.com
 
 只有 session 事件写表（对账）；其余只读表、不取表锁，配对实写证据另用独立状态锁。pre/post 对命中内置排除或忽略规则的路径（ortg.tsv、overview.txt、build/ 等）一律静默。
 
+## Windows（Codex 的 PowerShell）
+
+hook 命令与 `.mcp.json` 都只调用 `ortg`，Windows 原生解释器按 PATH 找到 `ortg.exe`，无需 `commandWindows`。`tool_input.command` 收字符串；宿主给 argv 数组时按单引号拼成一行再解析，其他形态只当没有命令，不丢弃整份载荷。
+
+shell 解析（`shellSegments`/`shellTargets`/`shellWrites`）在 Windows 上兼容 PowerShell：未加引号的反斜杠后接字母、数字或 `._-` 时保留为路径分隔符（`backslashPaths`，仅 windows 开启）；双引号内反斜杠只转义 `"`、`\`、`$` 与反引号（各平台一致，与 bash 相同）；命令开头单独的 `&` 是调用运算符，只有紧跟 `)` 的 `&` 与命令后的 `&` 仍算后台。命令名经 `shellVerb` 去掉 `.exe` 后缀，`Set-Location`/`chdir`、`Push-Location`、`Pop-Location` 按 cd、pushd、popd 处理；`shellScript` 把 `pwsh`/`powershell` 的 `-Command`（或 `-c`）与 `cmd` 的 `/c`、`/k` 之后的内容当内联脚本递归解析，与 `sh -c` 一致。写入：`Set-Content`/`Add-Content`/`Out-File`/`Tee-Object`/`New-Item`/`ni`/`ac` 取 `-Path`/`-LiteralPath`/`-FilePath` 或第一个位置参数（`-Name` 拼到其后，`-ItemType Directory` 不算写文件）；`Remove-Item`/`ri`/`del`/`erase`/`rd`/`Clear-Content`/`clc` 取全部路径且须已存在；`Copy-Item`/`Move-Item`/`Rename-Item` 及别名按源与 `-Destination`/`-NewName`/第二个位置参数。`-Value` 等其他带值参数不当路径，cmd 的 `/X` 开关丢弃。搜索：`Select-String`/`sls` 的路径参数，或管道前一段是 `Get-ChildItem`/`gci`/`dir`/`ls` 时，及 `findstr`（`/s` 递归）都算代码搜索。
+
+指纹：CRC32 把 CRLF 当 LF 计算，`fingerprint.Raw` 另存原始字节 CRC；表内 CRC 等于其中任一即未变（`fingerprint.matches`），新写入一律存规范化值。因此 `core.autocrlf` 检出与 LF 检出共用一份 `ortg.tsv`，旧表里 CRLF 文件的原始 CRC 也不会整批变成过期。
+
+`AtomicWrite` 在 Windows 上 Rename 失败（读者未开删除共享，hook 读表不取锁）时每 50 毫秒重试，最多约 1 秒，仍失败才按原逻辑报错并留临时文件。`ProcessAlive` 与 `Ancestors` 只读 `/proc`，Windows 上分别为 false 与空：Stop 不做后台整包提醒，`CODEX_HOME` 没有祖先进程回退。
+
 ## 目录纲要
 
 目录纲要就是表里的一行普通纲要，只是写给目录：path 是目录（如 `vendored`），纲要行的文件名以 `/` 结尾（`vendored/[标签]: ...`，CheckEntry 比对文件名时去掉这个 `/`）。它的 B 标签填用到它的模块——内容再独立也不单开模块，并入使用方模块（写进了规则块的"目录纲要规则"）。于是模块清单计数、按 module 取、增量发送、变动重发都与普通条目相同，没有另一套渲染。

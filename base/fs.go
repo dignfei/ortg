@@ -3,6 +3,7 @@ package base
 import (
 	"bytes"
 	"context"
+	"hash"
 	"hash/crc32"
 	"io"
 	"io/fs"
@@ -378,13 +379,50 @@ func matchFile(pat, rel string) bool {
 	return rel == pat || path.Base(rel) == pat
 }
 
+// fingerprint.CRC reads each CRLF as LF, so a checkout that git converts
+// (core.autocrlf on Windows) matches a table written from an LF one. Raw is
+// the plain CRC, which rows stored before that normalisation hold; the two
+// differ only for a file with CRLF in it.
 type fingerprint struct {
 	CRC   uint32
+	Raw   uint32
 	Mtime time.Time
 	Size  int64
 }
 
-// fingerprintFile streams the file through CRC32 (IEEE) and records mtime.
+// matches reports whether a stored CRC still describes this content.
+func (f fingerprint) matches(crc uint32) bool { return crc == f.CRC || crc == f.Raw }
+
+// hashLF feeds h the chunk p with every CRLF turned into LF. cr says the
+// previous chunk ended in a CR not yet written; the result says the same
+// of p, so the caller passes it to the next chunk and writes a final '\r'
+// itself when the content ends there.
+func hashLF(h hash.Hash32, p []byte, cr bool) bool {
+	if cr && len(p) > 0 && p[0] != '\n' {
+		h.Write([]byte{'\r'})
+	}
+	if len(p) == 0 {
+		return cr
+	}
+	for {
+		i := bytes.IndexByte(p, '\r')
+		if i < 0 {
+			h.Write(p)
+			return false
+		}
+		h.Write(p[:i])
+		if i+1 == len(p) {
+			return true
+		}
+		if p[i+1] != '\n' {
+			h.Write(p[i : i+1])
+		}
+		p = p[i+1:]
+	}
+}
+
+// fingerprintFile streams the file through CRC32 (IEEE), raw and with CRLF
+// read as LF, and records mtime.
 func fingerprintFile(p string) (fingerprint, error) {
 	st, err := os.Stat(p)
 	if err != nil {
@@ -400,11 +438,24 @@ func fingerprintFile(p string) (fingerprint, error) {
 		return fingerprint{}, err
 	}
 	defer f.Close()
-	h := crc32.NewIEEE()
-	if _, err := io.Copy(h, f); err != nil {
-		return fingerprint{}, err
+	raw, lf := crc32.NewIEEE(), crc32.NewIEEE()
+	buf := make([]byte, 32<<10)
+	cr := false
+	for {
+		n, err := f.Read(buf)
+		raw.Write(buf[:n])
+		cr = hashLF(lf, buf[:n], cr)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fingerprint{}, err
+		}
 	}
-	return fingerprint{CRC: h.Sum32(), Mtime: st.ModTime().UTC().Truncate(time.Second), Size: st.Size()}, nil
+	if cr {
+		lf.Write([]byte{'\r'})
+	}
+	return fingerprint{CRC: lf.Sum32(), Raw: raw.Sum32(), Mtime: st.ModTime().UTC().Truncate(time.Second), Size: st.Size()}, nil
 }
 
 type diffResult struct{ New, Missing, Changed []string }
@@ -418,7 +469,7 @@ func diff(rows map[string]*record, disk map[string]fingerprint) diffResult {
 		switch {
 		case !ok:
 			d.New = append(d.New, p)
-		case r.CRC != fp.CRC:
+		case !fp.matches(r.CRC):
 			d.Changed = append(d.Changed, p)
 		}
 	}

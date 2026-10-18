@@ -298,6 +298,23 @@ func TestReadHookInputTimeoutAndBOM(t *testing.T) {
 }
 
 // Claude Code's interactive SessionStart names the model, [1m] included.
+// A command given as an argv array reads as the shell line that runs it, so
+// a host that sends one does not lose the whole payload.
+func TestReadHookInputArgvCommand(t *testing.T) {
+	in := ReadHookInput(strings.NewReader(`{"tool_name":"Bash","session_id":"s","tool_input":{"command":["pwsh","-Command","Get-Content 'a b.go'"]}}`), time.Second)
+	if want := `pwsh -Command 'Get-Content '\''a b.go'\'''`; in.SessionID != "s" || in.Command != want {
+		t.Fatalf("argv command %q, want %q", in.Command, want)
+	}
+	in = ReadHookInput(strings.NewReader(`{"tool_name":"Bash","tool_input":{"command":"cat a.go"}}`), time.Second)
+	if in.Command != "cat a.go" {
+		t.Fatalf("string command: %q", in.Command)
+	}
+	in = ReadHookInput(strings.NewReader(`{"tool_name":"Bash","session_id":"s","tool_input":{"command":{"x":1}}}`), time.Second)
+	if in.SessionID != "s" || in.Command != "" {
+		t.Fatalf("odd command must not drop the payload: %+v", in)
+	}
+}
+
 func TestReadHookInputModel(t *testing.T) {
 	in := ReadHookInput(strings.NewReader(`{"hook_event_name":"SessionStart","source":"startup","model":"claude-opus-5-5[1m]"}`), time.Second)
 	if in.Model != "claude-opus-5-5[1m]" || in.Source != "startup" {
