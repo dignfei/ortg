@@ -1247,9 +1247,10 @@ type sentCache struct {
 	nagged map[string]bool   // file or "module:X" the gate reminded about
 	// The write gate: each ortg_review records the plan it saw; two in a
 	// row seeing the same plan unlock its files for the rest of the context.
-	reviews    int
-	lastReview string
-	planned    map[string]bool
+	reviews        int
+	lastReview     string
+	reviewGuidance string
+	planned        map[string]bool
 	// solo is the files written outside any plan whose outline has not been
 	// submitted yet: one such file is a single-file change and passes; a
 	// second one makes it a multi-file change, which needs a plan.
@@ -1303,24 +1304,25 @@ func sentFor(root string) *sentCache {
 
 // sentFile is sentCache as saved between processes.
 type sentFile struct {
-	Lost       string
-	Born       time.Time
-	Header     string
-	Rows       map[string]string
-	Denied     bool
-	Nagged     map[string]bool
-	Reviews    int
-	LastReview string
-	Planned    map[string]bool
-	Solo       map[string]bool
-	Plan       planSeen
-	Rules      string
+	Lost           string
+	Born           time.Time
+	Header         string
+	Rows           map[string]string
+	Denied         bool
+	Nagged         map[string]bool
+	Reviews        int
+	LastReview     string
+	ReviewGuidance string
+	Planned        map[string]bool
+	Solo           map[string]bool
+	Plan           planSeen
+	Rules          string
 }
 
 // saveSent writes the cache to its session's "sent" mark. Callers hold
 // overviewMu.
 func saveSent(root string, c *sentCache) {
-	b, err := json.Marshal(sentFile{c.lost, c.born, c.header, c.rows, c.denied, c.nagged, c.reviews, c.lastReview, c.planned, c.solo, c.plan, c.rules})
+	b, err := json.Marshal(sentFile{c.lost, c.born, c.header, c.rows, c.denied, c.nagged, c.reviews, c.lastReview, c.reviewGuidance, c.planned, c.solo, c.plan, c.rules})
 	if err != nil {
 		return
 	}
@@ -1344,7 +1346,7 @@ func loadSent(root, sid string) *sentCache {
 		return nil
 	}
 	c := &sentCache{sid: sid, lost: f.Lost, born: f.Born, header: f.Header, rows: f.Rows, denied: f.Denied, nagged: f.Nagged,
-		reviews: f.Reviews, lastReview: f.LastReview, planned: f.Planned, solo: f.Solo, plan: f.Plan, rules: f.Rules}
+		reviews: f.Reviews, lastReview: f.LastReview, reviewGuidance: f.ReviewGuidance, planned: f.Planned, solo: f.Solo, plan: f.Plan, rules: f.Rules}
 	if c.rows == nil {
 		c.rows = map[string]string{}
 	}
@@ -1444,10 +1446,19 @@ func gateCall(x *base.Index, tool, path, dir, command string) string {
 		if !mcpRulesKnown(x.Root()) {
 			return base.PreToolDecision(rulesNeeded, true)
 		}
-		_, targeted := planSnapshot(x)
+		snap, targeted := planSnapshot(x)
+		reviewed := c.reviewGuidance == reviewFingerprint(x.Config().Mode) && len(c.plan.Targets) == 0
+		// Updating a finished file removes its target; the remaining targets
+		// may be an exact subset of the plan that converged.
+		for line := range strings.SplitSeq(strings.TrimSuffix(snap, "\n"), "\n") {
+			if line != "" && !strings.Contains("\n"+c.lastReview, "\n"+line+"\n") {
+				reviewed = false
+				break
+			}
+		}
 		var unplanned []string
 		for _, w := range writes {
-			if c.planned[w] || x.Observed(w, reconcileOpts) {
+			if (c.planned[w] && (!targeted[w] || reviewed)) || x.Observed(w, reconcileOpts) {
 				continue
 			}
 			if targeted[w] {
@@ -4252,6 +4263,22 @@ func expandDirs(x *base.Index, paths []string) []string {
 	return out
 }
 
+func reviewChecklistFor(mode string) string {
+	if mode == "task" {
+		return reviewTaskChecklist
+	}
+	return reviewChecklist
+}
+
+// Guidance changes invalidate only plan review, independently of outlines
+// and the separately acknowledged rule pages. Bump v1 if review semantics change.
+func reviewFingerprint(mode string) string {
+	text := reviewChecklistFor(mode) + reviewConflict + reviewMigration + reviewContracts +
+		reviewKeys + reviewKeysRest + reviewKeyMissing + reviewGuardTests + reviewRulingsMissing +
+		reviewAgain + reviewQuickSame + reviewQuickClean + reviewConverged + reviewConvergedFirst
+	return "review-v1:" + fmt.Sprintf("%x", sha1.Sum([]byte(text)))
+}
+
 // Review checks the plan — every target outline, planned creation and
 // planned deletion — against the global outline and says what to verify:
 // each file's current → target fields, target lines that fail the format,
@@ -4269,6 +4296,14 @@ func Review(rulings ...string) (string, error) {
 	overviewMu.Lock()
 	defer overviewMu.Unlock()
 	c := sentFor(x.Root())
+	if fingerprint := reviewFingerprint(x.Config().Mode); c.reviewGuidance != fingerprint {
+		c.reviewGuidance = fingerprint
+		c.lastReview = ""
+		c.plan.Checklist, c.plan.Conflict = false, false
+		for p := range set {
+			delete(c.planned, p)
+		}
+	}
 	converged := c.reviews > 0 && c.lastReview == snap
 	c.reviews++
 	c.lastReview = snap
@@ -4407,11 +4442,7 @@ func Review(rulings ...string) (string, error) {
 	}
 	if !pl.Checklist {
 		pl.Checklist = true
-		if x.Config().Mode == "task" {
-			b.WriteString(reviewTaskChecklist)
-		} else {
-			b.WriteString(reviewChecklist)
-		}
+		b.WriteString(reviewChecklistFor(x.Config().Mode))
 	}
 	given, missing := matchRulings(bound, rulings)
 	// A plan with something to fix or weigh converges only once two reviews
