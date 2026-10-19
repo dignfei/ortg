@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -662,18 +663,57 @@ func Overview(module string, force bool) (string, error) {
 	if !force && c.nagged[policyKey] {
 		policy = ""
 	}
-	finish := func(footer string) string {
-		// Account for the actual reply, including its closing line. A deferred
-		// payload stays unsent so a later fitting call can still deliver it.
-		if policy != "" && outlineSize(b.String()+policy+footer) <= lim.max {
-			b.WriteString(policy)
-			c.nagged[policyKey] = true
+	finish := func(text, footer string, cache *sentCache) string {
+		// A deferred payload stays unsent so a later fitting call can deliver it.
+		if policy != "" && outlineSize(text+policy+footer) <= lim.max {
+			text += policy
+			cache.nagged[policyKey] = true
 		}
-		b.WriteString(footer)
-		return b.String()
+		return text + footer
 	}
-	rendered := x.Render(opts) + policy
-	size, tokens := outlineSize(rendered), estTokens(rendered)
+	if len(fresh) == 0 && !headerFresh {
+		b.WriteString(fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.countsReport() + "\n" + rules + taskDependencyHints(x, c, cand, s))
+		return finish(b.String(), overviewShortFooter, c), nil
+	}
+	sub := opts
+	set := make(map[string]bool, len(fresh))
+	for _, r := range fresh {
+		set[r.Path] = true
+	}
+	sub.Include = func(r base.Row) bool { return set[r.Path] }
+	sub.OmitHeader = !headerFresh
+	body := x.Render(sub)
+	// Build the actual candidate reply before choosing the bare-call scope.
+	// Keep delivery side effects private until that reply is selected.
+	next := *c
+	next.rows, next.nagged = maps.Clone(c.rows), maps.Clone(c.nagged)
+	var part strings.Builder
+	part.WriteString(b.String())
+	if n := outlineSize(body + policy); n > lim.max-lim.margin {
+		// Sent anyway: even a truncated part lets the model work out how to
+		// split the module. The warning leads so a preview still carries it,
+		// and nothing is recorded as sent, since the host may have cut it.
+		part.WriteString(fmt.Sprintf(overviewTooLarge, scope, n, lim.unit, lim.max, lim.unit) + "\n\n")
+	} else {
+		for _, r := range fresh {
+			next.rows[r.Path] = rowPrint(r)
+		}
+	}
+	next.header = header
+	part.WriteString(body)
+	if headerFresh {
+		part.WriteString(gateOverview(x))
+	}
+	part.WriteString("\n" + s.countsReport() + "\n" + rules)
+	part.WriteString("\n" + taskDependencyHints(x, &next, cand, s))
+	if skipped := len(cand) - len(fresh); skipped > 0 {
+		part.WriteString("\n" + fmt.Sprintf(overviewIncrementNote, len(fresh), skipped))
+	}
+	if whole {
+		scope = "整份" // "以上是整份的纲要"
+	}
+	reply := finish(part.String(), "\n"+fmt.Sprintf(overviewPartFooter, scope), &next)
+	size, tokens := outlineSize(reply), estTokens(reply)
 	over := ""
 	if size > lim.whole {
 		over = fmt.Sprintf(overviewBudgetCap, lim.whole, lim.unit)
@@ -681,9 +721,8 @@ func Overview(module string, force bool) (string, error) {
 		over = fmt.Sprintf(overviewBudgetWindow, half*100/wholeShareOfWindow)
 	}
 	if bare && over != "" && len(fresh) > 0 {
-		// Too large to hand over whole: the map, not the territory — the
-		// header and the module list; the model then fetches the modules its
-		// question needs. Below the budget a bare call sends everything.
+		// Too large to hand over whole: the header and module list. No rows
+		// or dependency hints in the unselected candidate count as delivered.
 		if headerFresh {
 			b.WriteString(header + "\n\n")
 			c.header = header
@@ -698,44 +737,10 @@ func Overview(module string, force bool) (string, error) {
 			b.WriteString(gateOverview(x))
 		}
 		b.WriteString("\n" + s.countsReport() + "\n" + rules)
-		return finish(overviewModulesFooter), nil
+		return finish(b.String(), overviewModulesFooter, c), nil
 	}
-	if len(fresh) == 0 && !headerFresh {
-		b.WriteString(fmt.Sprintf(overviewAlreadyRead, scope, len(cand)) + "\n" + s.countsReport() + "\n" + rules + taskDependencyHints(x, c, cand, s))
-		return finish(overviewShortFooter), nil
-	}
-	sub := opts
-	set := make(map[string]bool, len(fresh))
-	for _, r := range fresh {
-		set[r.Path] = true
-	}
-	sub.Include = func(r base.Row) bool { return set[r.Path] }
-	sub.OmitHeader = !headerFresh
-	body := x.Render(sub)
-	if n := outlineSize(body + policy); n > lim.max-lim.margin {
-		// Sent anyway: even a truncated part lets the model work out how to
-		// split the module. The warning leads so a preview still carries it,
-		// and nothing is recorded as sent, since the host may have cut it.
-		b.WriteString(fmt.Sprintf(overviewTooLarge, scope, n, lim.unit, lim.max, lim.unit) + "\n\n")
-	} else {
-		for _, r := range fresh {
-			c.rows[r.Path] = rowPrint(r)
-		}
-	}
-	c.header = header
-	b.WriteString(body)
-	if headerFresh {
-		b.WriteString(gateOverview(x))
-	}
-	b.WriteString("\n" + s.countsReport() + "\n" + rules)
-	b.WriteString("\n" + taskDependencyHints(x, c, cand, s))
-	if skipped := len(cand) - len(fresh); skipped > 0 {
-		b.WriteString("\n" + fmt.Sprintf(overviewIncrementNote, len(fresh), skipped))
-	}
-	if whole {
-		scope = "整份" // "以上是整份的纲要"
-	}
-	return finish("\n" + fmt.Sprintf(overviewPartFooter, scope)), nil
+	*c = next
+	return reply, nil
 }
 
 // gateOverview is the version-gate note that goes out with the header, ""

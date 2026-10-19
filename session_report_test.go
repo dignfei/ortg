@@ -217,3 +217,87 @@ func TestOverviewCountsKeepCompleteStatus(t *testing.T) {
 		})
 	}
 }
+
+func TestOverviewWholeReplyBudget(t *testing.T) {
+	for _, host := range []string{"claude", "codex"} {
+		for _, budget := range []string{"window", "cap"} {
+			t.Run(host+"/"+budget, func(t *testing.T) {
+				t.Setenv("ORTG_AGENT", host)
+				t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "200000")
+				codexHome := t.TempDir()
+				t.Setenv("CODEX_HOME", codexHome)
+				config := filepath.Join(codexHome, "config.toml")
+				writeFile(t, config, "model_context_window = 200000\n")
+				root := updateRepo(t, "owned.go", "unread.go", "CONTRIBUTING.md")
+				if _, err := scanWithHeader(); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := Header(testHeader, nil, nil, nil, nil, nil, nil, "task"); err != nil {
+					t.Fatal(err)
+				}
+				outline := "owned.go[5 L CL T]: Role:owned | Uses:unread.go | API:- | Constraints:-"
+				if _, err := Update("owned.go", outline); err != nil {
+					t.Fatal(err)
+				}
+				before := mustOpen(t, root).Rows()
+				t.Cleanup(func() { useCallSession(nil) })
+				get := func(module string, force bool, sid string) string {
+					t.Helper()
+					useCallSession(base.Args{"_meta": map[string]any{"threadId": sid}})
+					out, err := Overview(module, force)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return out
+				}
+				full := get("*", false, "budget-probe")
+				if !strings.Contains(full, taskDependenciesHead) || !strings.Contains(full, policyCandidatesHead) {
+					t.Fatal("probe must include dependency hints and policy candidates")
+				}
+				originalC, originalX := claudeLimits, codexLimits
+				t.Cleanup(func() { claudeLimits, codexLimits = originalC, originalX })
+				if budget == "window" {
+					window := 2 * (estTokens(full) - 1)
+					t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", fmt.Sprint(window))
+					writeFile(t, config, fmt.Sprintf("model_context_window = %d\n", window))
+				} else {
+					claudeLimits.whole, codexLimits.whole = outlineSize(full)-1, outlineSize(full)-1
+				}
+				for _, force := range []bool{false, true} {
+					sid := fmt.Sprintf("budget-%v", force)
+					out := get("", force, sid)
+					if !strings.HasSuffix(out, overviewModulesFooter) || strings.Contains(out, outline) {
+						t.Fatalf("complete reply exceeds %s budget but was sent whole: %d tokens, %d units", budget, estTokens(out), outlineSize(out))
+					}
+					if c := sentFor(root); len(c.rows) != 0 {
+						t.Fatal("module list marked unsent outline rows as delivered")
+					}
+					out = get("CL", false, sid)
+					if !strings.Contains(out, outline) || !strings.Contains(out, taskDependenciesHead) {
+						t.Fatal("budget preview consumed later outline or dependency delivery")
+					}
+					out = get("", false, sid)
+					if !strings.HasSuffix(out, fmt.Sprintf(overviewPartFooter, "整份")) || strings.Contains(out, outline) ||
+						!strings.Contains(out, "unread.go") || !strings.Contains(out, fmt.Sprintf(overviewIncrementNote, 2, 1)) {
+						t.Fatal("fitting delta must retain only unsent rows and its footer")
+					}
+					if out = get("", false, sid); !strings.HasSuffix(out, overviewShortFooter) {
+						t.Fatal("all delivered rows must retain the short reply")
+					}
+					if out = get("*", true, sid); !strings.Contains(out, outline) || !strings.Contains(out, "unread.go") {
+						t.Fatal("explicit whole force must bypass bare-call budgets")
+					}
+				}
+				x := mustOpen(t, root)
+				if len(x.Rows()) != 3 {
+					t.Fatal("budget selection changed the inventory")
+				}
+				for i, r := range x.Rows() {
+					if r != before[i] {
+						t.Fatalf("budget selection changed known or unknown inventory: %+v", r)
+					}
+				}
+			})
+		}
+	}
+}
