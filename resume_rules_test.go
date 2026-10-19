@@ -44,6 +44,9 @@ func resumeRulesHook(t *testing.T, root, event string, payload map[string]any) s
 	if err != nil {
 		t.Fatalf("hook: %v\n%s", err, out)
 	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		return ""
+	}
 	var reply struct {
 		Specific struct {
 			Context string `json:"additionalContext"`
@@ -365,6 +368,80 @@ func TestResumeRuleDelivery(t *testing.T) {
 		}
 	}
 }
+func TestPromptRuleFallback(t *testing.T) {
+	for _, flow := range []string{"missing-session", "resume-notice", "known-ack"} {
+		t.Run(flow, func(t *testing.T) {
+			t.Setenv("ORTG_AGENT", "codex")
+			root := updateRepo(t, "a.go")
+			if _, err := scanWithHeader(); err != nil {
+				t.Fatal(err)
+			}
+			outline := updateLine("a.go", "neutral source")
+			if _, err := Update("a.go", outline); err != nil {
+				t.Fatal(err)
+			}
+			mcp := resumeRulesMCP(t, root)
+			mcp("ortg_overview", nil)
+			collectRules(t, mcp)
+			mark := "rules-disc-" + sessionKey(testMCPSession)
+			_, receipt := base.OverviewMark(root, mark)
+			if flow != "known-ack" {
+				var old ruleDelivery
+				if err := json.Unmarshal([]byte(receipt), &old); err != nil {
+					t.Fatal(err)
+				}
+				old.Fingerprint = fmt.Sprintf("rules-mcp-v1:%x", sha1.Sum([]byte("neutral prior guidance")))
+				wire, err := json.Marshal(old)
+				if err != nil {
+					t.Fatal(err)
+				}
+				receipt = string(wire)
+				base.MarkOverview(root, mark, receipt)
+			}
+			_, sent := base.OverviewMark(root, sentMark(testMCPSession))
+			table, err := os.ReadFile(filepath.Join(root, "ortg.tsv"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if flow == "resume-notice" {
+				out := resumeRulesHook(t, root, "session", map[string]any{"cwd": root, "session_id": testMCPSession, "source": "resume"})
+				if !strings.Contains(out, rulesNeeded) {
+					t.Fatal("resume must emit the current-rule notice", out)
+				}
+			}
+			for i := 0; i < 3; i++ {
+				out := resumeRulesHook(t, root, "prompt", map[string]any{"cwd": root, "session_id": testMCPSession, "prompt": "continue"})
+				if flow == "missing-session" && i == 0 {
+					if out != rulesNeeded {
+						t.Fatal("missing SessionStart must get one bounded notice", out)
+					}
+				} else if out != "" {
+					t.Fatal("known or already emitted guidance repeated on a prompt", out)
+				}
+			}
+			if _, after := base.OverviewMark(root, mark); after != receipt {
+				t.Fatal("a notice changed the rule receipt")
+			}
+			if _, after := base.OverviewMark(root, sentMark(testMCPSession)); after != sent {
+				t.Fatal("a notice changed outline delivery or permissions")
+			}
+			if after, err := os.ReadFile(filepath.Join(root, "ortg.tsv")); err != nil || !bytes.Equal(table, after) {
+				t.Fatal("a notice changed the factual outline table", err)
+			}
+			if flow != "known-ack" {
+				out := mcp("ortg_gate", map[string]any{"tool": "Edit", "path": filepath.Join(root, "a.go")})
+				if !strings.Contains(out, deniedMark) || !strings.Contains(out, "rules=") {
+					t.Fatal("emitting a notice must not authorize writes", out)
+				}
+				collectRules(t, mcp)
+			}
+			if out := mcp("ortg_overview", nil); strings.Contains(out, outline) || strings.Contains(out, rulesNeeded) {
+				t.Fatal("rule transfer must preserve outline delivery", out)
+			}
+		})
+	}
+}
+
 func TestRuleCursorBoundaries(t *testing.T) {
 	t.Setenv("ORTG_AGENT", "codex")
 	useTestMCPSession(t)

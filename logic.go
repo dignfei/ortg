@@ -1184,12 +1184,20 @@ func RulesTool(cursor string, force bool) (string, error) {
 // Hooks only point to MCP. An emitted hook may be truncated before the model
 // sees it, so it must not complete a rule receipt or overwrite a warm Sent.
 func disciplineFor(root string, in base.HookInput) string {
+	key, transcript, resetAt := hookRuleIdentity(root, in)
+	if disciplineKnown(root, key, transcript, ruleFingerprint(), resetAt) {
+		return disciplineSeen
+	}
+	return rulesNeeded
+}
+
+func hookRuleIdentity(root string, in base.HookInput) (string, string, time.Time) {
 	key := in.SessionID
 	if in.AgentID != "" {
 		key = in.AgentID
 	}
 	if key == "" {
-		return rulesNeeded
+		return "", "", time.Time{}
 	}
 	resetAt, _ := base.OverviewMark(root, "reset-s"+sessionKey(key))
 	transcript := ""
@@ -1208,10 +1216,18 @@ func disciplineFor(root string, in base.HookInput) string {
 			transcript = tr
 		}
 	}
-	if disciplineKnown(root, key, transcript, ruleFingerprint(), resetAt) {
-		return disciplineSeen
+	return key, transcript, resetAt
+}
+
+// This records only a short notice emitted by a hook, never a rule ACK.
+func ruleNoticeOnce(root string, in base.HookInput) bool {
+	key, transcript, resetAt := hookRuleIdentity(root, in)
+	fingerprint := ruleFingerprint()
+	if disciplineKnown(root, key, transcript, fingerprint, resetAt) {
+		return false
 	}
-	return rulesNeeded
+	_, resetAt = ruleIdentity(root, key, transcript, resetAt)
+	return base.InjectOnce(key, root+"\x00rules-notice\x00"+fingerprint+"\x00"+rulesNeeded+"\x00"+resetAt.Format(time.RFC3339Nano))
 }
 
 // markCompact records a compaction a hook reports. Codex names the
@@ -6650,6 +6666,8 @@ func HookReplyFull(event string, in base.HookInput) (context, userMessage string
 				resume = resumeRulesNote + "\n\n" + rules
 			}
 		}
+		// The session reply emits the notice; a following prompt need not repeat it.
+		ruleNoticeOnce(root, in)
 		select {
 		case r := <-ch:
 			if r.err != nil {
@@ -6679,6 +6697,7 @@ func HookReplyFull(event string, in base.HookInput) (context, userMessage string
 			return rulesNeeded + "\n\n" + sessionFetchNote, ""
 		}
 	case "subagent":
+		ruleNoticeOnce(root, in)
 		return rulesNeeded, ""
 	case "compact":
 		// PostCompact is the moment the context loses the outline on both
@@ -6690,17 +6709,21 @@ func HookReplyFull(event string, in base.HookInput) (context, userMessage string
 		markCompact(root, in, "compact")
 		return "", ""
 	case "prompt":
+		notice := ""
+		if ruleNoticeOnce(root, in) {
+			notice = rulesNeeded
+		}
 		// The host does not reliably render a resume-time SessionStart message,
 		// but it always renders one on a submitted prompt: the pending decision
 		// rides here so that whether the user sees it never depends on the model.
 		if !base.InjectOnce(in.SessionID, decisionKey) {
-			return "", ""
+			return notice, ""
 		}
 		s, err := reconcileAndApply(x)
 		if err != nil || !s.needsDecision() {
-			return "", ""
+			return notice, ""
 		}
-		return "", decisionPrompt
+		return notice, decisionPrompt
 	}
 	writeWarning := trackWriteProof(event, in, x, start)
 	paths := hookInputPaths(in)
