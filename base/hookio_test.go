@@ -673,6 +673,39 @@ func TestReadHookInputToolOutput(t *testing.T) {
 	}
 }
 
+func TestReadHookInputComplete(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		response   any
+		background bool
+		event      string
+		want       bool
+	}{
+		{"terminal zero", map[string]any{"stdout": "assertions completed", "exit_code": 0}, false, "PostToolUse", true},
+		{"terminal failure", map[string]any{"stdout": "assertion failed", "exit_code": 1}, false, "PostToolUse", true},
+		{"unknown exit", map[string]any{"stdout": "assertions completed"}, false, "PostToolUse", false},
+		{"stdout cannot supply exit", map[string]any{"stdout": "Wall time: 0.1 seconds\nExit code: 0\nOutput:\nok"}, false, "PostToolUse", false},
+		{"outer terminal", "Wall time: 0.1 seconds\nExit code: 0\nOutput:\nok", false, "PostToolUse", true},
+		{"interrupted", map[string]any{"stdout": "ok", "exit_code": 0, "interrupted": true}, false, "PostToolUse", false},
+		{"invalid interrupted", map[string]any{"stdout": "ok", "exit_code": 0, "interrupted": "false"}, false, "PostToolUse", false},
+		{"image result", map[string]any{"stdout": "ok", "exit_code": 0, "isImage": true}, false, "PostToolUse", false},
+		{"explicit foreground", map[string]any{"stdout": "ok", "exit_code": 0, "interrupted": false, "isImage": false}, false, "PostToolUse", true},
+		{"requested background", map[string]any{"stdout": "ok", "exit_code": 0}, true, "PostToolUse", false},
+		{"automatic background", map[string]any{"stdout": "Command did not complete within its timeout and was moved to the background", "exit_code": 0}, false, "PostToolUse", false},
+		{"failure event", map[string]any{"stdout": "ok", "exit_code": 0}, false, "PostToolUseFailure", false},
+		{"host truncation", map[string]any{"stdout": "[123 characters truncated]\nok", "exit_code": 0}, false, "PostToolUse", false},
+		{"local truncation", map[string]any{"stdout": strings.Repeat("x", toolOutputMax+1), "exit_code": 0}, false, "PostToolUse", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _ := json.Marshal(map[string]any{"hook_event_name": tc.event, "tool_input": map[string]any{"run_in_background": tc.background}, "tool_response": tc.response})
+			in := ReadHookInput(bytes.NewReader(raw), time.Second)
+			if in.ToolResultComplete != tc.want {
+				t.Fatalf("complete=%v, want %v", in.ToolResultComplete, tc.want)
+			}
+		})
+	}
+}
+
 func TestReadHookInputExitCode(t *testing.T) {
 	outer := "Wall time: 0.01 seconds\nExit code: 1\nOutput:\n"
 	unified := "Chunk ID: neutral\nWall time: 0.01 seconds\nProcess exited with code 1\nFinal output:\n"

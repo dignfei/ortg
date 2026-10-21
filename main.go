@@ -173,7 +173,16 @@ func runMCP(args []string) error {
 			Props: map[string]base.Prop{"rulings": {Type: "array", Description: "对上一次核对给了正文的每条契约写一行「契约键：裁决」（需求是否讲到这个场景、与守护测试一致还是相反、按哪条证据裁决）；缺了裁决计划不收敛"},
 				"final":      {Type: "boolean", Description: finalFlagDescription},
 				"generation": {Type: "string", Description: finalGenerationDescription},
-				"report":     {Type: "array", Description: finalReportDescription}},
+				"report":     {Type: "array", Description: finalReportDescription},
+				"requirements": {Type: "array", Description: finalRequirementsDescription, Items: map[string]any{
+					"type": "object", "additionalProperties": false,
+					"required": []string{"requirement", "status", "assertion"},
+					"properties": map[string]any{
+						"requirement": map[string]any{"type": "string"},
+						"status":      map[string]any{"type": "string", "enum": []string{"supported", "failed", "blocked", "unverified"}},
+						"assertion":   map[string]any{"type": "string"},
+						"evidence":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					}}}},
 			Handler: func(a base.Args) (string, error) {
 				f, err := a.Bool("final")
 				if err != nil {
@@ -187,6 +196,12 @@ func runMCP(args []string) error {
 					report, err := a.Strings("report")
 					if err != nil {
 						return "", err
+					}
+					if requirements, present := a["requirements"]; present {
+						if _, mixed := a["report"]; mixed {
+							return "", fmt.Errorf("%s", finalRequirementsBad)
+						}
+						return finalRequirements(g, report, requirements)
 					}
 					return finalReview(g, report)
 				}

@@ -14,6 +14,7 @@ type Prop struct {
 	Type        string
 	Description string
 	Enum        []string
+	Items       map[string]any // optional array item schema; defaults to strings
 }
 
 // Tool is a registered MCP tool; the schema is generated from Props.
@@ -92,7 +93,10 @@ func schema(t Tool) map[string]any {
 			m["enum"] = p.Enum
 		}
 		if p.Type == "array" {
-			m["items"] = map[string]any{"type": "string"}
+			m["items"] = p.Items
+			if p.Items == nil {
+				m["items"] = map[string]any{"type": "string"}
+			}
 		}
 		props[name] = m
 	}

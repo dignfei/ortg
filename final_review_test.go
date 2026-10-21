@@ -69,6 +69,228 @@ func finalDeclare(t *testing.T, root string) string {
 	return g
 }
 
+func finalRunInput(t *testing.T, in base.HookInput, response any) base.HookInput {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"hook_event_name": "PostToolUse", "cwd": in.Cwd, "session_id": in.SessionID, "agent_id": in.AgentID, "tool_name": in.ToolName, "tool_use_id": in.ToolUseID, "turn_id": in.TurnID, "tool_input": map[string]any{"command": in.Command, "run_in_background": in.Background}, "tool_response": response})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base.ReadHookInput(bytes.NewReader(raw), time.Second)
+}
+
+func finalRunFixture(t *testing.T, root, use, command string) base.HookInput {
+	t.Helper()
+	in := base.HookInput{Cwd: root, SessionID: testMCPSession, TurnID: "neutral-turn", ToolName: "Bash", ToolUseID: use, Command: command}
+	HookReply("pre", in)
+	return in
+}
+
+func finalRequirementValue(status string, ids ...string) []map[string]any {
+	return []map[string]any{{"requirement": "the public neutral value remains available", "status": status, "assertion": "checked the persisted fixture through its public test consumer; other requirements remain unverified", "evidence": ids}}
+}
+
+// A real subprocess gives the hook fixture an actual result. No production
+// object or function is replaced to make this assertion pass.
+func TestFinalEvidenceAssertionProcess(t *testing.T) {
+	if os.Getenv("ORTG_FINAL_ASSERTION_CHILD") != "1" {
+		return
+	}
+	body, err := os.ReadFile("value.go")
+	if err != nil || !strings.Contains(string(body), "const Value = 2") {
+		fmt.Fprintln(os.Stderr, "persisted fixture assertion failed")
+		os.Exit(1)
+	}
+	fmt.Println("persisted fixture assertion completed")
+	os.Exit(0)
+}
+
+func TestFinalRequirementsRuntimeAndMCP(t *testing.T) {
+	root := finalFixture(t)
+	finalWrite(t, root, testMCPSession, "", "source", "value.go", "package sample\nconst Value = 2\n")
+	// A successful auxiliary command must not settle an unrelated pytest debt.
+	HookReply("post", base.HookInput{Cwd: root, SessionID: testMCPSession, ToolName: "Bash", ToolUseID: "known-failure", Command: "pytest tests", ToolOutput: "=== 1 failed in 0.1s ==="})
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := strconv.Quote(bin) + " -test.run=^TestFinalEvidenceAssertionProcess$"
+	in := finalRunFixture(t, root, "actual-assertion", command)
+	cmd := exec.Command(bin, "-test.run=^TestFinalEvidenceAssertionProcess$")
+	cmd.Dir, cmd.Env = root, append(os.Environ(), "ORTG_FINAL_ASSERTION_CHILD=1")
+	body, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("actual fixture assertion: %v %s", err, body)
+	}
+	HookReply("post", finalRunInput(t, in, map[string]any{"stdout": string(body), "exit_code": 0}))
+	call := func(args map[string]any) updateMCPReply {
+		return nativeMCP(t, root, map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_review", "arguments": args, "_meta": map[string]any{"threadId": testMCPSession}}})[0]
+	}
+	listed := nativeMCP(t, root, map[string]any{"method": "tools/list"})[0]
+	for _, tool := range listed.Result.Tools {
+		if tool.Name == "ortg_review" && (tool.InputSchema.Properties["requirements"].Type != "array" || tool.InputSchema.Properties["requirements"].Items.Type != "object" || tool.InputSchema.Properties["report"].Items.Type != "string") {
+			t.Fatal("structured array schema or legacy strings changed")
+		}
+	}
+	inspect := call(map[string]any{"final": true})
+	if inspect.Result.IsError {
+		t.Fatal(inspect.Result.Content)
+	}
+	var receipt finalRun
+	for _, line := range strings.Split(inspect.Result.Content[0].Text, "\n") {
+		if strings.HasPrefix(line, "{") && json.Unmarshal([]byte(line), &receipt) == nil && receipt.Operation == "actual-assertion" {
+			break
+		}
+	}
+	f := finalSaved(t, root, testMCPSession)
+	if receipt.ID == "" || receipt.Context != testMCPSession || receipt.Cwd != root || receipt.Command != command || receipt.Generation != finalGeneration(f) || receipt.SourceGeneration != finalSourceGeneration(f) || !receipt.Complete || receipt.ExitCode != 0 || receipt.Failed || !strings.Contains(receipt.Summary, "sha1=") {
+		t.Fatalf("model could not consume actual receipt identity/result: %+v", receipt)
+	}
+	if strings.Contains(inspect.Result.Content[0].Text, string(body)) {
+		t.Fatal("receipt persisted complete program stdout instead of a bounded summary")
+	}
+	submitted := call(map[string]any{"final": true, "generation": receipt.Generation, "requirements": finalRequirementValue("supported", receipt.ID)})
+	if submitted.Result.IsError || !strings.Contains(submitted.Result.Content[0].Text, "supported=1") {
+		t.Fatalf("actual MCP evidence-backed model declaration: %+v", submitted)
+	}
+	if len(loadFailedTests(root, testMCPSession).Runs) != 1 || len(finalSaved(t, root, testMCPSession).Requirements) != 1 {
+		t.Fatal("structured declaration changed failure debt or was not persisted")
+	}
+	legacy := call(map[string]any{"final": true, "generation": receipt.Generation, "report": []string{"static legacy declaration"}})
+	if legacy.Result.IsError || !strings.Contains(legacy.Result.Content[0].Text, finalReviewLegacy) || len(finalSaved(t, root, testMCPSession).Requirements) != 0 {
+		t.Fatal("legacy declaration was certified or retained structured results")
+	}
+	for _, bad := range []any{nil, []any{}, []string{"supported"}, []map[string]any{{"requirement": "x", "status": "supported", "assertion": "no run"}}, []map[string]any{{"requirement": "x", "status": "invented", "assertion": "x"}}, []map[string]any{{"requirement": "x", "status": "unverified", "assertion": "x", "exit_code": 0}}} {
+		if r := call(map[string]any{"final": true, "generation": receipt.Generation, "requirements": bad}); !r.Result.IsError {
+			t.Fatalf("bad structured declaration accepted: %#v", bad)
+		}
+	}
+	if r := call(map[string]any{"final": true, "generation": receipt.Generation, "requirements": finalRequirementValue("unverified"), "report": []string{}}); !r.Result.IsError {
+		t.Fatal("mixed legacy and structured formats accepted")
+	}
+}
+
+func TestFinalRequirementsRejectUnobservedAndStale(t *testing.T) {
+	for _, tc := range []string{"invented", "no pre", "missing exit", "truncated", "background", "command mismatch", "cwd mismatch", "source during run", "cross SID A-B-A", "other mode A-B-A", "source after run", "failure after run", "cross SID"} {
+		t.Run(tc, func(t *testing.T) {
+			t.Setenv("ORTG_STATE_DIR", t.TempDir())
+			root := finalFixture(t)
+			finalWrite(t, root, testMCPSession, "", "source", "value.go", "package sample\nconst Value = 2\n")
+			in := base.HookInput{Cwd: root, SessionID: testMCPSession, ToolName: "Bash", ToolUseID: "attempt", TurnID: "neutral-turn", Command: "go test ./..."}
+			if tc == "background" {
+				in.Background = true
+			}
+			if tc != "no pre" {
+				HookReply("pre", in)
+			}
+			if tc == "source during run" {
+				finalWrite(t, root, testMCPSession, "", "during", "value.go", "package sample\nconst Value = 3\n")
+			}
+			if tc == "cross SID A-B-A" || tc == "other mode A-B-A" {
+				if tc == "other mode A-B-A" {
+					if _, err := Header("", nil, nil, nil, nil, nil, nil, "build"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				finalWrite(t, root, testMCPSession, "other-neutral-sid", "other-image", "value.go", "package sample\nconst Value = 3\n")
+				finalWrite(t, root, testMCPSession, "other-neutral-sid", "restored-image", "value.go", "package sample\nconst Value = 2\n")
+				if tc == "other mode A-B-A" && len(finalSaved(t, root, "other-neutral-sid").Files) != 0 {
+					t.Fatal("non-task write created another context's final obligation")
+				}
+			}
+			if tc == "command mismatch" {
+				in.Command = "go test -short ./..."
+			}
+			if tc == "cwd mismatch" {
+				in.Cwd = filepath.Join(root, "sub")
+				if err := os.MkdirAll(in.Cwd, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			response := map[string]any{"stdout": "ok", "exit_code": 0}
+			if tc == "missing exit" {
+				delete(response, "exit_code")
+			}
+			if tc == "truncated" {
+				response["stdout"] = "[10 characters truncated]\nok"
+			}
+			HookReply("post", finalRunInput(t, in, response))
+			_, id := writeIdentity(in)
+			if tc == "invented" {
+				id = "not-observed"
+			}
+			if tc == "source after run" {
+				writeFile(t, filepath.Join(root, "value.go"), "package sample\nconst Value = 4\n")
+				_, _ = finalReview("", nil)
+			}
+			if tc == "failure after run" {
+				HookReply("post", base.HookInput{Cwd: root, SessionID: testMCPSession, ToolName: "Bash", ToolUseID: "later-failure", Command: "pytest tests", ToolOutput: "=== 1 failed in 0.1s ==="})
+			}
+			if tc == "cross SID" {
+				finalWrite(t, root, testMCPSession, "child-neutral", "child-source", "peer.go", "package sample\nconst Peer = 3\n")
+				callSession.ids = []string{"child-neutral"}
+				finishRules(t)
+			}
+			context := callSession.ids[0]
+			g := finalGeneration(finalSaved(t, root, context))
+			if _, err := finalRequirements(g, nil, finalRequirementValue("supported", id)); err == nil {
+				t.Fatalf("%s evidence was accepted", tc)
+			}
+			if _, err := finalRequirements(g, nil, finalRequirementValue("unverified")); err != nil {
+				t.Fatalf("honest unknown declaration was rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestFinalRequirementsFailureEpochAndBounds(t *testing.T) {
+	root := finalFixture(t)
+	finalWrite(t, root, testMCPSession, "", "source", "value.go", "package sample\nconst Value = 2\n")
+	a := finalRunFixture(t, root, "overlapping-success", "go test ./...")
+	b := finalRunFixture(t, root, "actual-failure", "pytest tests")
+	HookReply("post", finalRunInput(t, b, map[string]any{"stdout": "=== 1 failed in 0.1s ===", "exit_code": 0}))
+	_, failedID := writeIdentity(b)
+	f := finalSaved(t, root, testMCPSession)
+	g := finalGeneration(f)
+	if run := f.Runs[failedID]; !run.Failed || run.Generation != g || run.SourceGeneration != finalSourceGeneration(f) {
+		t.Fatalf("failure receipt lost its own current source epoch: %+v", run)
+	}
+	if _, err := finalRequirements(g, nil, finalRequirementValue("failed", failedID)); err != nil {
+		t.Fatalf("actual failure could not be reported: %v", err)
+	}
+	if _, err := finalRequirements(g, nil, finalRequirementValue("supported", failedID)); err == nil {
+		t.Fatal("recognized failure with exit0 supported a success claim")
+	}
+	HookReply("post", finalRunInput(t, a, map[string]any{"stdout": "ok", "exit_code": 0}))
+	_, aID := writeIdentity(a)
+	if _, exists := finalSaved(t, root, testMCPSession).Runs[aID]; exists {
+		t.Fatal("overlapping older run rebound to a newer failure epoch")
+	}
+	nonzero := finalRunFixture(t, root, "explicit-nonzero", "go test ./...")
+	HookReply("post", finalRunInput(t, nonzero, map[string]any{"stdout": "assertion failed", "exit_code": 2}))
+	_, nonzeroID := writeIdentity(nonzero)
+	if _, err := finalRequirements(g, nil, finalRequirementValue("supported", nonzeroID)); err == nil {
+		t.Fatal("nonzero execution supported a success claim")
+	}
+	if _, err := finalRequirements(g, nil, finalRequirementValue("blocked", nonzeroID)); err != nil {
+		t.Fatalf("actual blocking result could not be reported: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		in := finalRunFixture(t, root, fmt.Sprintf("bounded-%d", i), "go test ./...")
+		HookReply("post", finalRunInput(t, in, map[string]any{"stdout": "ok", "exit_code": 0}))
+	}
+	f = finalSaved(t, root, testMCPSession)
+	if len(f.Runs) != 16 {
+		t.Fatalf("receipt storage is unbounded: %d", len(f.Runs))
+	}
+	if _, err := finalRequirements(g, nil, finalRequirementValue("failed", failedID)); err == nil {
+		t.Fatal("evicted receipt was silently certified")
+	}
+	text := finalRunEvidenceText(f, 0)
+	if len(text) > finalReviewMax || !strings.Contains(text, "未列") || !utf8.ValidString(text) {
+		t.Fatal("receipt listing exceeded its budget or hid the omitted scope")
+	}
+}
+
 func TestFailedTestsExplicitExit(t *testing.T) {
 	const command = "python -m pytest -q tests"
 	const passed = "=== 1 passed in 0.01s ==="

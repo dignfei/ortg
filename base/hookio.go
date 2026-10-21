@@ -43,6 +43,10 @@ type HookInput struct {
 	ToolOutput string
 	// ToolExitCode is nil when the host did not provide a recognizable status.
 	ToolExitCode *int
+	// ToolResultComplete is true only for a recognized terminal result with
+	// an exit status and no known interruption, background or output loss.
+	// It describes the host result, not whether the command proved a contract.
+	ToolResultComplete bool
 	// Background is a Bash call's run_in_background (Claude Code): the
 	// command keeps running after the call returns.
 	Background bool
@@ -297,22 +301,30 @@ func isApplyPatchTool(name string) bool {
 // stdout and stderr (Claude Code's Bash) or its output field. Exit status is
 // taken before truncation, from a structured field or an outer text envelope,
 // never from stdout/stderr or the envelope's output body.
-func toolOutput(raw json.RawMessage) (string, *int) {
+func toolOutput(raw json.RawMessage) (string, *int, bool) {
 	if len(raw) == 0 {
-		return "", nil
+		return "", nil, false
 	}
 	var out string
 	var code *int
 	envelope := true
+	terminal := true
 	if json.Unmarshal(raw, &out) != nil {
 		var o struct {
-			Stdout   string          `json:"stdout"`
-			Stderr   string          `json:"stderr"`
-			Output   string          `json:"output"`
-			ExitCode json.RawMessage `json:"exit_code"`
+			Stdout      string          `json:"stdout"`
+			Stderr      string          `json:"stderr"`
+			Output      string          `json:"output"`
+			ExitCode    json.RawMessage `json:"exit_code"`
+			Interrupted json.RawMessage `json:"interrupted"`
+			IsImage     json.RawMessage `json:"isImage"`
 		}
 		if json.Unmarshal(raw, &o) != nil {
-			return "", nil
+			return "", nil, false
+		}
+		for _, flag := range []json.RawMessage{o.Interrupted, o.IsImage} {
+			if len(flag) > 0 && string(flag) != "false" {
+				terminal = false
+			}
 		}
 		var parsed *int
 		if json.Unmarshal(o.ExitCode, &parsed) == nil {
@@ -331,11 +343,16 @@ func toolOutput(raw json.RawMessage) (string, *int) {
 	if code == nil && envelope {
 		code = envelopeExitCode(out)
 	}
+	complete := terminal && code != nil && len(out) <= toolOutputMax && !incompleteToolOutput.MatchString(out)
 	if len(out) > toolOutputMax {
 		out = out[len(out)-toolOutputMax:]
 	}
-	return out, code
+	return out, code, complete
 }
+
+// These are conservative vetoes only. Program text never supplies positive
+// evidence of completion or an exit status.
+var incompleteToolOutput = regexp.MustCompile(`(?i)output truncated|tokens truncated|characters truncated|truncated output|output omitted|process running with session id|script running with cell id|moved to the background|command timed out`)
 
 var exitEnvelopes = []*regexp.Regexp{
 	regexp.MustCompile(`\A(?:Chunk ID: [^\s]+\r?\n)?Wall time: [0-9]+(?:\.[0-9]+)? seconds\r?\n(?:Process exited with code|Exit code:) (-?[0-9]+)\r?\n(?:Final output:|Output:)(?:\r?\n|\z)`),
@@ -415,7 +432,10 @@ func ReadHookInput(r io.Reader, timeout time.Duration) HookInput {
 		in.AgentID = filepath.Base(m.AgentID)
 	}
 	in.TranscriptPath = m.Transcript
-	in.ToolOutput, in.ToolExitCode = toolOutput(m.Response)
+	in.ToolOutput, in.ToolExitCode, in.ToolResultComplete = toolOutput(m.Response)
+	if m.Event == "PostToolUseFailure" || m.Input.Background {
+		in.ToolResultComplete = false
+	}
 	in.FilePath = m.Input.FilePath
 	if in.FilePath == "" {
 		in.FilePath = m.Input.NotebookPath

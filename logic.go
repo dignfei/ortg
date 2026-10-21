@@ -5903,10 +5903,43 @@ type writeChange struct {
 type finalReviewState struct {
 	Scope              string
 	Revision           uint64
+	SourceRevision     uint64
 	Files              map[string]string
 	Reviewed, Prompted string
 	Report             []string
+	Requirements       []finalRequirement
 	Failures           map[string]bool
+	Runs               map[string]finalRun
+}
+
+type finalRequirement struct {
+	Requirement string   `json:"requirement"`
+	Status      string   `json:"status"`
+	Assertion   string   `json:"assertion"`
+	Evidence    []string `json:"evidence,omitempty"`
+}
+
+// Only trusted hook observations populate these records; MCP callers can
+// reference their IDs but cannot supply a command, result or exit status.
+type finalRun struct {
+	ID               string    `json:"id"`
+	Context          string    `json:"sid"`
+	Operation        string    `json:"operation"`
+	Turn             string    `json:"turn,omitempty"`
+	Cwd              string    `json:"cwd"`
+	Command          string    `json:"command"`
+	Generation       string    `json:"generation"`
+	SourceGeneration string    `json:"source_generation"`
+	ExitCode         int       `json:"exit_code"`
+	Failed           bool      `json:"recognized_failure"`
+	Complete         bool      `json:"complete"`
+	Summary          string    `json:"summary"`
+	At               time.Time `json:"at"`
+}
+
+type finalRunBefore struct {
+	Input, Generation, SourceGeneration string
+	At                                  time.Time
 }
 
 func finalContext(in base.HookInput) string {
@@ -5933,6 +5966,11 @@ func finalGeneration(f finalReviewState) string {
 	return fmt.Sprintf("%x", sha1.Sum([]byte(b.String())))
 }
 
+func finalSourceGeneration(f finalReviewState) string {
+	f.Revision = f.SourceRevision
+	return finalGeneration(f)
+}
+
 // Reuse known source-language extensions, excluding generic configuration
 // and manifest names that the broader commit-test policy also calls code.
 func finalSourceFile(rel string) bool {
@@ -5940,25 +5978,34 @@ func finalSourceFile(rel string) bool {
 	return codeExts[ext] && ext != ".toml" && ext != ".cfg" && ext != ".ini"
 }
 
-func finalChanges(s *writeProofs, root, context string, files map[string]string) {
+func finalChanges(s *writeProofs, root, context string, files map[string]string, task bool) {
 	if context == "" || len(files) == 0 {
 		return
 	}
-	f := s.Final[context]
-	f.Scope = root + "\x00" + context
-	if f.Files == nil {
-		f.Files = map[string]string{}
-	}
-	changed := false
-	for p, token := range files {
-		if f.Files[p] != token {
-			f.Files[p] = token
-			changed = true
+	if task {
+		f := s.Final[context]
+		f.Scope = root + "\x00" + context
+		if f.Files == nil {
+			f.Files = map[string]string{}
 		}
-	}
-	if changed {
-		f.Revision++
 		s.Final[context] = f
+	}
+	for id, f := range s.Final {
+		changed := false
+		for p, token := range files {
+			old, tracked := f.Files[p]
+			if (tracked || id == context && task) && old != token {
+				f.Files[p] = token
+				changed = true
+			}
+		}
+		if changed {
+			// Observed cross-context A-B-A changes must not reuse an older
+			// source epoch. Other contexts only retain their existing paths.
+			f.Revision++
+			f.SourceRevision++
+			s.Final[id] = f
+		}
 	}
 }
 
@@ -5979,6 +6026,7 @@ func refreshFinal(x *base.Index, f *finalReviewState) (bool, int) {
 	}
 	if changed {
 		f.Revision++
+		f.SourceRevision++
 	}
 	return changed, unknown
 }
@@ -5990,6 +6038,11 @@ func finalReviewText(f finalReviewState, unknown int) string {
 	status := finalReviewPending
 	if f.Reviewed == g && unknown == 0 {
 		status = finalReviewDone
+		if len(f.Requirements) == 0 {
+			status += finalReviewLegacy
+		} else {
+			status += finalRequirementCounts(f.Requirements)
+		}
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, finalReviewHead, g, status)
@@ -6018,11 +6071,56 @@ func finalReviewText(f finalReviewState, unknown int) string {
 }
 
 func finalReview(generation string, report []string) (string, error) {
+	return finalReviewSubmission(generation, report, nil, false)
+}
+
+func finalRequirements(generation string, report []string, raw any) (string, error) {
+	b, err := json.Marshal(raw)
+	if err != nil || len(b) > finalReviewMax || !utf8.Valid(b) {
+		return "", errors.New(finalRequirementsBad)
+	}
+	var requirements []finalRequirement
+	d := json.NewDecoder(strings.NewReader(string(b)))
+	d.DisallowUnknownFields()
+	if d.Decode(&requirements) != nil || len(requirements) == 0 || len(requirements) > 32 || len(report) != 0 {
+		return "", errors.New(finalRequirementsBad)
+	}
+	seen := map[string]bool{}
+	for i := range requirements {
+		r := &requirements[i]
+		r.Requirement = strings.TrimSpace(r.Requirement)
+		r.Assertion = strings.TrimSpace(r.Assertion)
+		if r.Requirement == "" || r.Assertion == "" || seen[r.Requirement] {
+			return "", errors.New(finalRequirementsBad)
+		}
+		seen[r.Requirement] = true
+		switch r.Status {
+		case "supported":
+			if len(r.Evidence) == 0 {
+				return "", errors.New(finalEvidenceNeeded)
+			}
+		case "failed", "blocked", "unverified":
+		default:
+			return "", errors.New(finalRequirementsBad)
+		}
+	}
+	return finalReviewSubmission(generation, nil, requirements, true)
+}
+
+func finalRequirementCounts(requirements []finalRequirement) string {
+	counts := map[string]int{}
+	for _, r := range requirements {
+		counts[r.Status]++
+	}
+	return fmt.Sprintf(finalRequirementsCounts, counts["supported"], counts["failed"], counts["blocked"], counts["unverified"])
+}
+
+func finalReviewSubmission(generation string, report []string, requirements []finalRequirement, structured bool) (string, error) {
 	if len(callSession.ids) == 0 || callSession.ids[0] == "" {
 		return "", errors.New(finalReviewNoSession)
 	}
 	context := callSession.ids[0]
-	inspect := generation == "" && len(report) == 0
+	inspect := generation == "" && len(report) == 0 && !structured
 	report = slices.Clone(report)
 	for i, line := range report {
 		report[i] = strings.TrimSpace(line)
@@ -6031,7 +6129,7 @@ func finalReview(generation string, report []string) (string, error) {
 		}
 	}
 	text := strings.Join(report, "\n")
-	if !inspect && (generation == "" || text == "" || len(text) > finalReviewMax || !utf8.ValidString(text)) {
+	if !inspect && (generation == "" || !structured && text == "" || len(text) > finalReviewMax || !utf8.ValidString(text)) {
 		return "", errors.New(finalReviewBadReport)
 	}
 	x, err := openIndex(repoRoot())
@@ -6055,16 +6153,38 @@ func finalReview(generation string, report []string) (string, error) {
 		current := finalGeneration(f)
 		switch {
 		case inspect:
-			out = finalReviewText(f, unknown)
+			out = finalReviewText(f, unknown) + finalRunEvidenceText(f, unknown)
 		case unknown > 0:
 			invalid = fmt.Errorf(finalReviewUnknown, unknown)
 		case generation != current:
 			invalid = errors.New(finalReviewMismatch)
 		default:
-			f.Reviewed = current
-			f.Report = report
-			changed = true
-			out = fmt.Sprintf(finalReviewAccepted, current)
+			for _, r := range requirements {
+				for _, id := range r.Evidence {
+					run, exists := f.Runs[id]
+					if !exists || !run.Complete || run.Context != context || run.Generation != current || run.SourceGeneration != finalSourceGeneration(f) {
+						invalid = fmt.Errorf(finalEvidenceInvalid, id)
+						break
+					}
+					if r.Status == "supported" && (run.ExitCode != 0 || run.Failed) {
+						invalid = fmt.Errorf(finalEvidenceFailed, id)
+						break
+					}
+				}
+				if invalid != nil {
+					break
+				}
+			}
+			if invalid == nil {
+				f.Reviewed, f.Report, f.Requirements = current, report, requirements
+				changed = true
+				out = fmt.Sprintf(finalReviewAccepted, current)
+				if structured {
+					out += finalRequirementCounts(requirements)
+				} else {
+					out += finalReviewLegacy
+				}
+			}
 		}
 		s.Final[context] = f
 		return changed, nil
@@ -6076,6 +6196,34 @@ func finalReview(generation string, report []string) (string, error) {
 		return "", invalid
 	}
 	return out, nil
+}
+
+// Listing does not run a command or certify the model's assertion. Only
+// current complete receipts are candidates; full identities are never cut.
+func finalRunEvidenceText(f finalReviewState, unknown int) string {
+	var runs []finalRun
+	if unknown == 0 {
+		for _, run := range f.Runs {
+			if run.Complete && run.Generation == finalGeneration(f) && run.SourceGeneration == finalSourceGeneration(f) {
+				runs = append(runs, run)
+			}
+		}
+	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].At.After(runs[j].At) })
+	var b strings.Builder
+	b.WriteString(finalEvidenceHead)
+	shown := 0
+	for _, run := range runs {
+		line, _ := json.Marshal(run)
+		if shown == 8 || b.Len()+len(line)+160 > finalReviewMax {
+			continue
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+		shown++
+	}
+	fmt.Fprintf(&b, finalEvidenceCount, shown, len(runs)-shown, len(f.Runs)-len(runs))
+	return b.String()
 }
 
 // Status reflects this caller's phase without consuming Stop delivery or
@@ -6143,8 +6291,62 @@ func finalReviewStopNoteBudget(root string, in base.HookInput, budget int) strin
 	return out
 }
 
-// A recognized pytest failure invalidates an existing final declaration.
-func finalFailureNote(root string, in base.HookInput) string {
+// Pre/post source and operation identity are captured in the existing state
+// transaction. An overlapping source edit or failure makes this run unknown.
+func beginFinalRun(x *base.Index, in base.HookInput, cwd string) string {
+	context, key := writeIdentity(in)
+	if in.ToolName != "Bash" || key == "" || in.Command == "" || len(in.Command)+len(cwd)+len(in.ToolUseID)+len(in.TurnID)+len(context) > finalReviewMax || in.Background || detachedCommand(in.Command) {
+		return ""
+	}
+	err := withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
+		f := s.Final[context]
+		if len(f.Files) == 0 {
+			return false, nil
+		}
+		changed, unknown := refreshFinal(x, &f)
+		s.Final[context] = f
+		if unknown != 0 {
+			return changed, nil
+		}
+		if _, complete := f.Runs[key]; complete {
+			return changed, nil // a reused host identity cannot create a new run
+		}
+		before := finalRunBefore{Input: writeInputPrint(in, cwd), Generation: finalGeneration(f), SourceGeneration: finalSourceGeneration(f), At: time.Now()}
+		if old, exists := s.RunBefore[key]; exists {
+			if old.Input != before.Input || old.Generation != before.Generation || old.SourceGeneration != before.SourceGeneration {
+				old.Input = "" // conflicting duplicate pre remains unusable
+			}
+			s.RunBefore[key] = old
+		} else {
+			s.RunBefore[key] = before
+		}
+		for k, old := range s.RunBefore {
+			if time.Since(old.At) > staleMarkAge {
+				delete(s.RunBefore, k)
+			}
+		}
+		// ponytail: a bounded shared map; no separate job/execution subsystem.
+		for len(s.RunBefore) > 64 {
+			oldest := key
+			for k, old := range s.RunBefore {
+				if old.At.Before(s.RunBefore[oldest].At) {
+					oldest = k
+				}
+			}
+			delete(s.RunBefore, oldest)
+		}
+		return true, nil
+	})
+	if err != nil {
+		base.Debugf("final run pre: %v", err)
+		return finalReviewStateWarning
+	}
+	return ""
+}
+
+// Failure invalidation and its receipt share one transaction. Thus a failed
+// run can describe its own result without rebinding older overlapping runs.
+func finishFinalRun(x *base.Index, in base.HookInput, cwd string, pytestFailed bool) string {
 	context, key := writeIdentity(in)
 	if context == "" {
 		context = finalContext(in)
@@ -6152,26 +6354,53 @@ func finalFailureNote(root string, in base.HookInput) string {
 	if context == "" {
 		return ""
 	}
-	unidentified := key == ""
-	invalidated := false
-	err := withWriteProofs(root, func(s *writeProofs) (bool, error) {
+	unidentified, invalidated := key == "", false
+	err := withWriteProofs(x.Root(), func(s *writeProofs) (bool, error) {
 		f, exists := s.Final[context]
 		if !exists || len(f.Files) == 0 {
 			return false, nil
 		}
-		if !unidentified {
-			if f.Failures[key] {
-				return false, nil
+		changed, unknown := refreshFinal(x, &f)
+		before, paired := s.RunBefore[key]
+		delete(s.RunBefore, key)
+		changed = changed || paired
+		valid := paired && before.Input != "" && before.Input == writeInputPrint(in, cwd) && before.Generation == finalGeneration(f) && before.SourceGeneration == finalSourceGeneration(f) && unknown == 0
+		if pytestFailed && (unidentified || !f.Failures[key]) {
+			if !unidentified {
+				if f.Failures == nil {
+					f.Failures = map[string]bool{}
+				}
+				f.Failures[key] = true
 			}
-			if f.Failures == nil {
-				f.Failures = map[string]bool{}
-			}
-			f.Failures[key] = true
+			invalidated, changed = true, true
+			f.Revision++
 		}
-		invalidated = true
-		f.Revision++
+		if valid && in.ToolName == "Bash" && in.ToolResultComplete && in.ToolExitCode != nil && !in.Background && !detachedCommand(in.Command) {
+			if f.Runs == nil {
+				f.Runs = map[string]finalRun{}
+			}
+			if _, duplicate := f.Runs[key]; !duplicate {
+				summary := fmt.Sprintf(finalRunSummary, len(in.ToolOutput), fmt.Sprintf("%x", sha1.Sum([]byte(in.ToolOutput))))
+				for _, result := range pytestSummaries(in.ToolOutput) {
+					if result.complete && strings.TrimSpace(in.ToolOutput[result.end:]) == "" && len(result.text) <= 512 {
+						summary += "; " + result.text
+					}
+				}
+				f.Runs[key] = finalRun{ID: key, Context: context, Operation: in.ToolUseID, Turn: in.TurnID, Cwd: filepath.Clean(cwd), Command: in.Command, Generation: finalGeneration(f), SourceGeneration: finalSourceGeneration(f), ExitCode: *in.ToolExitCode, Failed: pytestFailed, Complete: true, Summary: summary, At: time.Now()}
+				changed = true
+				for len(f.Runs) > 16 {
+					oldest := key
+					for k, run := range f.Runs {
+						if run.At.Before(f.Runs[oldest].At) {
+							oldest = k
+						}
+					}
+					delete(f.Runs, oldest)
+				}
+			}
+		}
 		s.Final[context] = f
-		return true, nil
+		return changed, nil
 	})
 	if err != nil {
 		base.Debugf("final failure: %v", err)
@@ -6184,9 +6413,10 @@ func finalFailureNote(root string, in base.HookInput) string {
 }
 
 type writeProofs struct {
-	Before  map[string]writeBefore
-	Pending map[string]writeChange
-	Final   map[string]finalReviewState
+	Before    map[string]writeBefore
+	Pending   map[string]writeChange
+	Final     map[string]finalReviewState
+	RunBefore map[string]finalRunBefore
 }
 
 func withWriteProofs(root string, fn func(*writeProofs) (bool, error)) error {
@@ -6205,6 +6435,9 @@ func withWriteProofs(root string, fn func(*writeProofs) (bool, error)) error {
 		}
 		if s.Final == nil {
 			s.Final = map[string]finalReviewState{}
+		}
+		if s.RunBefore == nil {
+			s.RunBefore = map[string]finalRunBefore{}
 		}
 		changed, err := fn(&s)
 		if err != nil || !changed {
@@ -6320,7 +6553,7 @@ func trackWriteProof(event string, in base.HookInput, x *base.Index, cwd string)
 				continue
 			}
 			f, _ := x.Inspect(p)
-			if b.Task && finalSourceFile(p) && !f.Ignored && f.ContentToken != "" && f.ContentToken != before {
+			if finalSourceFile(p) && !f.Ignored && f.ContentToken != "" && f.ContentToken != before {
 				finalFiles[p] = f.ContentToken
 			}
 			if !f.Exists || f.ContentToken == "" {
@@ -6333,7 +6566,7 @@ func trackWriteProof(event string, in base.HookInput, x *base.Index, cwd string)
 				s.Pending[p] = writeChange{before, f.ContentToken, context, in.ToolUseID}
 			}
 		}
-		finalChanges(s, x.Root(), context, finalFiles)
+		finalChanges(s, x.Root(), context, finalFiles, b.Task)
 		return true, nil
 	})
 	if err != nil {
@@ -6731,6 +6964,9 @@ func HookReplyFull(event string, in base.HookInput) (context, userMessage string
 		return notice, decisionPrompt
 	}
 	writeWarning := trackWriteProof(event, in, x, start)
+	if event == "pre" {
+		writeWarning = strings.TrimSpace(writeWarning + "\n" + beginFinalRun(x, in, start))
+	}
 	paths := hookInputPaths(in)
 	if len(paths) == 0 {
 		// Bash and friends carry no file path: a file read with cat/sed and an
@@ -6867,10 +7103,7 @@ func fileHookReply(event string, in base.HookInput, x *base.Index, rel string) s
 // report stays the backstop for anything the model lets slide.
 func shellNote(x *base.Index, in base.HookInput, cwd string) string {
 	session, cmd, output, background := in.SessionID, in.Command, in.ToolOutput, in.Background
-	failureWarning := ""
-	if recordTestResult(x.Root(), session, cwd, cmd, output, in.ToolExitCode) {
-		failureWarning = finalFailureNote(x.Root(), in)
-	}
+	failureWarning := finishFinalRun(x, in, cwd, recordTestResult(x.Root(), session, cwd, cmd, output, in.ToolExitCode))
 	if words, _ := scanTestRun(cmd, x.Root()); words != nil && (background || detachedCommand(cmd)) {
 		recordBgRun(x.Root(), session, words)
 	}
