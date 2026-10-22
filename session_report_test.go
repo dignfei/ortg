@@ -250,7 +250,7 @@ func TestOverviewWholeReplyBudget(t *testing.T) {
 					}
 					return out
 				}
-				full := get("*", false, "budget-probe")
+				full := get("", false, "budget-probe")
 				if !strings.Contains(full, taskDependenciesHead) || !strings.Contains(full, policyCandidatesHead) {
 					t.Fatal("probe must include dependency hints and policy candidates")
 				}
@@ -278,8 +278,12 @@ func TestOverviewWholeReplyBudget(t *testing.T) {
 					}
 					out = get("", false, sid)
 					if !strings.HasSuffix(out, fmt.Sprintf(overviewPartFooter, "整份")) || strings.Contains(out, outline) ||
-						!strings.Contains(out, "unread.go") || !strings.Contains(out, fmt.Sprintf(overviewIncrementNote, 2, 1)) {
-						t.Fatal("fitting delta must retain only unsent rows and its footer")
+						!strings.Contains(out, "CONTRIBUTING.md[") || !strings.Contains(out, fmt.Sprintf(overviewTaskInventoryNote, 1)) ||
+						!strings.Contains(out, fmt.Sprintf(overviewIncrementNote, 1, 1)) {
+						t.Fatal("fitting task delta must keep all real outlines and disclose omitted bare inventory")
+					}
+					if _, sent := sentFor(root).rows["unread.go"]; sent {
+						t.Fatal("omitted inventory was marked delivered")
 					}
 					if out = get("", false, sid); !strings.HasSuffix(out, overviewShortFooter) {
 						t.Fatal("all delivered rows must retain the short reply")
@@ -299,5 +303,157 @@ func TestOverviewWholeReplyBudget(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestTaskOverviewOmitsBareInventory(t *testing.T) {
+	for _, host := range []string{"claude", "codex"} {
+		t.Run(host, func(t *testing.T) {
+			t.Setenv("ORTG_AGENT", host)
+			t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "200000")
+			codexHome := t.TempDir()
+			t.Setenv("CODEX_HOME", codexHome)
+			writeFile(t, filepath.Join(codexHome, "config.toml"), "model_context_window = 200000\n")
+			root := updateRepo(t, "owned.go", "other.go", "target.go", "delete.go", "ignored.go", "vendor/lib/x.go")
+			paths := make([]string, 1024)
+			for i := range paths {
+				paths[i] = fmt.Sprintf("unknown_inventory/unread_%04d_with_a_long_filename.go", i)
+				writeFile(t, filepath.Join(root, paths[i]), "package sample")
+			}
+			if _, err := scanWithHeader(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Header(testHeader, nil, []string{"ignored.go"}, nil, []string{"vendor"}, nil, nil, "task"); err != nil {
+				t.Fatal(err)
+			}
+			known := []string{updateLine("owned.go", "owned"), updateLine("other.go", "other"), "vendor/[3 L ST T]: Role:library | Uses:- | API:- | Constraints:-"}
+			for i, p := range []string{"owned.go", "other.go", "vendor"} {
+				if _, err := Update(p, known[i]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			plans := []string{updateLine("target.go", "planned change"), updateLine("future.go", "planned creation")}
+			for i, p := range []string{"target.go", "future.go"} {
+				if _, err := Target(p, plans[i], false, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := Target("delete.go", "", true, ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Scan(); err != nil {
+				t.Fatal(err)
+			}
+			before := mustOpen(t, root).Rows()
+			sid := "task-default-" + host
+			useCallSession(base.Args{"_meta": map[string]any{"threadId": sid}})
+			t.Cleanup(func() { useCallSession(nil) })
+			get := func(module string, force bool) string {
+				t.Helper()
+				out, err := Overview(module, force)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return out
+			}
+			checkDefault := func(out string) {
+				t.Helper()
+				for _, line := range append(append([]string{}, known...), plans...) {
+					if !strings.Contains(out, line) {
+						t.Fatal("default omitted real knowledge or a target", line)
+					}
+				}
+				if !strings.Contains(out, "delete.go\n"+prefixTargetDelete) || !strings.Contains(out, prefixPlanned+"future.go") ||
+					!strings.Contains(out, fmt.Sprintf(overviewTaskInventoryNote, len(paths))) || strings.Contains(out, "unread_") ||
+					!strings.HasSuffix(out, fmt.Sprintf(overviewPartFooter, "整份")) {
+					t.Fatalf("task default lost plans, scope disclosure or whole reply: %.1000s", out)
+				}
+				for _, p := range paths {
+					if _, sent := sentFor(root).rows[p]; sent {
+						t.Fatal("omitted bare row consumed its Sent entry", p)
+					}
+				}
+			}
+			full := get("", false)
+			checkDefault(full)
+			originalC, originalX := claudeLimits, codexLimits
+			t.Cleanup(func() { claudeLimits, codexLimits = originalC, originalX })
+			// The selected known/plan reply fits; the bare inventory alone would exceed it.
+			claudeLimits.whole, codexLimits.whole = outlineSize(full)+512, outlineSize(full)+512
+			checkDefault(get("", true))
+			if out := get("", false); !strings.HasSuffix(out, overviewShortFooter) || strings.Contains(out, known[0]) || strings.Contains(out, "unread_") {
+				t.Fatal("unchanged task default must be a short reply")
+			}
+			for _, module := range []string{"-", "*"} {
+				out := get(module, module == "*")
+				for _, p := range paths {
+					if !strings.Contains(out, filepath.Base(p)) {
+						t.Fatal("explicit inventory query lost a bare row", module, p)
+					}
+				}
+				if outlineSize(out) <= limits().whole {
+					t.Fatal("fixture must put explicit inventory beyond the default reply budget")
+				}
+			}
+			status, err := Status()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range paths {
+				if !strings.Contains(status, p) {
+					t.Fatal("Status lost complete inventory", p)
+				}
+			}
+			for _, source := range []string{"compact", "clear"} {
+				time.Sleep(10 * time.Millisecond)
+				HookReply("session", base.HookInput{Cwd: root, SessionID: sid, Source: source})
+				checkDefault(get("", false))
+				if out := get("-", false); !strings.Contains(out, filepath.Base(paths[len(paths)-1])) {
+					t.Fatal("context reset consumed omitted bare inventory")
+				}
+			}
+			x := mustOpen(t, root)
+			if len(x.Rows()) != len(before) || !x.Observed("vendor/lib/x.go", reconcileOpts) || !x.Excluded("ignored.go", reconcileOpts) {
+				t.Fatal("overview selection changed inventory or roles")
+			}
+			for i, r := range x.Rows() {
+				if r != before[i] {
+					t.Fatal("overview selection changed a stored row", r.Path)
+				}
+			}
+			// Newly known or planned rows must enter the next default delta.
+			line := updateLine(paths[0], "new knowledge")
+			if _, err := Update(paths[0], line); err != nil {
+				t.Fatal(err)
+			}
+			target := updateLine(paths[1], "new plan")
+			if _, err := Target(paths[1], target, false, ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Target(paths[2], "", true, ""); err != nil {
+				t.Fatal(err)
+			}
+			out := get("", false)
+			if !strings.Contains(out, line) || !strings.Contains(out, target) || !strings.Contains(out, filepath.Base(paths[2])+"\n"+prefixTargetDelete) ||
+				strings.Contains(out, known[0]) || strings.Contains(out, filepath.Base(paths[3])) {
+				t.Fatal("knowledge/plan transitions lost their incremental delivery")
+			}
+			if out := get("", false); !strings.HasSuffix(out, overviewShortFooter) {
+				t.Fatal("newly delivered knowledge/plans did not enter Sent")
+			}
+			claudeLimits.whole, codexLimits.whole = 10, 10
+			if out := get("", true); !strings.HasSuffix(out, overviewModulesFooter) || !strings.Contains(out, fmt.Sprintf("- -  %d 个文件", len(paths)+2)) || strings.Contains(out, known[0]) {
+				t.Fatal("real knowledge over budget must retain complete module discovery")
+			}
+			for _, mode := range []string{"build", ""} {
+				if _, err := Header("", nil, nil, nil, nil, nil, nil, mode); err != nil {
+					t.Fatal(err)
+				}
+				claudeLimits.whole, codexLimits.whole = originalC.whole, originalX.whole
+				if out := get("", true); !strings.Contains(out, filepath.Base(paths[3])) || strings.Contains(out, "默认正文未逐条发送") {
+					t.Fatal("build/compatibility default inventory semantics changed", mode)
+				}
+			}
+		})
 	}
 }

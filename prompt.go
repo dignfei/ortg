@@ -10,6 +10,8 @@ const taskValidationRule = "任务验收：先沿公开合法构造或获取→�
 const stagedInitRule = "仅用户明确要求全库初始化(mode=build)时，首次初始化顺序：核心文档与源码入口 → 初始纲要头 → 补齐全部文档纲要 → 根据完整文档理解修订纲要头和受影响的已有纲要 → 优先建立核心代码纲要（入口、基础模块与关键执行链） → 根据核心代码理解再次修订头与受影响纲要 → 建立普通文件纲要 → 通读全库纲要，最后修订头及仍需更新的文件纲要。每轮检查职责、接口、约束和关系描述是否随新增理解变化；头用 ortg_header、文件纲要用 ortg_update 更新，不只更新头。所有未覆盖文件继续保留待建纲要状态。"
 const outlineModeRule = "维护模式：普通任务显式用 ortg_header mode=task；只有用户明确要求全库初始化才用 mode=build，按全库初始化阶段推进。模式持久化，不根据自然语言自动猜测；未传 mode 保持当前配置，传空串恢复旧兼容行为。task 仍须有依据的纲要头，仍按完整字段、路径、Uses/API/Constraints/Keys和目标复审校验；模式决定纲要维护阶段与本地提交核查策略，不改变文件库存、源码、角色或项目规定的验收范围，不以模式切换、伪填纲要或 ortg_align 声称全库已初始化。" + " " + taskOutlineRule + " " + taskValidationRule
 const taskModeNote = "ortg: 当前为任务维护模式(task)。无需先补齐全部文档；未覆盖文件继续保留裸行与未知状态，实时对账仍报告无纲要，不代表全库初始化完成。" + " " + taskOutlineRule
+const taskOverviewRule = "任务维护模式的默认纲要（module省略或空串，含force）保留全部真实纲要与目标/计划；无纲要且无计划的裸库存只计数、不逐条发送或记为已发，可用 module=\"-\" 或 module=\"*\" 显式取回，完整路径用 ortg_status 查询；build/未设置模式保持逐条交付。"
+const overviewTaskInventoryNote = "ortg: 默认正文未逐条发送 %d 个无纲要且无计划的未知库存条目，本次省略不新增已发记录；原库存与状态保留。用 module=\"-\" 或 module=\"*\" 显式取回，完整路径用 ortg_status 查询；这不表示全库已知或初始化完成。"
 const headerTaskFirstNote = "ortg: 当前为任务维护模式(task)，纲要头仍是模板。先按原任务和可见测试列相关路径及理由，读相关文档与合法源码入口，用 ortg_header 写有依据的初始头，再提交相关已读源码纲要与目标计划；不要求先补齐全部文档。" + " " + taskOutlineRule + " " + semanticInitRule
 const headerBadMode = "mode 只接受 build、task 或空串（恢复旧兼容行为），配置未写入"
 const outlineConflictRule = "纲要与需求、源码、测试或实际运行结果冲突时，读取对应源码与测试核实，并修正不准确的纲要；状态对齐不证明代码正确或语义完整。"
@@ -27,7 +29,7 @@ const rulesBlock = `## ORTG 纲要规则
 骨架规则：纲要中只有裸文件名没有纲要的行，是尚未建立认知的文件清单；普通任务按任务和可见测试确定其相关后，读取正文并生成一行纲要、调用 ortg_update 提交，不为补齐裸行清单扫描全库；用户明确全库初始化时，全部范围内文件都相关，按全库阶段维护。
 目录纲要规则：第三方库等不逐文件写纲要的目录，给目录本身写一行纲要（文件名以 / 结尾，如 vendored/[标签]: ...），目录放进 observe_dirs。它的内容往往自成一体，但不要为它单开一个模块：B 标签填用到它的那个模块，它就并入那个模块、随那个模块一起发送。
 目标规则：条目下一行 "#目标:" 是该文件的目标纲要——这个文件改完之后应有的纲要，表示要改代码去达到它；"#目标:删除" 表示计划删除；"#计划新建" 表示文件尚不存在。改完后用 ortg_update 提交，目标纲要自动清空。只改实现、改完纲要不变的文件（重构、格式化、修 lint），ortg_target 的 outline 传 "=" 即可，不必把整行纲要再抄一遍，纲要里显示为 "#目标:同现在"。目标纲要只写要改代码去达成的状态：待核查、待实测的结论和疑问不是目标，也不写进当前纲要——先核查，再把事实写进当前纲要。
-高屋建瓴模式：只迭代目标纲要、纲要头、忽略规则与目录描述，不改代码，用 ortg_target 与 ortg_header 提交。` + "\n" + outlineModeRule + "\n" + semanticInitRule + "\n" + outlineConflictRule + "\n" + dependencyBlockerRule + "\n" + finalSourceRule
+高屋建瓴模式：只迭代目标纲要、纲要头、忽略规则与目录描述，不改代码，用 ortg_target 与 ortg_header 提交。` + "\n" + taskOverviewRule + "\n" + outlineModeRule + "\n" + semanticInitRule + "\n" + outlineConflictRule + "\n" + dependencyBlockerRule + "\n" + finalSourceRule
 
 // codexBudgetRule is injected only under the Codex host: it wraps MCP calls in
 // functions.exec and cuts the middle out of a tool result that overruns the
@@ -149,7 +151,7 @@ var headerTemplate = `#====项目纲要====
 const targetModeText = `高屋建瓴模式：本轮只改目标纲要、纲要头、忽略规则与目录描述，不改代码；请输出完整目标纲要而非差异。`
 
 var toolDescriptions = map[string]string{
-	"ortg_overview": "可选 rules 字符串走独立规则分页：省略 rules 是普通纲要，rules=空串取首段，后续逐段回传返回的 cursor，末段后的 cursor 确认整链；每段按可信宿主预算，未知时最多4096 UTF-8字节。须看到本段完整标题/收尾且没有截断提示才续取；缺文用 rules=空串 force=true 重来。分页不与 module/init 混用，不改变纲要已发或写入许可；旧hook回执不算完成。对账并返回纲要与全库计数摘要，完整路径清单用 ortg_status 按需查看。不带参数时整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回，超过时只返回纲要头与模块清单（不含条目正文）；再用 module（B 标签）取模块，module=\"*\" 取全部。同一会话只发上下文里还没有或已变动的条目，全都发过就只回计数摘要；上下文压缩或清空后自动重发；确实看不到时传 force=true 重发。一次超过单次上限时照发正文（可能被截断），开头提醒把模块拆细。本仓库启用了 ORTG（会话开始注入过 ORTG 纲要规则）时开工先调用。仓库没有 ortg.tsv 就是没启用 ORTG：不要调用 ortg 工具；只有用户明确要求创建（初始化）或对齐纲要时，才传 init=true 建表（根目录有 overview.txt 则先备份再整份导入，否则建空表；再首扫）。" + " " + taskOutlineRule,
+	"ortg_overview": "可选 rules 字符串走独立规则分页：省略 rules 是普通纲要，rules=空串取首段，后续逐段回传返回的 cursor，末段后的 cursor 确认整链；每段按可信宿主预算，未知时最多4096 UTF-8字节。须看到本段完整标题/收尾且没有截断提示才续取；缺文用 rules=空串 force=true 重来。分页不与 module/init 混用，不改变纲要已发或写入许可；旧hook回执不算完成。对账并返回纲要与全库计数摘要，完整路径清单用 ortg_status 按需查看。不带参数时整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回，超过时只返回纲要头与模块清单（不含条目正文）；再用 module（B 标签）取模块，module=\"*\" 取全部。同一会话只发上下文里还没有或已变动的条目，全都发过就只回计数摘要；上下文压缩或清空后自动重发；确实看不到时传 force=true 重发。一次超过单次上限时照发正文（可能被截断），开头提醒把模块拆细。本仓库启用了 ORTG（会话开始注入过 ORTG 纲要规则）时开工先调用。仓库没有 ortg.tsv 就是没启用 ORTG：不要调用 ortg 工具；只有用户明确要求创建（初始化）或对齐纲要时，才传 init=true 建表（根目录有 overview.txt 则先备份再整份导入，否则建空表；再首扫）。" + " " + taskOverviewRule + " " + taskOutlineRule,
 	"ortg_status":   "重新扫描并对账，只返回对账报告（无纲要/过期/观察变动/对齐各多少及路径），不返回纲要正文。被问到纲要是否对齐、有哪些文件要处理时用它——会话开始的报告只是当时的快照，不要引用。",
 	"ortg_update":   "提交当前文件纲要：用 path+outline 提交一个文件，或用 items 批量提交（每项为\"路径 完整纲要行\"，路径和文件名可含空格及括号，按纲要文件名与标签识别边界）。给了 items 就忽略 path/outline；空批、规范化后重复路径均拒绝。全批共用一个事务，任一项失败全部回滚并指出路径与原因；成功逐项报告，统一保存与刷新。每项仍校验格式、字典、Uses、Keys、API、角色与目录类型，前移指纹并清空目标纲要。全库初始化(build或旧兼容首次建设)按批前文档状态检查，不能同批补文档并首次提交源码；任务维护(task)只维护当前已读文件，未覆盖仍未知。全库建设成功后按批次最终状态提示阶段修订。批量只合并已阅读文件的完整当前纲要，不代替正文阅读与每文件改完立即提交；全库初始化仍按文档→修订→核心→修订→普通→最终修订流程。第三方库等不逐文件建纲要的目录，给目录本身写一行目录纲要：path 填目录，文件名以 / 结尾（vendored/[标签]: ...），B 标签填用到它的模块，它就随那个模块一起发送；目录本身放进 observe_dirs，其下文件就不再要求逐个写纲要。",
 	"ortg_review":   "可选 final=true：读取本上下文实写后的当前源码代际；用generation加requirements逐公开要求提交结构化status与真实运行引用；旧report数组保持兼容但运行依据未核证（有效UTF-8、合计至多4096字节）。这是模型声明，不是原生语义验收；源码或新识别失败使旧声明失效。" + " " + finalReviewContractGuide + " 默认参数仍核对改动计划（参数 rulings：对上一次核对给了正文的每条契约写一行「契约键：裁决」，缺了不收敛）：列出所有目标纲要（要改、新建、删除的文件）的现在→目标字段变化、不合格的目标行、Uses 依赖它们却还没有目标纲要的文件，并给出逐项核对清单。要改多个文件时，写完计划后调用；核对列出要补、要核实的地方时，补改后连续两次看到同一计划才解锁，计划全写 = 或核对没发现要补的地方时一次即解锁。只改一个文件不需要。只给自己核对用，不用给用户看。",

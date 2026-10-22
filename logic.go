@@ -625,13 +625,23 @@ func Overview(module string, force bool) (string, error) {
 	}
 	opts := renderOpts(x, module)
 	bare, whole := module == "", module == "" || module == "*"
+	include := opts.Include
+	if bare && x.Config().Mode == "task" {
+		opts.Include = func(r base.Row) bool {
+			return include(r) && (r.Outline != "" || r.Target != "" || r.TargetDelete)
+		}
+	}
 	scope := "整份纲要"
 	if !whole {
 		scope = "模块 " + module + " "
 	}
 	var cand, fresh []base.Row
+	omitted := 0
 	for _, r := range x.Rows() {
 		if !opts.Include(r) {
+			if include(r) {
+				omitted++
+			}
 			continue
 		}
 		cand = append(cand, r)
@@ -643,6 +653,9 @@ func Overview(module string, force bool) (string, error) {
 	headerFresh := force || c.header != header
 	var b strings.Builder
 	b.WriteString(first)
+	if omitted > 0 {
+		b.WriteString(fmt.Sprintf(overviewTaskInventoryNote, omitted) + "\n\n")
+	}
 	if c.lost != "" && headerFresh {
 		// The whole outline goes out again: say why, so a repeat in the
 		// transcript is not taken for waste.
@@ -732,7 +745,7 @@ func Overview(module string, force bool) (string, error) {
 			sized = fmt.Sprintf(overviewSizeEst, tokens)
 		}
 		fmt.Fprintf(&b, overviewModulesHead, sized, len(x.Rows()), over)
-		b.WriteString(moduleList(x, opts.Include, c))
+		b.WriteString(moduleList(x, include, c))
 		if headerFresh {
 			b.WriteString(gateOverview(x))
 		}
