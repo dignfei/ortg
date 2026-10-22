@@ -298,16 +298,16 @@ func isApplyPatchTool(name string) bool {
 }
 
 // toolOutput reads a tool_response: a string as is (Codex), or an object's
-// stdout and stderr (Claude Code's Bash) or its output field. Exit status is
-// taken before truncation, from a structured field or an outer text envelope,
-// never from stdout/stderr or the envelope's output body.
+// stdout and stderr (Claude Code's Bash) or its output field. Only a host's
+// structured exit_code supplies status, before truncation. Codex 0.159.3 sends
+// raw command output as a string: even a complete-looking status header there
+// is program text, not evidence of the process's exit status.
 func toolOutput(raw json.RawMessage) (string, *int, bool) {
 	if len(raw) == 0 {
 		return "", nil, false
 	}
 	var out string
 	var code *int
-	envelope := true
 	terminal := true
 	if json.Unmarshal(raw, &out) != nil {
 		var o struct {
@@ -334,15 +334,11 @@ func toolOutput(raw json.RawMessage) (string, *int, bool) {
 		if o.Stderr != "" {
 			out += "\n" + o.Stderr
 		}
-		envelope = out == ""
 		if out == "" {
 			out = o.Output
 		}
 	}
 	out = ansiRe.ReplaceAllString(out, "")
-	if code == nil && envelope {
-		code = envelopeExitCode(out)
-	}
 	complete := terminal && code != nil && len(out) <= toolOutputMax && !incompleteToolOutput.MatchString(out)
 	if len(out) > toolOutputMax {
 		out = out[len(out)-toolOutputMax:]
@@ -353,22 +349,6 @@ func toolOutput(raw json.RawMessage) (string, *int, bool) {
 // These are conservative vetoes only. Program text never supplies positive
 // evidence of completion or an exit status.
 var incompleteToolOutput = regexp.MustCompile(`(?i)output truncated|tokens truncated|characters truncated|truncated output|output omitted|process running with session id|script running with cell id|moved to the background|command timed out`)
-
-var exitEnvelopes = []*regexp.Regexp{
-	regexp.MustCompile(`\A(?:Chunk ID: [^\s]+\r?\n)?Wall time: [0-9]+(?:\.[0-9]+)? seconds\r?\n(?:Process exited with code|Exit code:) (-?[0-9]+)\r?\n(?:Final output:|Output:)(?:\r?\n|\z)`),
-	regexp.MustCompile(`\AExit code: (-?[0-9]+)\r?\nWall time: [0-9]+(?:\.[0-9]+)? seconds\r?\nOutput:(?:\r?\n|\z)`),
-}
-
-func envelopeExitCode(out string) *int {
-	for _, re := range exitEnvelopes {
-		if m := re.FindStringSubmatch(out); m != nil {
-			if code, err := strconv.Atoi(m[1]); err == nil {
-				return &code
-			}
-		}
-	}
-	return nil
-}
 
 // ReadHookInput reads the JSON payload with a timeout: after timeout without
 // EOF whatever arrived is parsed. Missing fields yield empty values.

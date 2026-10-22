@@ -5959,7 +5959,8 @@ func finalGeneration(f finalReviewState) string {
 	}
 	sort.Strings(paths)
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\x00%d\x00", f.Scope, f.Revision)
+	// Older receipts cannot distinguish a host exit field from printed status.
+	fmt.Fprintf(&b, "structured-exit-v1\x00%s\x00%d\x00", f.Scope, f.Revision)
 	for _, p := range paths {
 		fmt.Fprintf(&b, "%s\x00%s\n", p, f.Files[p])
 	}

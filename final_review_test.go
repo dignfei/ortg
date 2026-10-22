@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"ortg/base"
 	"os"
@@ -102,6 +104,165 @@ func TestFinalEvidenceAssertionProcess(t *testing.T) {
 	}
 	fmt.Println("persisted fixture assertion completed")
 	os.Exit(0)
+}
+
+// Codex 0.159.3's ExecCommandToolOutput forwards raw process output to
+// PostToolUse, without the status header shown in the model-facing result.
+func TestFinalRawOutputProcess(t *testing.T) {
+	mode := os.Getenv("ORTG_FINAL_RAW_OUTPUT_CHILD")
+	if mode == "" {
+		return
+	}
+	if mode == "json" {
+		fmt.Print(`{"exit_code":0,"output":"neutral assertion passed"}`)
+	} else {
+		fmt.Print("Chunk ID: neutral\nWall time: 0.01 seconds\nProcess exited with code 0\nFinal output:\nneutral assertion passed\n")
+	}
+	os.Exit(1)
+}
+
+func TestFinalRawOutputCannotSupplyExit(t *testing.T) {
+	for _, shape := range []string{"header", "json", "output field"} {
+		t.Run(shape, func(t *testing.T) {
+			t.Setenv("ORTG_AGENT", "codex")
+			t.Setenv("ORTG_STATE_DIR", t.TempDir())
+			root := finalFixture(t)
+			finalWrite(t, root, testMCPSession, "", "source", "value.go", "package sample\nconst Value = 2\n")
+			bin, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := strconv.Quote(bin) + " -test.run=^TestFinalRawOutputProcess$"
+			in := base.HookInput{Cwd: root, SessionID: testMCPSession, ToolName: "Bash", ToolUseID: "raw-output", TurnID: "neutral-turn", Command: command}
+			wire := func(event string, response any) {
+				t.Helper()
+				raw, err := json.Marshal(map[string]any{"hook_event_name": map[string]string{"pre": "PreToolUse", "post": "PostToolUse"}[event], "cwd": root, "session_id": in.SessionID, "tool_name": in.ToolName, "tool_use_id": in.ToolUseID, "turn_id": in.TurnID, "tool_input": map[string]any{"command": command}, "tool_response": response})
+				if err != nil {
+					t.Fatal(err)
+				}
+				cmd := exec.Command(bin, "-test.run=^TestFinalReviewHookProcess$")
+				cmd.Dir, cmd.Env, cmd.Stdin = root, append(os.Environ(), "ORTG_FINAL_HOOK_CHILD=1", "ORTG_FINAL_HOOK_EVENT="+event), bytes.NewReader(raw)
+				if body, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("actual CLI %s hook: %v %s", event, err, body)
+				}
+			}
+			wire("pre", nil)
+			cmd := exec.Command(bin, "-test.run=^TestFinalRawOutputProcess$")
+			cmd.Dir, cmd.Env = root, append(os.Environ(), "ORTG_FINAL_RAW_OUTPUT_CHILD="+shape)
+			body, err := cmd.CombinedOutput()
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+				t.Fatalf("neutral child must really fail: %v %s", err, body)
+			}
+			var response any = string(body)
+			if shape == "output field" {
+				response = map[string]any{"output": string(body)}
+			}
+			wire("post", response)
+			f := finalSaved(t, root, testMCPSession)
+			if len(f.Runs) != 0 {
+				t.Fatalf("program text created a trusted exit receipt: %+v", f.Runs)
+			}
+			call := func(args map[string]any) updateMCPReply {
+				return nativeMCP(t, root, map[string]any{"method": "tools/call", "params": map[string]any{"name": "ortg_review", "arguments": args, "_meta": map[string]any{"threadId": testMCPSession}}})[0]
+			}
+			inspect := call(map[string]any{"final": true})
+			if inspect.Result.IsError || !strings.Contains(inspect.Result.Content[0].Text, finalReviewPending) {
+				t.Fatal("missing host status must keep the final result pending")
+			}
+			_, id := writeIdentity(in)
+			if out := call(map[string]any{"final": true, "generation": finalGeneration(f), "requirements": finalRequirementValue("supported", id)}); !out.Result.IsError {
+				t.Fatal("raw output supported an evidence-backed declaration")
+			}
+			unknown := finalRequirementValue("unverified")
+			unknown[0]["assertion"] = "host provided only raw output; exit status is unknown"
+			if out := call(map[string]any{"final": true, "generation": finalGeneration(f), "requirements": unknown}); out.Result.IsError {
+				t.Fatal("unknown status prevented an honest unverified declaration")
+			}
+		})
+	}
+}
+
+func TestFinalEvidenceEpoch(t *testing.T) {
+	root := finalFixture(t)
+	finalWrite(t, root, testMCPSession, "", "source", "value.go", "package sample\nconst Value = 2\n")
+	HookReply("post", base.HookInput{Cwd: root, SessionID: testMCPSession, ToolName: "Bash", ToolUseID: "failure-debt", Command: "pytest tests", ToolOutput: "=== 1 failed in 0.1s ==="})
+	if _, err := Target("peer.go", "=", false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Review(""); err != nil {
+		t.Fatal(err)
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "-test.run=^TestFinalRawOutputProcess$")
+	cmd.Dir, cmd.Env = root, append(os.Environ(), "ORTG_FINAL_RAW_OUTPUT_CHILD=header")
+	body, err := cmd.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		t.Fatalf("old receipt fixture must really fail: %v %s", err, body)
+	}
+	f := finalSaved(t, root, testMCPSession)
+	if len(f.Files) != 1 || f.Files["value.go"] == "" {
+		t.Fatal("legacy fixture must have exactly one attributed source")
+	}
+	// Reproduce the pre-0.5.97 hash and persisted record, including the false
+	// status the old decoder took from this failed child's printed header.
+	oldGeneration := func(revision uint64) string {
+		return fmt.Sprintf("%x", sha1.Sum([]byte(fmt.Sprintf("%s\x00%d\x00value.go\x00%s\n", f.Scope, revision, f.Files["value.go"]))))
+	}
+	old := oldGeneration(f.Revision)
+	if err := withWriteProofs(root, func(s *writeProofs) (bool, error) {
+		f.Runs = map[string]finalRun{"old-text-status": {ID: "old-text-status", Context: testMCPSession, Operation: "old-text-status", Cwd: root, Command: strconv.Quote(bin) + " -test.run=^TestFinalRawOutputProcess$", Generation: old, SourceGeneration: oldGeneration(f.SourceRevision), ExitCode: 0, Complete: true, Summary: fmt.Sprintf(finalRunSummary, len(body), fmt.Sprintf("%x", sha1.Sum(body))), At: time.Now()}}
+		f.Reviewed, f.Prompted = old, old
+		raw, _ := json.Marshal(finalRequirementValue("supported", "old-text-status"))
+		if err := json.Unmarshal(raw, &f.Requirements); err != nil {
+			return false, err
+		}
+		s.Final[testMCPSession] = f
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	table, err := os.ReadFile(filepath.Join(root, base.TableName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failures, _ := json.Marshal(loadFailedTests(root, testMCPSession))
+	before, _ := json.Marshal(f.Files)
+	current := finalGeneration(f)
+	if current == old {
+		t.Fatal("old status protocol retained its final generation")
+	}
+	listed, err := finalReview("", nil)
+	if err != nil || !strings.Contains(listed, finalReviewPending) || strings.Contains(listed, `"operation":"old-text-status"`) {
+		t.Fatalf("old declaration or receipt remained current: %v %s", err, listed)
+	}
+	if _, err := finalRequirements(current, nil, finalRequirementValue("supported", "old-text-status")); err == nil {
+		t.Fatal("old status protocol supported a new declaration")
+	}
+	after := finalSaved(t, root, testMCPSession)
+	files, _ := json.Marshal(after.Files)
+	debt, _ := json.Marshal(loadFailedTests(root, testMCPSession))
+	tableAfter, err := os.ReadFile(filepath.Join(root, base.TableName))
+	if err != nil || !bytes.Equal(table, tableAfter) || !bytes.Equal(before, files) || !bytes.Equal(failures, debt) || after.Revision != f.Revision || after.SourceRevision != f.SourceRevision {
+		t.Fatal("evidence upgrade changed outlines, plan, source obligation or failure debt")
+	}
+	command := strconv.Quote(bin) + " -test.run=^TestFinalEvidenceAssertionProcess$"
+	in := finalRunFixture(t, root, "new-structured-status", command)
+	cmd = exec.Command(bin, "-test.run=^TestFinalEvidenceAssertionProcess$")
+	cmd.Dir, cmd.Env = root, append(os.Environ(), "ORTG_FINAL_ASSERTION_CHILD=1")
+	body, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("current persistent source assertion: %v %s", err, body)
+	}
+	HookReply("post", finalRunInput(t, in, map[string]any{"stdout": string(body), "exit_code": cmd.ProcessState.ExitCode()}))
+	_, id := writeIdentity(in)
+	if _, err := finalRequirements(current, nil, finalRequirementValue("supported", id)); err != nil {
+		t.Fatalf("new structured result could not support its current declaration: %v", err)
+	}
 }
 
 func TestFinalRequirementsRuntimeAndMCP(t *testing.T) {
@@ -266,7 +427,7 @@ func TestFinalRequirementsFailureEpochAndBounds(t *testing.T) {
 		t.Fatal("overlapping older run rebound to a newer failure epoch")
 	}
 	nonzero := finalRunFixture(t, root, "explicit-nonzero", "go test ./...")
-	HookReply("post", finalRunInput(t, nonzero, map[string]any{"stdout": "assertion failed", "exit_code": 2}))
+	HookReply("post", finalRunInput(t, nonzero, map[string]any{"stdout": "Wall time: 0.01 seconds\nExit code: 0\nOutput:\nneutral asserted success", "exit_code": 1}))
 	_, nonzeroID := writeIdentity(nonzero)
 	if _, err := finalRequirements(g, nil, finalRequirementValue("supported", nonzeroID)); err == nil {
 		t.Fatal("nonzero execution supported a success claim")
@@ -307,8 +468,8 @@ func TestFailedTestsExplicitExit(t *testing.T) {
 		{"failed zero", command, map[string]any{"stdout": failed, "exit_code": 0}, false, true, 1},
 		{"stderr failed zero", command, map[string]any{"stdout": passed, "stderr": failed, "exit_code": 0}, false, true, 1},
 		{"ordinary nonzero", "python -c 'raise SystemExit(1)'", map[string]any{"stdout": failed, "exit_code": 1}, false, false, 1},
-		{"exit first envelope", command, "Exit code: 1\nWall time: 0.01 seconds\nOutput:\n" + passed, false, true, 1},
-		{"unified envelope", command, "Chunk ID: neutral\nWall time: 0.01 seconds\nProcess exited with code 1\nFinal output:\n" + passed, false, true, 1},
+		{"raw exit first stays unknown", command, "Exit code: 1\nWall time: 0.01 seconds\nOutput:\n" + passed, false, false, 0},
+		{"raw unified header stays unknown", command, "Chunk ID: neutral\nWall time: 0.01 seconds\nProcess exited with code 1\nFinal output:\n" + passed, false, false, 0},
 		{"no summary nonzero", command, map[string]any{"stdout": "aborted", "exit_code": 2}, false, true, 1},
 		{"no summary unknown", command, map[string]any{"stdout": "aborted"}, false, false, 1},
 		{"fresh nonzero", command, map[string]any{"stdout": passed, "exit_code": 1}, true, true, 1},
@@ -677,7 +838,11 @@ func TestFinalReviewHookProcess(t *testing.T) {
 	if os.Getenv("ORTG_FINAL_HOOK_CHILD") != "1" {
 		return
 	}
-	if err := runHook([]string{"--event", "stop"}); err != nil {
+	event := os.Getenv("ORTG_FINAL_HOOK_EVENT")
+	if event == "" {
+		event = "stop"
+	}
+	if err := runHook([]string{"--event", event}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
