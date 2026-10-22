@@ -2220,6 +2220,9 @@ func TestGateTestFileReminder(t *testing.T) {
 	if strings.Contains(got, `"permissionDecision":"deny"`) || !strings.Contains(got, "按证据裁决") || !strings.Contains(got, "不改期望") {
 		t.Fatalf("a planned test file passes with the reminder: %q", got)
 	}
+	if !strings.Contains(got, "本机实际输出本身不是修改期望或测试选择的依据") || strings.Contains(got, "按实际输出更新期望") {
+		t.Fatalf("a test reminder must require contract evidence for expectation changes: %q", got)
+	}
 	if got := gate("tests/a_test.go"); got != "" {
 		t.Fatalf("the reminder comes once per file: %q", got)
 	}
@@ -3455,6 +3458,9 @@ func TestRemovedTestedNames(t *testing.T) {
 			t.Fatalf("note lacks %q:\n%s", want, note)
 		}
 	}
+	if strings.Contains(note, "默认保留") {
+		t.Fatalf("test references alone must not freeze private helper names:\n%s", note)
+	}
 	if strings.Contains(note, "user.py") || strings.Contains(note, "keep（") {
 		t.Fatalf("only gone names and test references count:\n%s", note)
 	}
@@ -3955,6 +3961,83 @@ func TestVersionGateFlow(t *testing.T) {
 	}
 }
 
+func TestVersionGateWritesRequirePlan(t *testing.T) {
+	for _, mode := range []string{"task", "build"} {
+		for _, tool := range []string{"Edit", "Bash"} {
+			t.Run(mode+"/"+tool, func(t *testing.T) {
+				useTestMCPSession(t)
+				t.Setenv("TMPDIR", t.TempDir())
+				const config = "def pytest_collection_modifyitems(config, items):\n    if dep_version >= parse_version(\"2\"):\n        skip_doctests = True\n"
+				root, _ := gitRepo(t, map[string]string{"conftest.py": config, "a.py": "x = 1\n"})
+				t.Chdir(root)
+				if _, err := scanWithHeader(); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := Header("", nil, nil, nil, nil, nil, nil, mode); err != nil {
+					t.Fatal(err)
+				}
+				for _, p := range []string{"conftest.py", "a.py"} {
+					if _, err := Update(p, updateLine(p, "neutral source")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				Overview("", false)
+				finishRules(t)
+				writeGate := func(p string) string {
+					t.Helper()
+					var got string
+					var err error
+					if tool == "Edit" {
+						got, err = Gate(tool, filepath.Join(root, p), "", "", "")
+					} else {
+						got, err = Gate(tool, "", "", "printf '%s' neutral >> "+p, "")
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					return got
+				}
+				if got := writeGate("conftest.py"); strings.Contains(got, deniedMark) {
+					t.Fatalf("a single configuration write must remain allowed: %s", got)
+				}
+				writeFile(t, filepath.Join(root, "conftest.py"), config+"# neutral configuration change\n")
+				if got := writeGate("a.py"); !strings.Contains(got, deniedMark) {
+					t.Fatalf("a second unplanned file must require a plan: %s", got)
+				}
+				if _, err := Update("conftest.py", updateLine("conftest.py", "neutral test configuration")); err != nil {
+					t.Fatal(err)
+				}
+				if got := writeGate("a.py"); strings.Contains(got, deniedMark) {
+					t.Fatalf("updating the configuration outline completes its single-file write: %s", got)
+				}
+				writeFile(t, filepath.Join(root, "a.py"), "x = 2\n")
+				if _, err := Update("a.py", updateLine("a.py", "neutral source")); err != nil {
+					t.Fatal(err)
+				}
+				const multi = "printf '%s' neutral >> conftest.py; printf '%s' neutral >> a.py"
+				if got, _ := Gate("Bash", "", "", multi, ""); !strings.Contains(got, deniedMark) {
+					t.Fatalf("a shell write to configuration and source must require a plan: %s", got)
+				}
+				if _, err := TargetItems([]string{"conftest.py =", "a.py ="}); err != nil {
+					t.Fatal(err)
+				}
+				if got, err := Review(); err != nil || !strings.Contains(got, "已收敛") {
+					t.Fatalf("the explicit implementation-only plan must converge: %s %v", got, err)
+				}
+				for _, p := range []string{"conftest.py", "a.py"} {
+					if got := writeGate(p); strings.Contains(got, deniedMark) {
+						t.Fatalf("the reviewed plan must allow %s: %s", p, got)
+					}
+				}
+				if got, _ := Gate("Bash", "", "", multi, ""); strings.Contains(got, deniedMark) {
+					t.Fatalf("the reviewed plan must allow the shell multi-file write: %s", got)
+				}
+			})
+		}
+	}
+}
+
+// A colored pytest summary (--color=yes) is read once colors are removed.
 func TestAllSkippedColored(t *testing.T) {
 	in := base.ReadHookInput(strings.NewReader(`{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"python -m pytest x.py -q"},"tool_response":{"stdout":"\u001b[33m\u001b[1m17 skipped\u001b[0m\u001b[33m in 0.05s\u001b[0m"}}`), time.Second)
 	if got := allSkipped(in.Command, in.ToolOutput); got != 17 {
