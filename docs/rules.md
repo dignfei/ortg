@@ -147,6 +147,8 @@ Codex 的 `apply_patch`：载荷 `tool_name` 为 `apply_patch`，`tool_input.com
 
 只有 session 事件写表（对账）；其余只读表、不取表锁，配对实写证据另用独立状态锁。pre/post 对命中内置排除或忽略规则的路径（ortg.tsv、overview.txt、build/ 等）一律静默。
 
+并行会话读取已取得的文件纲要时，若另一会话改写了该条目，门禁按新版本提醒一次，随后 `ortg_overview` 只补变更条目。本会话自行提交当前纲要或目标时记录作者身份，避免误报；作者记录不代替实际交付，后续增量纲要及依赖提示仍照常发送。
+
 ## Windows（Codex 的 PowerShell）
 
 hook 命令与 `.mcp.json` 都只调用 `ortg`，Windows 原生解释器按 PATH 找到 `ortg.exe`，无需 `commandWindows`。`tool_input.command` 收字符串；宿主给 argv 数组时按单引号拼成一行再解析，其他形态只当没有命令，不丢弃整份载荷。

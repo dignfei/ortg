@@ -1556,7 +1556,7 @@ func gateCall(x *base.Index, tool, path, dir, command string) string {
 			// Sent in another version: a parallel session or a subagent
 			// rewrote it since. Once per version, as a refetch sends it.
 			key := "changed:" + p + "\x00" + rowPrint(row)
-			if sent == rowPrint(row) || c.nagged[key] {
+			if sent == rowPrint(row) || c.nagged[key] || c.nagged["self:"+p+"\x00"+rowPrint(row)] {
 				continue
 			}
 			c.nagged[key] = true
@@ -5643,11 +5643,10 @@ func updateOutlines(entries [][2]string) (string, error) {
 			delete(c.solo, rel)
 			cacheChanged = true
 		}
-		// The context wrote this version itself: an entry it already held
-		// is current, not changed by someone else. One it never got stays
-		// unsent.
+		// Remember authorship separately from delivery: Update must not
+		// consume the next incremental Overview or dependency hint.
 		if r, ok := x.Row(rel); ok && c.rows[rel] != "" && c.rows[rel] != rowPrint(r) {
-			c.rows[rel] = rowPrint(r)
+			c.nagged["self:"+rel+"\x00"+rowPrint(r)] = true
 			cacheChanged = true
 		}
 	}
@@ -5760,16 +5759,15 @@ func Target(rel, line string, del bool, document string) (string, error) {
 		return x.SetTarget(rel, line)
 	})
 	if err == nil && planned != "" {
-		advanceSent(x, planned, before)
+		acknowledgeOwnOutline(x, planned, before)
 	}
 	return msg, err
 }
 
-// advanceSent moves the context's sent version of rel to the row as it is
-// now, after the context itself rewrote part of it, but only when it held
-// the version the rewrite started from: one changed by another session in
-// between stays behind, so the gate still asks for it.
-func advanceSent(x *base.Index, rel string, before base.Row) {
+// acknowledgeOwnOutline suppresses a stale-read reminder for a target
+// this context wrote, without consuming its next Overview. A version
+// changed by another context must still be fetched first.
+func acknowledgeOwnOutline(x *base.Index, rel string, before base.Row) {
 	r, ok := x.Row(rel)
 	if !ok {
 		return
@@ -5777,8 +5775,9 @@ func advanceSent(x *base.Index, rel string, before base.Row) {
 	overviewMu.Lock()
 	defer overviewMu.Unlock()
 	c := sentFor(x.Root())
-	if sent := c.rows[rel]; sent != "" && sent == rowPrint(before) && sent != rowPrint(r) {
-		c.rows[rel] = rowPrint(r)
+	if sent := c.rows[rel]; sent != "" && sent != rowPrint(r) &&
+		(sent == rowPrint(before) || c.nagged["self:"+rel+"\x00"+rowPrint(before)]) {
+		c.nagged["self:"+rel+"\x00"+rowPrint(r)] = true
 		saveSent(x.Root(), c)
 	}
 }
