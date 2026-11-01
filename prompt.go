@@ -242,8 +242,10 @@ const folderPreText = "ortg: %s 属于目录纲要 %s/(整目录一条纲要,不
 // gateDeny is the reason the gate gives when it refuses the first code read or
 // write of a context that has not loaded the outline; gateRemind (%s the file)
 // follows every later one, once per file; gateModule (%s the file, %s its
-// module) asks for the module of a file whose entry the context lacks. They
-// name the call to make, since the model re-plans on them. gateBadOutline (%s
+// module) asks for the module of a file whose entry the context lacks;
+// gateChanged (%s the file) for a file whose entry changed after this context
+// got it — another session or a subagent submitted it. They name the call to
+// make, since the model re-plans on them. gateBadOutline (%s
 // the file) is for an entry whose tag yields no module: no fetch can reach
 // it, and the entry itself is what is broken.
 const gateDeny = "ortg: 本会话还没加载纲要，这一步先拦下（只拦这一次）。先不带参数调用 ortg_overview 取纲要——纲要就是本仓库的认知，能从纲要回答的不用读源码——再重做这一步。"
@@ -262,6 +264,7 @@ const resetClear = "被清空"
 const overviewResent = "ortg: 重发整份纲要的原因：%s，之前发过的条目已不在上下文里。别的会话压缩或清空不会让本会话重发。"
 const gateRemind = "ortg: 仍未加载纲要，%s 的认知在纲要里。先不带参数调用 ortg_overview，再读改代码。"
 const gateModule = "ortg: %s 所在模块的纲要还没取，先调用 ortg_overview（module=%s）——纲要没写的具体细节再读文件。"
+const gateChanged = "ortg: %s 的纲要在本会话取过之后被改过（别的会话或子代理提交的），上下文里那版已过时。先不带参数调用 ortg_overview——只补变了的条目——再读改代码。"
 const gateBadOutline = "ortg: %s 的纲要行取不到模块（标签解析不出 B 段），这行纲要有问题。直接读这个文件，按纪律重写它的纲要，用 ortg_update 提交。"
 
 // The write gate and ortg_review. gateWriteUnloaded refuses a write before

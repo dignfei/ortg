@@ -1549,8 +1549,18 @@ func gateCall(x *base.Index, tool, path, dir, command string) string {
 	}
 	for _, p := range targets {
 		row, ok := x.Row(p)
-		if !ok || row.Outline == "" || c.rows[p] != "" {
+		if !ok || row.Outline == "" {
 			continue
+		}
+		if sent := c.rows[p]; sent != "" {
+			// Sent in another version: a parallel session or a subagent
+			// rewrote it since. Once per version, as a refetch sends it.
+			key := "changed:" + p + "\x00" + rowPrint(row)
+			if sent == rowPrint(row) || c.nagged[key] {
+				continue
+			}
+			c.nagged[key] = true
+			return base.PreToolDecision(fmt.Sprintf(gateChanged, p), false)
 		}
 		if row.Module == "" { // a tag without a B part: the entry is broken
 			if c.nagged[p] {
@@ -5633,6 +5643,13 @@ func updateOutlines(entries [][2]string) (string, error) {
 			delete(c.solo, rel)
 			cacheChanged = true
 		}
+		// The context wrote this version itself: an entry it already held
+		// is current, not changed by someone else. One it never got stays
+		// unsent.
+		if r, ok := x.Row(rel); ok && c.rows[rel] != "" && c.rows[rel] != rowPrint(r) {
+			c.rows[rel] = rowPrint(r)
+			cacheChanged = true
+		}
 	}
 	if cacheChanged {
 		saveSent(x.Root(), c)
@@ -5673,7 +5690,8 @@ func Target(rel, line string, del bool, document string) (string, error) {
 	if document == "" && headerUnwritten(x.Header()) {
 		return "", errors.New(headerFirstText(x))
 	}
-	var msg string
+	var msg, planned string
+	var before base.Row
 	err = x.Batch(func() error {
 		if document != "" {
 			// AllTarget: this tool submits a plan. Without it the bootstrap
@@ -5699,6 +5717,8 @@ func Target(rel, line string, del bool, document string) (string, error) {
 		if rel, err = normRel(x.Root(), rel); err != nil {
 			return err
 		}
+		planned = rel
+		before, _ = x.Row(rel)
 		if del {
 			msg = fmt.Sprintf("已标记 %s 计划删除", rel)
 			return x.SetTargetDelete(rel)
@@ -5739,7 +5759,28 @@ func Target(rel, line string, del bool, document string) (string, error) {
 		}
 		return x.SetTarget(rel, line)
 	})
+	if err == nil && planned != "" {
+		advanceSent(x, planned, before)
+	}
 	return msg, err
+}
+
+// advanceSent moves the context's sent version of rel to the row as it is
+// now, after the context itself rewrote part of it, but only when it held
+// the version the rewrite started from: one changed by another session in
+// between stays behind, so the gate still asks for it.
+func advanceSent(x *base.Index, rel string, before base.Row) {
+	r, ok := x.Row(rel)
+	if !ok {
+		return
+	}
+	overviewMu.Lock()
+	defer overviewMu.Unlock()
+	c := sentFor(x.Root())
+	if sent := c.rows[rel]; sent != "" && sent == rowPrint(before) && sent != rowPrint(r) {
+		c.rows[rel] = rowPrint(r)
+		saveSent(x.Root(), c)
+	}
 }
 
 // TargetItems writes several targets in one call, one item per file:
