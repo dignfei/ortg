@@ -57,6 +57,7 @@ type Row struct {
 // Config is the typed view of the JSON section.
 type Config struct {
 	Mode        string
+	Language    string
 	IgnoreDirs  []string
 	IgnoreFiles []string
 	// KeepFiles re-includes paths the ignore rules would drop: ignoring a
@@ -736,7 +737,8 @@ func (x *Index) SetHeader(h string) error {
 }
 
 func (x *Index) Config() Config {
-	return Config{Mode: x.t.cfg.string("mode"), IgnoreDirs: x.t.cfg.strings("ignore_dirs"), IgnoreFiles: x.t.cfg.strings("ignore_files"),
+	return Config{Mode: x.t.cfg.string("mode"), Language: x.t.cfg.string("language"),
+		IgnoreDirs: x.t.cfg.strings("ignore_dirs"), IgnoreFiles: x.t.cfg.strings("ignore_files"),
 		KeepFiles: x.t.cfg.strings("keep_files"), ObserveDirs: x.t.cfg.strings("observe_dirs"),
 		ObserveFiles: x.t.cfg.strings("observe_files"), Dirs: x.t.cfg.stringMap("dirs")}
 }
@@ -746,6 +748,11 @@ func (x *Index) SetConfig(c Config) error {
 		delete(x.t.cfg.raw, "mode")
 	} else {
 		x.t.cfg.set("mode", c.Mode)
+	}
+	if c.Language == "" {
+		delete(x.t.cfg.raw, "language")
+	} else {
+		x.t.cfg.set("language", c.Language)
 	}
 	x.t.cfg.set("ignore_dirs", nonNil(c.IgnoreDirs))
 	x.t.cfg.set("ignore_files", nonNil(c.IgnoreFiles))

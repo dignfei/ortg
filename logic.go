@@ -617,11 +617,14 @@ func Overview(module string, force bool) (string, error) {
 	c := sentFor(x.Root())
 	defer saveSent(x.Root(), c)
 	rules := overviewDiscipline(root)
-	first := "" // a fresh table: the docs come before any outline
+	first := outlineLanguageText(x)
+	if first != "" {
+		first += "\n\n"
+	}
 	if headerUnwritten(x.Header()) {
-		first = headerFirstText(x) + "\n\n"
+		first += headerFirstText(x) + "\n\n"
 	} else if x.Config().Mode == "task" {
-		first = taskModeNote + "\n\n"
+		first += taskModeNote + "\n\n"
 	}
 	opts := renderOpts(x, module)
 	bare, whole := module == "", module == "" || module == "*"
@@ -4977,6 +4980,9 @@ func Scan() (string, error) {
 	if note != "" {
 		note += "\n"
 	}
+	if language := outlineLanguageText(x); language != "" {
+		note += language + "\n"
+	}
 	return note + s.report() + finalStatus(), nil
 }
 
@@ -6751,8 +6757,16 @@ func Align(mode string, paths []string) (string, error) {
 
 // Header replaces the header and/or the ignore and directory configuration.
 func Header(header string, ignoreDirs, ignoreFiles, keepFiles, observeDirs, observeFiles, dirs []string, mode ...string) (string, error) {
+	return headerConfig(header, ignoreDirs, ignoreFiles, keepFiles, observeDirs, observeFiles, dirs, mode, nil)
+}
+
+// headerConfig keeps optional language and header changes in the same transaction.
+func headerConfig(header string, ignoreDirs, ignoreFiles, keepFiles, observeDirs, observeFiles, dirs []string, mode []string, language *string) (string, error) {
 	if len(mode) > 1 || len(mode) == 1 && mode[0] != "" && mode[0] != "build" && mode[0] != "task" {
 		return "", errors.New(headerBadMode)
+	}
+	if language != nil && *language != "zh" && *language != "en" {
+		return "", errors.New(headerBadLanguage)
 	}
 	x, err := openIndex(repoRoot())
 	if err != nil {
@@ -6762,6 +6776,9 @@ func Header(header string, ignoreDirs, ignoreFiles, keepFiles, observeDirs, obse
 		cfg := x.Config()
 		if len(mode) == 1 {
 			cfg.Mode = mode[0]
+		}
+		if language != nil {
+			cfg.Language = *language
 		}
 		if ignoreDirs != nil {
 			cfg.IgnoreDirs = ignoreDirs
@@ -6797,6 +6814,9 @@ func Header(header string, ignoreDirs, ignoreFiles, keepFiles, observeDirs, obse
 		return "", err
 	}
 	msg := "纲要头与配置已更新"
+	if text := outlineLanguageText(x); text != "" {
+		msg += "\n" + text
+	}
 	if x.Config().Mode == "task" {
 		msg += "\n" + taskModeNote
 	} else if header != "" && !headerUnwritten(x.Header()) {
@@ -6808,6 +6828,21 @@ func Header(header string, ignoreDirs, ignoreFiles, keepFiles, observeDirs, obse
 		msg += "\n" + fmt.Sprintf(keysOrphan, strings.Join(orphan, "、"))
 	}
 	return msg, nil
+}
+
+// outlineLanguageText is outside the outline cache so configuration changes
+// also reach contexts whose header and entries have already been delivered.
+func outlineLanguageText(x *base.Index) string {
+	switch x.Config().Language {
+	case "zh":
+		return outlineLanguageZH
+	case "en":
+		return outlineLanguageEN
+	}
+	if headerUnwritten(x.Header()) {
+		return outlineLanguageAsk
+	}
+	return ""
 }
 
 // ---- hooks ----

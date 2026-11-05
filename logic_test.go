@@ -1718,8 +1718,8 @@ func TestHeaderFirst(t *testing.T) {
 	if _, err := Update("a.go", line); err == nil {
 		t.Fatal("a header whose 【系统】 is still the placeholder is not written yet")
 	}
-	if doc, _ := Overview("", false); !strings.HasPrefix(doc, "ortg: 纲要头还没写") {
-		t.Fatalf("the overview of a fresh table must lead with the docs:\n%.200s", doc)
+	if doc, _ := Overview("", false); !strings.HasPrefix(doc, outlineLanguageAsk+"\n\nortg: 纲要头还没写") {
+		t.Fatalf("the overview of a fresh table must ask for the language before the docs:\n%.200s", doc)
 	}
 	section := "\n\n===根 " + filepath.ToSlash(root) + "/===\n" + line + "\n"
 	if _, err := Target("", "", false, headerTemplate+section); err == nil || !strings.Contains(err.Error(), "纲要头还没写") {
@@ -1834,8 +1834,8 @@ func TestInitialHeaderBeforeRemainingDocs(t *testing.T) {
 	if _, err := Update("main.go", src); err == nil || !strings.Contains(err.Error(), "还没纲要的文档：README.md、docs/a.md") {
 		t.Fatalf("a source outline before the documents must be refused, naming them: %v", err)
 	}
-	if doc, _ := Overview("", false); !strings.HasPrefix(doc, fmt.Sprintf(headerFirstNote, "README.md、docs/a.md", docQuota)) {
-		t.Fatalf("a fresh overview must lead with the documents to outline:\n%.300s", doc)
+	if doc, _ := Overview("", false); !strings.HasPrefix(doc, outlineLanguageAsk+"\n\n"+fmt.Sprintf(headerFirstNote, "README.md、docs/a.md", docQuota)) {
+		t.Fatalf("a fresh overview must ask for the language before the documents to outline:\n%.300s", doc)
 	}
 	long := strings.Repeat("约", docQuota-10)
 	got, err := Update("README.md", "README.md[3 D CL T]: Role:总览 | Uses:- | API:- | Constraints:"+long)
@@ -1966,14 +1966,14 @@ func TestHeaderGuidanceStages(t *testing.T) {
 	if _, err := Scan(); err != nil {
 		t.Fatal(err)
 	}
-	if doc, _ := Overview("", false); !strings.HasPrefix(doc, headerNoDocsNote) {
+	if doc, _ := Overview("", false); !strings.HasPrefix(doc, outlineLanguageAsk+"\n\n"+headerNoDocsNote) {
 		t.Fatalf("no documents: the header comes from the code:\n%.200s", doc)
 	}
 	os.WriteFile(filepath.Join(root, "GUIDE.md"), []byte("g"), 0o644)
 	if _, err := Update("GUIDE.md", "GUIDE.md[3 D CL T]: Role:指南 | Uses:- | API:- | Constraints:-"); err != nil {
 		t.Fatal(err)
 	}
-	if doc, _ := Overview("", true); !strings.HasPrefix(doc, headerFromDocsNote) {
+	if doc, _ := Overview("", true); !strings.HasPrefix(doc, outlineLanguageAsk+"\n\n"+headerFromDocsNote) {
 		t.Fatalf("documents outlined: the header comes next:\n%.200s", doc)
 	}
 	for p, want := range map[string]bool{"README.md": true, "docs/x.go": true, "a/doc/b.txt": true, "guide": true, "x.rst": true, "main.go": false, "docsify.go": false, "src/doc.go": false} {

@@ -14,6 +14,27 @@ const taskOverviewRule = "任务维护模式的默认纲要（module省略或空
 const overviewTaskInventoryNote = "ortg: 默认正文未逐条发送 %d 个无纲要且无计划的未知库存条目，本次省略不新增已发记录；原库存与状态保留。用 module=\"-\" 或 module=\"*\" 显式取回，完整路径用 ortg_status 查询；这不表示全库已知或初始化完成。"
 const headerTaskFirstNote = "ortg: 当前为任务维护模式(task)，纲要头仍是模板。先按原任务和可见测试列相关路径及理由，读相关文档与合法源码入口，用 ortg_header 写有依据的初始头，再提交相关已读源码纲要与目标计划；不要求先补齐全部文档。" + " " + taskOutlineRule + " " + semanticInitRule
 const headerBadMode = "mode 只接受 build、task 或空串（恢复旧兼容行为），配置未写入"
+const outlineLanguagePrompt = `创建的纲要使用哪种语言？
+Which language should the outline use?
+1. 中文
+   Chinese
+2. 英文
+   English`
+const outlineLanguageAsk = `首次创建且尚未配置语言时，先向用户原样显示以下双语问题和选项，等待选择后再生成纲要；1/中文/Chinese 对应 ortg_header language="zh"，2/英文/English 对应 language="en"。用户已明确指定语言时直接保存，不重复询问；没有回答时不代选，不根据对话、源码或系统区域设置猜填。
+When creating outlines for the first time without a language setting, show the following bilingual question and options verbatim, then wait for the user's choice. Save 1/中文/Chinese with ortg_header language="zh", or 2/英文/English with language="en". Save an explicit language request directly without asking again; never infer or select a language without an answer.
+` + outlineLanguagePrompt
+const outlineLanguageRule = `纲要语言通过 ortg_header language=zh/en 保存到 ortg.tsv 的 JSON 配置 language 字段，省略保持原值。用户可主动更改语言，只影响之后新增或更新纲要的描述正文；已有纲要默认不变，不自动批量翻译。Role/Uses/API/Constraints/Keys、标签、路径与标识符，以及 #【部署】/#【系统】/#【契约】/#目标: 和「必须保持」等协议标记保持原样；标记后的描述按所选语言写。已有真实纲要且未配置语言的仓库沿用原文，不自动猜填或反复询问。
+Save the outline language as zh/en in the language field of ortg.tsv's JSON configuration through ortg_header; omission preserves it. Users may explicitly change the language at any time. The change applies only to descriptions in subsequent new or updated outlines; existing entries stay unchanged and are not automatically translated. Preserve protocol markers, including Role/Uses/API/Constraints/Keys, tags, paths, identifiers, #【部署】/#【系统】/#【契约】/#目标: and 必须保持; write the descriptions after them in the chosen language. Keep existing outlines unchanged in repositories without a language setting; do not infer a preference or repeatedly ask.`
+const outlineLanguageZH = `ortg: 纲要语言：中文（zh）。新增或更新纲要的描述正文使用中文；已有纲要默认不变。
+Outline language: Chinese (zh). Write descriptions in subsequent new or updated outlines in Chinese; keep existing outlines unchanged by default.`
+const outlineLanguageEN = `ortg: 纲要语言：英文（en）。新增或更新纲要的描述正文使用英文；已有纲要默认不变。
+Outline language: English (en). Write descriptions in subsequent new or updated outlines in English; keep existing outlines unchanged by default.`
+const headerCommandUsage = `[--mode build|task|""] [--language zh|en] [--header TEXT]  设置维护模式、纲要语言或纲要头
+Set the maintenance mode, outline language or header.`
+const headerLanguageDescription = `纲要描述正文语言：zh 中文；en 英文；省略保持当前配置
+Outline description language: zh Chinese; en English; omission preserves the current setting.`
+const headerBadLanguage = `language 只接受 zh 或 en，配置未写入。
+language must be zh or en; the configuration was not changed.`
 const outlineConflictRule = "纲要与需求、源码、测试或实际运行结果冲突时，读取对应源码与测试核实，并修正不准确的纲要；状态对齐不证明代码正确或语义完整。"
 const dependencyBlockerRule = "任务依赖闭环：发现缺失符号、导入或依赖缺口时，沿公开合法构造或获取→目标调用→输出的最短必要链，结合可见测试判断是否阻断任务；有依据的阻断纳入计划，不能仅因未点名或早已缺失就排除。“不要求完整子系统”不等于“禁止必要 helper”；显式禁止须遵守，不凭假想外围流程扩展恢复范围，确与任务无关的按证据说明。恢复或迁移缺失符号后，全库搜索实际使用点（含函数对象传递/注册，不能只搜调用括号），逐个消费者核对导入、名称绑定与调用契约；不能只补定义或一个分支，遗漏消费者也纳入计划验证。"
 const finalSourceRule = "最终验证：为绕过仓库缺失实现而临时注入或替换的函数、对象只作诊断。提交或结束任务前，移除这类替代，在新进程中按最终持久源码运行验收；仅替代后的自测通过不算最终源码通过。"
@@ -151,13 +172,13 @@ var headerTemplate = `#====项目纲要====
 const targetModeText = `高屋建瓴模式：本轮只改目标纲要、纲要头、忽略规则与目录描述，不改代码；请输出完整目标纲要而非差异。`
 
 var toolDescriptions = map[string]string{
-	"ortg_overview": "可选 rules 字符串走独立规则分页：省略 rules 是普通纲要，rules=空串取首段，后续逐段回传返回的 cursor，末段后的 cursor 确认整链；每段按可信宿主预算，未知时最多4096 UTF-8字节。须看到本段完整标题/收尾且没有截断提示才续取；缺文用 rules=空串 force=true 重来。分页不与 module/init 混用，不改变纲要已发或写入许可；旧hook回执不算完成。对账并返回纲要与全库计数摘要，完整路径清单用 ortg_status 按需查看。不带参数时整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回，超过时只返回纲要头与模块清单（不含条目正文）；再用 module（B 标签）取模块，module=\"*\" 取全部。同一会话只发上下文里还没有或已变动的条目，全都发过就只回计数摘要；上下文压缩或清空后自动重发；确实看不到时传 force=true 重发。一次超过单次上限时照发正文（可能被截断），开头提醒把模块拆细。本仓库启用了 ORTG（会话开始注入过 ORTG 纲要规则）时开工先调用。仓库没有 ortg.tsv 就是没启用 ORTG：不要调用 ortg 工具；只有用户明确要求创建（初始化）或对齐纲要时，才传 init=true 建表（根目录有 overview.txt 则先备份再整份导入，否则建空表；再首扫）。" + " " + taskOverviewRule + " " + taskOutlineRule,
+	"ortg_overview": "可选 rules 字符串走独立规则分页：省略 rules 是普通纲要，rules=空串取首段，后续逐段回传返回的 cursor，末段后的 cursor 确认整链；每段按可信宿主预算，未知时最多4096 UTF-8字节。须看到本段完整标题/收尾且没有截断提示才续取；缺文用 rules=空串 force=true 重来。分页不与 module/init 混用，不改变纲要已发或写入许可；旧hook回执不算完成。对账并返回纲要与全库计数摘要，完整路径清单用 ortg_status 按需查看。不带参数时整份不超过整份预算（估算的 token 不超过上下文窗口的一半，大小不超过约 48 万（单次截断值 50 万留出余量，Claude 按字计、Codex 按 token 计））就整份返回，超过时只返回纲要头与模块清单（不含条目正文）；再用 module（B 标签）取模块，module=\"*\" 取全部。同一会话只发上下文里还没有或已变动的条目，全都发过就只回计数摘要；上下文压缩或清空后自动重发；确实看不到时传 force=true 重发。一次超过单次上限时照发正文（可能被截断），开头提醒把模块拆细。本仓库启用了 ORTG（会话开始注入过 ORTG 纲要规则）时开工先调用。仓库没有 ortg.tsv 就是没启用 ORTG：不要调用 ortg 工具；只有用户明确要求创建（初始化）或对齐纲要时，才传 init=true 建表（根目录有 overview.txt 则先备份再整份导入，否则建空表；再首扫）。" + " " + taskOverviewRule + " " + taskOutlineRule + "\n" + outlineLanguageRule + "\n" + outlineLanguageAsk,
 	"ortg_status":   "重新扫描并对账，只返回对账报告（无纲要/过期/观察变动/对齐各多少及路径），不返回纲要正文。被问到纲要是否对齐、有哪些文件要处理时用它——会话开始的报告只是当时的快照，不要引用。",
 	"ortg_update":   "提交当前文件纲要：用 path+outline 提交一个文件，或用 items 批量提交（每项为\"路径 完整纲要行\"，路径和文件名可含空格及括号，按纲要文件名与标签识别边界）。给了 items 就忽略 path/outline；空批、规范化后重复路径均拒绝。全批共用一个事务，任一项失败全部回滚并指出路径与原因；成功逐项报告，统一保存与刷新。每项仍校验格式、字典、Uses、Keys、API、角色与目录类型，前移指纹并清空目标纲要。全库初始化(build或旧兼容首次建设)按批前文档状态检查，不能同批补文档并首次提交源码；任务维护(task)只维护当前已读文件，未覆盖仍未知。全库建设成功后按批次最终状态提示阶段修订。批量只合并已阅读文件的完整当前纲要，不代替正文阅读与每文件改完立即提交；全库初始化仍按文档→修订→核心→修订→普通→最终修订流程。第三方库等不逐文件建纲要的目录，给目录本身写一行目录纲要：path 填目录，文件名以 / 结尾（vendored/[标签]: ...），B 标签填用到它的模块，它就随那个模块一起发送；目录本身放进 observe_dirs，其下文件就不再要求逐个写纲要。",
 	"ortg_review":   "可选 final=true：读取本上下文实写后的当前源码代际；用generation加requirements逐公开要求提交结构化status与真实运行引用；旧report数组保持兼容但运行依据未核证（有效UTF-8、合计至多4096字节）。这是模型声明，不是原生语义验收；源码或新识别失败使旧声明失效。" + " " + finalReviewContractGuide + " 默认参数仍核对改动计划（参数 rulings：对上一次核对给了正文的每条契约写一行「契约键：裁决」，缺了不收敛）：列出所有目标纲要（要改、新建、删除的文件）的现在→目标字段变化、不合格的目标行、Uses 依赖它们却还没有目标纲要的文件，并给出逐项核对清单。要改多个文件时，写完计划后调用；核对列出要补、要核实的地方时，补改后连续两次看到同一计划才解锁，计划全写 = 或核对没发现要补的地方时一次即解锁。只改一个文件不需要。只给自己核对用，不用给用户看。",
 	"ortg_target":   "写目标纲要（这个文件改完之后应有的纲要，用来指导接下来改代码；待核查、待实测的事项不是目标，不要写进来）：给 path 与 outline 写单个文件的目标纲要，delete=true 标记计划删除；或传 document 整份导入（高屋建瓴模式）。允许尚不存在的路径。改完代码后用 ortg_update 提交，目标纲要自动清空。只改实现、改完纲要不变时 outline 传 \"=\"（等于现在的纲要，不必抄整行）。一次改多个文件时用 items 一次传全部：每项 \"路径 目标纲要行\"，纲要行写 = 表示纲要不变，写 删除 表示计划删除。路径和文件名可含空格及括号，完整行按纲要文件名与标签识别边界，= 和 删除 从末尾识别。只改一个文件不需要写目标纲要。",
 	"ortg_align":    "人工已核对纲要对齐时调用：mode=all 前移全部文件指纹，mode=paths 只前移 paths。不改纲要文本。已确认的内容改动须提交新纲要，不能用对齐替代。",
-	"ortg_header":   "整块替换纲要头（必须含 #A/#B/#E 字典行），并可设置忽略目录、忽略文件、白名单、观察目录与目录标题（keep_files 压过忽略规则；dirs 为 \"目录=标题\" 列表，只作纲要里目录段的标题）。传了的列表整体替换，不传的字段保持原值。可选 mode=build 表示全库初始化，文档未齐时拒绝源码纲要；mode=task 表示部分纲要下的任务维护，解除全部文档前置并按任务范围核查提交，其他校验与复审保留，未覆盖仍未知；空串恢复旧兼容行为，未传保持当前模式。模式持久化，不自动猜用户意图。" + " " + taskOutlineRule,
+	"ortg_header":   "整块替换纲要头（必须含 #A/#B/#E 字典行），并可设置忽略目录、忽略文件、白名单、观察目录与目录标题（keep_files 压过忽略规则；dirs 为 \"目录=标题\" 列表，只作纲要里目录段的标题）。传了的列表整体替换，不传的字段保持原值。可选 mode=build 表示全库初始化，文档未齐时拒绝源码纲要；mode=task 表示部分纲要下的任务维护，解除全部文档前置并按任务范围核查提交，其他校验与复审保留，未覆盖仍未知；空串恢复旧兼容行为，未传保持当前模式。模式持久化，不自动猜用户意图。" + " " + taskOutlineRule + "\n" + outlineLanguageRule,
 }
 
 const updateItemsDescription = "一次提交多个当前纲要：每项为\"路径 完整纲要行\"，路径和文件名可含空格及括号；给了 items 就忽略 path/outline，空批与重复路径拒绝，任一项失败全部回滚"
